@@ -1,0 +1,334 @@
+/*
+ * M14 local-module bridge v29 / LLVM seq_logo stage-1 scheduler probe.
+ *
+ * dev38 proved that 0x8027551C must be a real LLVM re-entry boundary: the
+ * generated region now begins exactly there and the first retrace genuinely
+ * escaped scheduler idle.  The post-relF seq_logo stage-1 stall nevertheless
+ * remains: one DrawDone/two display copies are produced, then the persistent
+ * CPU returns to SelectThread idle forever while VI retraces continue.
+ *
+ * Earlier R8PE01 revision-2 scheduler work already derived the authoritative
+ * SDK globals from the player's generated code:
+ *   RunQueueBits  = r13 - 29552
+ *   RunQueueHint  = r13 - 29556
+ * and proved SelectThread=0x802753D0 / idle=0x8027551C /
+ * OSWakeupThread=0x802761CC.  Do not import addresses from other retail
+ * revisions; this probe uses only the proven US2 coordinates plus the live r13.
+ *
+ * v29 changes no guest state.  Around each host-delivered retrace it snapshots
+ * RunQueueBits/RunQueueHint/current OS context/current thread before and after
+ * the complete underlying run.  A bounded host-service observer also records
+ * any stage-1 async completion event and the two player-disc GameFS read seams.
+ * Together these distinguish:
+ *   - no runnable thread created by VI;
+ *   - a runnable thread queued but not transferred;
+ *   - a committed Nintendo OSLoadContext/rfi transfer;
+ *   - a non-VI async service that should be the real wake source.
+ *
+ * The dev38 partition marker is retained below for CMake/source-contract
+ * ancestry: m14-dev38-llvm-scheduler-idle-reentry
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev38_scheduler_reentry_base
+#include "legacy_c_adapter_v28.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V39_RUNQUEUE_BITS_DELTA UINT32_C(29552)
+#define OPENSPM_M14_V39_RUNQUEUE_HINT_DELTA UINT32_C(29556)
+#define OPENSPM_M14_V39_OS_CURRENT_THREAD UINT32_C(0x800000E4)
+#define OPENSPM_M14_V39_GAMEFS_ASYNC_READ UINT32_C(0x80279BF4)
+#define OPENSPM_M14_V39_GAMEFS_SYNC_READ UINT32_C(0x80279CDC)
+#define OPENSPM_M14_V39_BASELINE_LOG_LIMIT UINT32_C(4)
+#define OPENSPM_M14_V39_STAGE1_LOG_LIMIT UINT32_C(16)
+#define OPENSPM_M14_V39_SERVICE_LOG_LIMIT UINT32_C(16)
+
+typedef struct openspm_m14_v39_scheduler_snapshot {
+    uint32_t r13;
+    uint32_t runqueue_bits_addr;
+    uint32_t runqueue_hint_addr;
+    uint32_t runqueue_bits;
+    uint32_t runqueue_hint;
+    uint32_t current_context;
+    uint32_t current_thread;
+    uint32_t seq;
+    uint32_t stage;
+    uint32_t pc;
+    uint32_t retrace_ticks;
+    uint32_t transfer_context;
+    uint32_t transfer_pc;
+    uint32_t valid;
+} openspm_m14_v39_scheduler_snapshot;
+
+static openspm_native_create_fn g_m14_v39_underlying_create;
+static openspm_native_run_fn g_m14_v39_underlying_run;
+static openspm_native_destroy_fn g_m14_v39_underlying_destroy;
+static openspm_m14_hostcall_handle_fn g_m14_v39_underlying_service_handle;
+static openspm_bridge_instance *g_m14_v39_instance;
+static uint32_t g_m14_v39_baseline_logs;
+static uint32_t g_m14_v39_stage1_logs;
+static uint32_t g_m14_v39_service_logs;
+static uint32_t g_m14_v39_retrace_observations;
+static uint32_t g_m14_v39_stage1_retraces;
+static uint32_t g_m14_v39_stage1_nonzero_after;
+static uint32_t g_m14_v39_stage1_transfers;
+static uint32_t g_m14_v39_stage1_async_events;
+
+static void bridge_v39_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static void bridge_v39_snapshot(openspm_bridge_instance *instance,
+                                openspm_m14_v39_scheduler_snapshot *out) {
+    uint32_t bits_addr;
+    uint32_t hint_addr;
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (instance == NULL) return;
+
+    out->r13 = (uint32_t)instance->cpu.gpr[13];
+    bits_addr = out->r13 - OPENSPM_M14_V39_RUNQUEUE_BITS_DELTA;
+    hint_addr = out->r13 - OPENSPM_M14_V39_RUNQUEUE_HINT_DELTA;
+    out->runqueue_bits_addr = bits_addr;
+    out->runqueue_hint_addr = hint_addr;
+    out->pc = (uint32_t)instance->cpu.pc;
+    out->retrace_ticks = g_m14_retrace_ticks;
+    out->transfer_context = g_m14_last_event_transfer_context;
+    out->transfer_pc = g_m14_last_event_transfer_pc;
+
+    if (!bridge_m14_context_address_valid(&instance->cpu, bits_addr, 4u) ||
+        !bridge_m14_context_address_valid(&instance->cpu, hint_addr, 4u) ||
+        !bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_OS_CURRENT_CONTEXT, 4u) ||
+        !bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_V39_OS_CURRENT_THREAD, 4u) ||
+        !bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_TIMING_SEQ_WORK, 8u)) {
+        return;
+    }
+
+    out->runqueue_bits = mem_read32(&instance->cpu, bits_addr);
+    out->runqueue_hint = mem_read32(&instance->cpu, hint_addr);
+    out->current_context = mem_read32(&instance->cpu,
+                                      OPENSPM_M14_OS_CURRENT_CONTEXT);
+    out->current_thread = mem_read32(&instance->cpu,
+                                     OPENSPM_M14_V39_OS_CURRENT_THREAD);
+    out->seq = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+    out->stage = mem_read32(&instance->cpu,
+                            OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+    out->valid = 1u;
+}
+
+static void bridge_v39_log_retrace(
+    openspm_bridge_instance *instance,
+    const openspm_m14_v39_scheduler_snapshot *before,
+    const openspm_m14_v39_scheduler_snapshot *after,
+    int result,
+    const openspm_native_exit *out_exit) {
+    char message[704];
+    uint32_t stage1;
+    uint32_t index;
+    if (instance == NULL || before == NULL || after == NULL ||
+        !before->valid || !after->valid ||
+        before->retrace_ticks == after->retrace_ticks) {
+        return;
+    }
+
+    ++g_m14_v39_retrace_observations;
+    stage1 = ((before->seq == 0u && before->stage == 1u) ||
+              (after->seq == 0u && after->stage == 1u));
+    if (stage1) {
+        ++g_m14_v39_stage1_retraces;
+        if (after->runqueue_bits != 0u)
+            ++g_m14_v39_stage1_nonzero_after;
+        if (after->transfer_context != 0u)
+            ++g_m14_v39_stage1_transfers;
+        if (g_m14_v39_stage1_logs >= OPENSPM_M14_V39_STAGE1_LOG_LIMIT)
+            return;
+        index = ++g_m14_v39_stage1_logs;
+    } else {
+        if (g_m14_v39_baseline_logs >= OPENSPM_M14_V39_BASELINE_LOG_LIMIT)
+            return;
+        index = ++g_m14_v39_baseline_logs;
+    }
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM scheduler wake probe %s#%u tick=%u->%u r13=0x%08X runq@0x%08X=0x%08X->0x%08X hint@0x%08X=0x%08X->0x%08X context=0x%08X->0x%08X thread=0x%08X->0x%08X transfer=0x%08X/0x%08X pc=0x%08X->0x%08X result=%d exit=%u/detail=%u/source=0x%08llX.",
+        stage1 ? "stage1-" : "baseline-", (unsigned)index,
+        (unsigned)before->retrace_ticks, (unsigned)after->retrace_ticks,
+        (unsigned)after->r13,
+        (unsigned)after->runqueue_bits_addr,
+        (unsigned)before->runqueue_bits, (unsigned)after->runqueue_bits,
+        (unsigned)after->runqueue_hint_addr,
+        (unsigned)before->runqueue_hint, (unsigned)after->runqueue_hint,
+        (unsigned)before->current_context, (unsigned)after->current_context,
+        (unsigned)before->current_thread, (unsigned)after->current_thread,
+        (unsigned)after->transfer_context, (unsigned)after->transfer_pc,
+        (unsigned)before->pc, (unsigned)after->pc,
+        result,
+        out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+        out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+        (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+    bridge_v39_log(instance, message);
+}
+
+static int OPENSPM_CALL bridge_v39_hostcall_service(
+    void *context,
+    uint32_t target_address,
+    openspm_m14_hostcall_state *state) {
+    int result;
+    uint32_t seq = UINT32_MAX;
+    uint32_t stage = UINT32_MAX;
+    uint32_t interesting_target;
+    uint32_t event_target;
+    uint32_t event_argc;
+    uint32_t r3;
+
+    if (g_m14_v39_underlying_service_handle == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    if (g_m14_v39_instance != NULL &&
+        bridge_m14_context_address_valid(&g_m14_v39_instance->cpu,
+                                          OPENSPM_M14_TIMING_SEQ_WORK, 8u)) {
+        seq = mem_read32(&g_m14_v39_instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+        stage = mem_read32(&g_m14_v39_instance->cpu,
+                           OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+    }
+
+    result = g_m14_v39_underlying_service_handle(context, target_address, state);
+    event_target = state != NULL ? state->event_target : 0u;
+    event_argc = state != NULL ? state->event_argc : 0u;
+    r3 = state != NULL ? state->gpr[3] : 0u;
+    interesting_target =
+        target_address == OPENSPM_M14_V39_GAMEFS_ASYNC_READ ||
+        target_address == OPENSPM_M14_V39_GAMEFS_SYNC_READ;
+
+    if (seq == 0u && stage == 1u && event_target != 0u)
+        ++g_m14_v39_stage1_async_events;
+
+    if (g_m14_v39_service_logs < OPENSPM_M14_V39_SERVICE_LOG_LIMIT &&
+        ((seq == 0u && stage == 1u && event_target != 0u) ||
+         interesting_target)) {
+        char message[512];
+        ++g_m14_v39_service_logs;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM stage1 async-service probe #%u seq=%u stage=%u target=0x%08X result=%d r3=0x%08X event=0x%08X argc=%u args=[0x%08X,0x%08X,0x%08X].",
+            (unsigned)g_m14_v39_service_logs,
+            (unsigned)seq, (unsigned)stage, (unsigned)target_address,
+            result, (unsigned)r3, (unsigned)event_target,
+            (unsigned)event_argc,
+            state != NULL ? (unsigned)state->event_args[0] : 0u,
+            state != NULL ? (unsigned)state->event_args[1] : 0u,
+            state != NULL ? (unsigned)state->event_args[2] : 0u);
+        bridge_v39_log(g_m14_v39_instance, message);
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_run_v39(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    openspm_m14_v39_scheduler_snapshot before;
+    openspm_m14_v39_scheduler_snapshot after;
+    int result;
+    if (g_m14_v39_underlying_run == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    bridge_v39_snapshot(instance, &before);
+    result = g_m14_v39_underlying_run(opaque, soft_cycle_budget, out_exit);
+    bridge_v39_snapshot(instance, &after);
+    bridge_v39_log_retrace(instance, &before, &after, result, out_exit);
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v39(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v39_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v39_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v39_instance = instance;
+    g_m14_v39_underlying_service_handle = NULL;
+    if (g_m14_have_hostcall && g_m14_hostcall.handle != NULL) {
+        g_m14_v39_underlying_service_handle = g_m14_hostcall.handle;
+        g_m14_hostcall.handle = bridge_v39_hostcall_service;
+    }
+
+    g_m14_v39_baseline_logs = 0u;
+    g_m14_v39_stage1_logs = 0u;
+    g_m14_v39_service_logs = 0u;
+    g_m14_v39_retrace_observations = 0u;
+    g_m14_v39_stage1_retraces = 0u;
+    g_m14_v39_stage1_nonzero_after = 0u;
+    g_m14_v39_stage1_transfers = 0u;
+    g_m14_v39_stage1_async_events = 0u;
+
+    bridge_v39_log(instance,
+        "M14 LLVM stage-1 scheduler wake probe active: RunQueueBits=r13-29552 and RunQueueHint=r13-29556 are observed across delivered retraces; stage-1 async host events are bounded-traced; no guest state is modified.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v39(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[384];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM stage-1 scheduler probe stats retraces=%u stage1_retraces=%u stage1_runq_nonzero_after=%u stage1_transfers=%u stage1_async_events=%u service_logs=%u.",
+            (unsigned)g_m14_v39_retrace_observations,
+            (unsigned)g_m14_v39_stage1_retraces,
+            (unsigned)g_m14_v39_stage1_nonzero_after,
+            (unsigned)g_m14_v39_stage1_transfers,
+            (unsigned)g_m14_v39_stage1_async_events,
+            (unsigned)g_m14_v39_service_logs);
+        bridge_v39_log(instance, message);
+    }
+
+    if (g_m14_v39_underlying_service_handle != NULL &&
+        g_m14_hostcall.handle == bridge_v39_hostcall_service)
+        g_m14_hostcall.handle = g_m14_v39_underlying_service_handle;
+    if (g_m14_v39_underlying_destroy != NULL)
+        g_m14_v39_underlying_destroy(opaque);
+    g_m14_v39_instance = NULL;
+    g_m14_v39_underlying_service_handle = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev38_scheduler_reentry_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v39_underlying_create = out_api->create;
+    g_m14_v39_underlying_run = out_api->run;
+    g_m14_v39_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev39-llvm-stage1-scheduler-probe";
+    out_api->create = bridge_create_v39;
+    out_api->run = bridge_run_v39;
+    out_api->destroy = bridge_destroy_v39;
+#endif
+    return OPENSPM_OK;
+}

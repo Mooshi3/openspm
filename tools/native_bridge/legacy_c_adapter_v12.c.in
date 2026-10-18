@@ -1,0 +1,277 @@
+/*
+ * M14 generated-C bridge v12 / local-module bridge v20 timing wrapper.
+ *
+ * Runtime 022901 proved the native VI scheduler's delivery-anchored deadline
+ * loses host time permanently: after every delivered retrace, dev15 sets the
+ * next deadline to delivery_time + 16.666667 ms. Any renderer/handler latency
+ * is therefore added to the period itself, explaining the ~56-58 Hz ceiling in
+ * light scenes and the deeper ~52 Hz loss when synchronous GX work is heavy.
+ *
+ * Keep the proven v19 display-list/native execution stack unchanged underneath.
+ * This wrapper does NOT emit catch-up interrupts and never accelerates guest
+ * simulation. It remembers the deadline that was due before the base run,
+ * allows the base bridge to deliver at most its existing single retrace, then
+ * advances the deadline on the original fixed 60 Hz grid. Deadlines already
+ * expired by the time control returns are skipped, not delivered in a burst.
+ * Thus host-side stalls may still drop one or more VI opportunities, but they
+ * no longer shift every future retrace later.
+ *
+ * Runtime 044537 also measured a separate producer-side tax: gameplay emits
+ * millions of Broadway write-gather stores per second. dev16 already gathers
+ * them into exact 32-byte FIFO lines inside this translation unit, but stock
+ * DolRecomp mem_write* first runs every WPAR store through generic RAM address
+ * resolution and an indirect CPUState::external_write call. The player-local
+ * build now patches only its private staged cpu.c so the exact 32-byte WPAR
+ * window can call openspm_m14_try_wg_write directly before generic resolution.
+ * This helper reuses dev16's proven buffer, flush/error path and ordering; no GX
+ * bytes, semantic boundaries, guest-array lifetimes or renderer scheduling are
+ * changed.
+ *
+ * Runtime 162213 proved the old fps/input diagnostics were insufficient: VI can
+ * remain near 60 Hz while Mario/enemy movement visibly falls behind. The local
+ * generated tree now hooks only R8PE01 revision-2 spmarioMain's durable entry
+ * label and calls openspm_m14_note_spmario_main_v20(). This wrapper reports that
+ * true top-level gameplay-update cadence against delivered VI retraces once per
+ * host second. Resumes inside a yielded spmarioMain do not cross the entry label
+ * and therefore are not double-counted.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev19_v20_base
+#include "legacy_c_adapter_v11.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+static openspm_native_run_fn g_m14_v20_underlying_run;
+static uint64_t g_m14_v20_expired_deadlines;
+static uint64_t g_m14_v20_rephased_deliveries;
+static uint32_t g_m14_v20_phase_log_reported;
+static uint64_t g_m14_v20_spmario_main_total;
+static uint64_t g_m14_v20_spmario_sample_total;
+static uint64_t g_m14_v20_spmario_sample_ns;
+static uint32_t g_m14_v20_spmario_sample_retraces;
+
+/* Called only by the private staged DolRecomp cpu.c used for the player-local
+ * module. Return nonzero iff this exact store belongs to Broadway's WPAR window
+ * and has therefore been consumed by the already-proven dev16 gather path.
+ *
+ * Keeping this hook in the active wrapper is intentional: legacy_c_adapter_v11
+ * includes dev16/v8 in the same C translation unit, so the helper can reuse the
+ * exact static 32-byte buffer and bridge_flush_wg_v8() rather than introducing
+ * a second transport or changing a public ABI. */
+int openspm_m14_try_wg_write(CPUState *cpu,
+                             u32 address,
+                             u64 value,
+                             u8 width) {
+    openspm_bridge_instance *instance = NULL;
+    uint32_t source_address = 0u;
+
+    if (!g_m14_v8_have_gx_fifo ||
+        address < OPENSPM_M14_WGPIPE_BASE ||
+        address >= OPENSPM_M14_WGPIPE_BASE + OPENSPM_M14_WGPIPE_SIZE ||
+        (width != 1u && width != 2u && width != 4u && width != 8u)) {
+        return 0;
+    }
+
+    if ((uint32_t)width > OPENSPM_M14_WG_GATHER_BYTES - g_m14_v8_wg_size) {
+        instance = bridge_from_cpu(cpu);
+        source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+        if (bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK) {
+            if (cpu != NULL) cpu->pc = source_address;
+            return 1;
+        }
+    }
+
+    /* PPC stores arrive as host integers. Append their bytes in the exact same
+       big-endian order as bridge_external_write_v8, but avoid a per-byte loop on
+       the overwhelmingly common 4/8-byte GX store forms. */
+    switch (width) {
+    case 8u:
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 56);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 48);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 40);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 32);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 24);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 16);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 8);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)value;
+        break;
+    case 4u:
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 24);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 16);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 8);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)value;
+        break;
+    case 2u:
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> 8);
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)value;
+        break;
+    default:
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)value;
+        break;
+    }
+    ++g_m14_v8_wg_pending_stores;
+
+    if (!g_m14_v8_wg_fast_reported) {
+        instance = bridge_from_cpu(cpu);
+        if (instance != NULL && instance->runtime != NULL &&
+            instance->runtime->host != NULL &&
+            instance->runtime->host->log != NULL) {
+            instance->runtime->host->log(
+                instance->runtime->host->context,
+                OPENSPM_LOG_INFO,
+                "M14 staged DolRecomp CPU WPAR direct fast path active; exact 32-byte GX gather/order preserved.");
+        }
+        g_m14_v8_wg_fast_reported = 1u;
+    }
+
+    if (g_m14_v8_wg_size == OPENSPM_M14_WG_GATHER_BYTES) {
+        if (instance == NULL) instance = bridge_from_cpu(cpu);
+        source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+        if (bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK &&
+            cpu != NULL) {
+            cpu->pc = source_address;
+        }
+    }
+    return 1;
+}
+
+/* Injected only at the exact durable guest entry label for R8PE01 revision-2
+ * spmarioMain (0x801A7AAC). This is the true top-level gameplay update from
+ * SPM's main loop, unlike the old input-frame/fps diagnostics which are latched
+ * from the host retrace epoch. */
+void openspm_m14_note_spmario_main_v20(CPUState *cpu) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const openspm_host_api *host;
+    uint64_t now;
+
+    ++g_m14_v20_spmario_main_total;
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->monotonic_ns == NULL || host->log == NULL) return;
+    now = host->monotonic_ns(host->context);
+    if (now == 0u) return;
+
+    if (g_m14_v20_spmario_sample_ns == 0u) {
+        g_m14_v20_spmario_sample_ns = now;
+        g_m14_v20_spmario_sample_total = g_m14_v20_spmario_main_total;
+        g_m14_v20_spmario_sample_retraces = g_m14_retrace_ticks;
+        return;
+    }
+
+    if (now - g_m14_v20_spmario_sample_ns >= UINT64_C(1000000000)) {
+        const uint64_t host_ns = now - g_m14_v20_spmario_sample_ns;
+        const uint64_t updates =
+            g_m14_v20_spmario_main_total - g_m14_v20_spmario_sample_total;
+        const uint32_t retraces =
+            g_m14_retrace_ticks - g_m14_v20_spmario_sample_retraces;
+        char message[320];
+        (void)snprintf(message, sizeof(message),
+                       "M14 simulation cadence host_ms=%llu spmarioMain=%llu retraces=%u total_updates=%llu pc=0x%08X.",
+                       (unsigned long long)(host_ns / UINT64_C(1000000)),
+                       (unsigned long long)updates,
+                       (unsigned)retraces,
+                       (unsigned long long)g_m14_v20_spmario_main_total,
+                       (unsigned)(cpu != NULL ? cpu->pc : 0u));
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+        g_m14_v20_spmario_sample_ns = now;
+        g_m14_v20_spmario_sample_total = g_m14_v20_spmario_main_total;
+        g_m14_v20_spmario_sample_retraces = g_m14_retrace_ticks;
+    }
+}
+
+static int bridge_v20_should_log_count(uint64_t value) {
+    return value <= UINT64_C(8) ||
+           (value != 0u && (value & (value - UINT64_C(1))) == 0u);
+}
+
+static void bridge_log_v20_phase(openspm_bridge_instance *instance,
+                                 uint64_t expired_this_delivery,
+                                 uint64_t next_deadline,
+                                 uint64_t now) {
+    const openspm_host_api *host;
+    char message[320];
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+
+    if (!g_m14_v20_phase_log_reported) {
+        host->log(host->context, OPENSPM_LOG_INFO,
+                  g_m14_dev132_half_monitor_cadence
+                      ? "M14 native retrace phase-lock active: dev132 diagnostic ~49.9715 Hz grid; elapsed deadlines are skipped, never burst-delivered."
+                      : "M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.");
+        g_m14_v20_phase_log_reported = 1u;
+    }
+
+    if (expired_this_delivery == 0u ||
+        !bridge_v20_should_log_count(g_m14_v20_expired_deadlines)) {
+        return;
+    }
+    (void)snprintf(message, sizeof(message),
+                   "M14 native retrace phase-lock expired_this=%llu expired_total=%llu deliveries=%llu next_in_us=%lld.",
+                   (unsigned long long)expired_this_delivery,
+                   (unsigned long long)g_m14_v20_expired_deadlines,
+                   (unsigned long long)g_m14_v20_rephased_deliveries,
+                   (long long)(next_deadline > now ?
+                       (next_deadline - now) / UINT64_C(1000) : 0u));
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int OPENSPM_CALL bridge_run_v20(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    const uint32_t tick_before = g_m14_retrace_ticks;
+    const uint64_t scheduled_before = g_m14_next_retrace_ns;
+    int result;
+
+    if (g_m14_v20_underlying_run == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v20_underlying_run(opaque, soft_cycle_budget, out_exit);
+    if (result != OPENSPM_OK) return result;
+
+    /* dev15 delivers at most one retrace per service pass. Only rephase after
+       an actual delivery, and only when a real pre-delivery deadline existed.
+       The first arm pass has scheduled_before==0 and needs no correction. */
+    if (g_m14_retrace_ticks != tick_before && scheduled_before != 0u) {
+        uint64_t now = bridge_m14_now_ns(instance);
+        uint64_t next = scheduled_before + OPENSPM_M14_RETRACE_PERIOD_NS;
+        uint64_t expired = 0u;
+
+        if (now == 0u) return OPENSPM_ERROR_UNSUPPORTED;
+        if (now >= next) {
+            expired = (now - next) / OPENSPM_M14_RETRACE_PERIOD_NS + UINT64_C(1);
+            next += expired * OPENSPM_M14_RETRACE_PERIOD_NS;
+        }
+
+        g_m14_next_retrace_ns = next;
+        ++g_m14_v20_rephased_deliveries;
+        g_m14_v20_expired_deadlines += expired;
+        bridge_log_v20_phase(instance, expired, next, now);
+    }
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result;
+
+    result = openspm_native_module_query_dev19_v20_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    if (out_api->run == NULL || out_api->create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    g_m14_v20_underlying_run = out_api->run;
+    g_m14_v20_expired_deadlines = 0u;
+    g_m14_v20_rephased_deliveries = 0u;
+    g_m14_v20_phase_log_reported = 0u;
+    g_m14_v20_spmario_main_total = 0u;
+    g_m14_v20_spmario_sample_total = 0u;
+    g_m14_v20_spmario_sample_ns = 0u;
+    g_m14_v20_spmario_sample_retraces = 0u;
+
+    out_api->module_version = "m14-dev20";
+    out_api->run = bridge_run_v20;
+    return OPENSPM_OK;
+}

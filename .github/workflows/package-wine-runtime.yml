@@ -1,0 +1,42 @@
+name: Package portable Wine for M10 testing
+
+on:
+  push:
+    paths:
+      - ".github/workflows/package-wine-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-wine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download Proton Wine AppImage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 5 \
+            -o wine.AppImage \
+            https://github.com/mmtrt/WINE_AppImage/releases/download/continuous-proton/wine-proton_11.0-1-x86_64.AppImage
+          echo "e62ee53dad3aec00b34dbf7801ab6981f413452220bc8990a578d4fd278e8623  wine.AppImage" | sha256sum -c -
+
+      - name: Extract self-contained Wine runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x wine.AppImage
+          ./wine.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          squashfs-root/AppRun --version
+
+      - name: Upload portable Wine runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: spm-m10-wine-proton-runtime
+          path: squashfs-root/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

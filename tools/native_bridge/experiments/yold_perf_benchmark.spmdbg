@@ -1,0 +1,35 @@
+# OpenSPM M14 dev113 - canonical Yold Town performance capture
+#
+# Stand in Yold Town / he2_03 before starting. Hold one direction and run/jump
+# naturally during the 8-second capture so Mario-motion telemetry also sees a
+# realistic produced-frame stream.
+#
+# This is non-destructive. It does not freeze, hide, suspend, or mutate NPCs.
+
+defer speed 1
+defer npcs suspend off
+defer npcs isolate off
+defer npcs freeze off
+
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 2.0 0.20
+
+capture start yold-perf
+status
+map
+pos
+npcs info
+npcs list
+npcs freeze off
+wait 8
+npcs info
+npcs list
+capture stop
+
+stable_npcs 1.5 0.20
+status
+map
+pos
+npcs info

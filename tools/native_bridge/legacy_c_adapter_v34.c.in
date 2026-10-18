@@ -1,0 +1,397 @@
+/*
+ * M14 local-module bridge v34 / LLVM post-frame idle + pre-sleep truth probe.
+ *
+ * dev43 proved the player-derived VI machinery is healthy while seq_logo stage 1
+ * is still making progress. The real R8PE01 VIWaitForRetrace queue is at
+ * r13-0x7198, its retraceCount is at r13-0x7174, and delivered VI retraces
+ * repeatedly drain the waiter, increment retraceCount and set Nintendo's real
+ * RunQueueBits. The later permanent 0x8027551C idle therefore happens after the
+ * useful dev43 64-line window rather than inside the VI wake/count mechanism it
+ * was designed to test.
+ *
+ * v34 remains read-only. It reserves a second telemetry window specifically for
+ * the first stage-1 transition into scheduler idle and subsequent delivered
+ * retraces. It also wraps the already-proven native-region query hook with an
+ * eight-entry ring buffer for stage-1 OSSleepThread/VIWait sleep boundaries.
+ * When permanent idle is first entered, the ring is dumped before any records
+ * can be overwritten. If DolRecomp direct-native-calls the sleep function
+ * without consulting the region query, the ring simply remains empty; no guest
+ * control flow is changed to force an observation.
+ *
+ * This answers the two questions dev43 intentionally left open:
+ *   1. Is the main thread actually waiting on VI's retraceQueue in the dead state?
+ *   2. Which sleep queue / thread / LR immediately preceded the transition to
+ *      no-runnable-thread scheduler idle?
+ *
+ * Historical source-contract ancestry:
+ * m14-dev43-llvm-vi-wait-queue-truth
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev43_vi_wait_base
+#include "legacy_c_adapter_v33.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V44_SLEEP_RING UINT32_C(8)
+#define OPENSPM_M14_V44_IDLE_LOG_LIMIT UINT32_C(24)
+
+typedef struct openspm_m14_v44_sleep_query {
+    uint32_t valid;
+    uint32_t kind;
+    uint32_t seq;
+    uint32_t stage;
+    uint32_t retrace_ticks;
+    uint32_t entry_pc;
+    uint32_t region_start;
+    uint32_t region_end;
+    uint32_t queue_arg;
+    uint32_t queue_valid;
+    uint32_t queue_head;
+    uint32_t queue_tail;
+    uint32_t current_context;
+    uint32_t current_thread;
+    uint32_t lr;
+    uint32_t sp;
+} openspm_m14_v44_sleep_query;
+
+static openspm_native_create_fn g_m14_v44_underlying_create;
+static openspm_native_run_fn g_m14_v44_underlying_run;
+static openspm_native_destroy_fn g_m14_v44_underlying_destroy;
+static PPCHostCall g_m14_v44_underlying_host_call;
+static openspm_m14_v44_sleep_query g_m14_v44_sleep_ring[OPENSPM_M14_V44_SLEEP_RING];
+static uint32_t g_m14_v44_sleep_query_count;
+static uint32_t g_m14_v44_idle_active;
+static uint32_t g_m14_v44_idle_runs;
+static uint32_t g_m14_v44_idle_logs;
+static uint32_t g_m14_v44_last_tick;
+static uint32_t g_m14_v44_last_queue_head;
+static uint32_t g_m14_v44_last_queue_tail;
+static uint32_t g_m14_v44_last_count;
+static uint32_t g_m14_v44_last_runq;
+static uint32_t g_m14_v44_last_hint;
+static uint32_t g_m14_v44_last_thread;
+
+static void bridge_v44_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static void bridge_v44_stage(CPUState *cpu, uint32_t *out_seq,
+                             uint32_t *out_stage) {
+    if (out_seq != NULL) *out_seq = UINT32_MAX;
+    if (out_stage != NULL) *out_stage = UINT32_MAX;
+    if (cpu == NULL || out_seq == NULL || out_stage == NULL) return;
+    if (!bridge_m14_context_address_valid(cpu, OPENSPM_M14_TIMING_SEQ_WORK, 8u))
+        return;
+    *out_seq = mem_read32(cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+    *out_stage = mem_read32(cpu,
+                            OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+}
+
+static void bridge_v44_record_sleep_query(CPUState *cpu,
+                                          uint32_t kind,
+                                          uint32_t entry_pc,
+                                          uint32_t start,
+                                          uint32_t end) {
+    openspm_m14_v44_sleep_query *record;
+    uint32_t seq;
+    uint32_t stage;
+    uint32_t slot;
+    uint32_t current;
+    if (cpu == NULL) return;
+    bridge_v44_stage(cpu, &seq, &stage);
+    if (seq != 0u || stage != 1u) return;
+
+    slot = g_m14_v44_sleep_query_count % OPENSPM_M14_V44_SLEEP_RING;
+    record = &g_m14_v44_sleep_ring[slot];
+    memset(record, 0, sizeof(*record));
+    record->valid = 1u;
+    record->kind = kind;
+    record->seq = seq;
+    record->stage = stage;
+    record->retrace_ticks = g_m14_retrace_ticks;
+    record->entry_pc = entry_pc;
+    record->region_start = start;
+    record->region_end = end;
+    record->queue_arg = (uint32_t)cpu->gpr[3];
+    record->lr = (uint32_t)cpu->lr;
+    record->sp = (uint32_t)cpu->gpr[1];
+
+    if (bridge_m14_context_address_valid(cpu,
+                                          OPENSPM_M14_OS_CURRENT_CONTEXT, 4u))
+        record->current_context = mem_read32(cpu,
+                                             OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (bridge_m14_context_address_valid(cpu,
+                                          OPENSPM_M14_V39_OS_CURRENT_THREAD, 4u))
+        record->current_thread = mem_read32(cpu,
+                                            OPENSPM_M14_V39_OS_CURRENT_THREAD);
+
+    current = record->queue_arg;
+    if (bridge_m14_context_address_valid(cpu, current, 8u)) {
+        record->queue_valid = 1u;
+        record->queue_head = mem_read32(cpu, current);
+        record->queue_tail = mem_read32(cpu, current + UINT32_C(4));
+    }
+    ++g_m14_v44_sleep_query_count;
+}
+
+static bool bridge_host_call_v44(CPUState *cpu, u32 address) {
+    if (cpu == NULL || g_m14_v44_underlying_host_call == NULL)
+        return false;
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t entry_pc = (uint32_t)cpu->pc;
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        if (entry_pc == OPENSPM_LOCAL_OS_SLEEP_THREAD) {
+            bridge_v44_record_sleep_query(cpu, 1u, entry_pc, start, end);
+        } else if (entry_pc == OPENSPM_LOCAL_VI_SLEEP_CALL) {
+            bridge_v44_record_sleep_query(cpu, 2u, entry_pc, start, end);
+        }
+    }
+
+    return g_m14_v44_underlying_host_call(cpu, address);
+}
+
+static void bridge_v44_dump_sleep_ring(openspm_bridge_instance *instance) {
+    uint32_t total;
+    uint32_t begin;
+    uint32_t ordinal;
+    if (instance == NULL) return;
+    total = g_m14_v44_sleep_query_count;
+    begin = total > OPENSPM_M14_V44_SLEEP_RING
+        ? total - OPENSPM_M14_V44_SLEEP_RING : 0u;
+
+    if (total == 0u) {
+        bridge_v44_log(instance,
+            "M14 LLVM pre-idle sleep ring empty: no stage-1 OSSleepThread/VI sleep-call native-region entry was observed; guest execution was not trapped to force one.");
+        return;
+    }
+
+    for (ordinal = begin; ordinal < total; ++ordinal) {
+        const openspm_m14_v44_sleep_query *record =
+            &g_m14_v44_sleep_ring[ordinal % OPENSPM_M14_V44_SLEEP_RING];
+        char message[640];
+        if (!record->valid) continue;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM pre-idle sleep ring %u/%u kind=%s tick=%u entry=0x%08X range=[0x%08X,0x%08X) queue_r3=0x%08X queue_valid=%s head=0x%08X tail=0x%08X context=0x%08X thread=0x%08X lr=0x%08X sp=0x%08X.",
+            (unsigned)(ordinal - begin + 1u),
+            (unsigned)(total - begin),
+            record->kind == 1u ? "OSSleepThread" : "VI-sleep-call",
+            (unsigned)record->retrace_ticks,
+            (unsigned)record->entry_pc,
+            (unsigned)record->region_start,
+            (unsigned)record->region_end,
+            (unsigned)record->queue_arg,
+            record->queue_valid ? "yes" : "no",
+            (unsigned)record->queue_head,
+            (unsigned)record->queue_tail,
+            (unsigned)record->current_context,
+            (unsigned)record->current_thread,
+            (unsigned)record->lr,
+            (unsigned)record->sp);
+        bridge_v44_log(instance, message);
+    }
+}
+
+static void bridge_v44_log_idle_state(
+    openspm_bridge_instance *instance,
+    const openspm_m14_v43_vi_snapshot *before,
+    const openspm_m14_v43_vi_snapshot *after,
+    uint32_t before_lr,
+    uint32_t before_ctr,
+    uint32_t before_sp,
+    uint32_t before_r3,
+    int result,
+    const openspm_native_exit *out_exit,
+    const char *label) {
+    char message[1088];
+    if (instance == NULL || before == NULL || after == NULL || label == NULL)
+        return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM post-frame idle %s #%u tick=%u->%u queue@0x%08X head=0x%08X->0x%08X tail=0x%08X->0x%08X count%s@0x%08X=0x%08X->0x%08X runq=0x%08X->0x%08X hint=0x%08X->0x%08X context=0x%08X->0x%08X thread=0x%08X->0x%08X pc=0x%08X->0x%08X pre_lr=0x%08X pre_ctr=0x%08X pre_sp=0x%08X pre_r3=0x%08X post_lr=0x%08X post_ctr=0x%08X post_sp=0x%08X post_r3=0x%08X result=%d exit=%u/detail=%u/source=0x%08llX.",
+        label, (unsigned)(g_m14_v44_idle_logs + 1u),
+        (unsigned)before->retrace_ticks, (unsigned)after->retrace_ticks,
+        (unsigned)after->queue_addr,
+        (unsigned)before->queue_head, (unsigned)after->queue_head,
+        (unsigned)before->queue_tail, (unsigned)after->queue_tail,
+        (before->count_valid && after->count_valid) ? "" : "-unavailable",
+        (unsigned)(after->count_valid ? after->count_addr : 0u),
+        (unsigned)(before->count_valid ? before->retrace_count : 0u),
+        (unsigned)(after->count_valid ? after->retrace_count : 0u),
+        (unsigned)before->runqueue_bits, (unsigned)after->runqueue_bits,
+        (unsigned)before->runqueue_hint, (unsigned)after->runqueue_hint,
+        (unsigned)before->current_context, (unsigned)after->current_context,
+        (unsigned)before->current_thread, (unsigned)after->current_thread,
+        (unsigned)before->pc, (unsigned)after->pc,
+        (unsigned)before_lr, (unsigned)before_ctr,
+        (unsigned)before_sp, (unsigned)before_r3,
+        (unsigned)instance->cpu.lr, (unsigned)instance->cpu.ctr,
+        (unsigned)instance->cpu.gpr[1], (unsigned)instance->cpu.gpr[3],
+        result,
+        out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+        out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+        (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+    bridge_v44_log(instance, message);
+    ++g_m14_v44_idle_logs;
+}
+
+static int OPENSPM_CALL bridge_run_v44(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    openspm_m14_v43_vi_snapshot before;
+    openspm_m14_v43_vi_snapshot after;
+    uint32_t before_lr;
+    uint32_t before_ctr;
+    uint32_t before_sp;
+    uint32_t before_r3;
+    uint32_t stage1;
+    uint32_t changed;
+    int result;
+
+    if (instance == NULL || g_m14_v44_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    bridge_v43_snapshot(instance, &before);
+    before_lr = (uint32_t)instance->cpu.lr;
+    before_ctr = (uint32_t)instance->cpu.ctr;
+    before_sp = (uint32_t)instance->cpu.gpr[1];
+    before_r3 = (uint32_t)instance->cpu.gpr[3];
+
+    result = g_m14_v44_underlying_run(opaque, soft_cycle_budget, out_exit);
+    bridge_v43_snapshot(instance, &after);
+
+    stage1 = after.valid && after.seq == 0u && after.stage == 1u;
+    if (!g_m14_v44_idle_active && stage1 &&
+        before.pc != OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        after.pc == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+        g_m14_v44_idle_active = 1u;
+        g_m14_v44_idle_runs = 0u;
+        g_m14_v44_last_tick = UINT32_MAX;
+        g_m14_v44_last_queue_head = UINT32_MAX;
+        g_m14_v44_last_queue_tail = UINT32_MAX;
+        g_m14_v44_last_count = UINT32_MAX;
+        g_m14_v44_last_runq = UINT32_MAX;
+        g_m14_v44_last_hint = UINT32_MAX;
+        g_m14_v44_last_thread = UINT32_MAX;
+        bridge_v44_log(instance,
+            "M14 LLVM post-frame idle capture ARMED on first seq=0/stage=1 transition into 0x8027551C; dumping the bounded pre-idle sleep-query ring, then logging only state changes/retrace epochs.");
+        bridge_v44_dump_sleep_ring(instance);
+        if (g_m14_v44_idle_logs < OPENSPM_M14_V44_IDLE_LOG_LIMIT)
+            bridge_v44_log_idle_state(instance, &before, &after,
+                                      before_lr, before_ctr, before_sp, before_r3,
+                                      result, out_exit, "ENTER");
+    }
+
+    if (g_m14_v44_idle_active && stage1 &&
+        after.pc == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+        ++g_m14_v44_idle_runs;
+        changed =
+            after.retrace_ticks != g_m14_v44_last_tick ||
+            after.queue_head != g_m14_v44_last_queue_head ||
+            after.queue_tail != g_m14_v44_last_queue_tail ||
+            (after.count_valid && after.retrace_count != g_m14_v44_last_count) ||
+            after.runqueue_bits != g_m14_v44_last_runq ||
+            after.runqueue_hint != g_m14_v44_last_hint ||
+            after.current_thread != g_m14_v44_last_thread;
+        if (changed && g_m14_v44_idle_logs < OPENSPM_M14_V44_IDLE_LOG_LIMIT) {
+            bridge_v44_log_idle_state(instance, &before, &after,
+                                      before_lr, before_ctr, before_sp, before_r3,
+                                      result, out_exit, "STATE");
+        }
+        g_m14_v44_last_tick = after.retrace_ticks;
+        g_m14_v44_last_queue_head = after.queue_head;
+        g_m14_v44_last_queue_tail = after.queue_tail;
+        g_m14_v44_last_count = after.count_valid ? after.retrace_count : UINT32_MAX;
+        g_m14_v44_last_runq = after.runqueue_bits;
+        g_m14_v44_last_hint = after.runqueue_hint;
+        g_m14_v44_last_thread = after.current_thread;
+    }
+
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v44(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v44_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v44_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v44_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_v44;
+    memset(g_m14_v44_sleep_ring, 0, sizeof(g_m14_v44_sleep_ring));
+    g_m14_v44_sleep_query_count = 0u;
+    g_m14_v44_idle_active = 0u;
+    g_m14_v44_idle_runs = 0u;
+    g_m14_v44_idle_logs = 0u;
+    g_m14_v44_last_tick = UINT32_MAX;
+    g_m14_v44_last_queue_head = UINT32_MAX;
+    g_m14_v44_last_queue_tail = UINT32_MAX;
+    g_m14_v44_last_count = UINT32_MAX;
+    g_m14_v44_last_runq = UINT32_MAX;
+    g_m14_v44_last_hint = UINT32_MAX;
+    g_m14_v44_last_thread = UINT32_MAX;
+
+    bridge_v44_log(instance,
+        "M14 LLVM post-frame idle truth probe active: stage-1 VI wake/count proof is preserved; first transition into scheduler idle dumps an 8-entry sleep-query ring and opens a separate retrace-state window; guest state unchanged.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v44(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[320];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM post-frame idle truth stats sleep_queries=%u idle_active=%u idle_runs=%u idle_logs=%u.",
+            (unsigned)g_m14_v44_sleep_query_count,
+            (unsigned)g_m14_v44_idle_active,
+            (unsigned)g_m14_v44_idle_runs,
+            (unsigned)g_m14_v44_idle_logs);
+        bridge_v44_log(instance, message);
+        instance->cpu.host_call = g_m14_v44_underlying_host_call;
+    }
+    if (g_m14_v44_underlying_destroy != NULL)
+        g_m14_v44_underlying_destroy(opaque);
+    g_m14_v44_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev43_vi_wait_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v44_underlying_create = out_api->create;
+    g_m14_v44_underlying_run = out_api->run;
+    g_m14_v44_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev44-llvm-postframe-idle-truth";
+    out_api->create = bridge_create_v44;
+    out_api->run = bridge_run_v44;
+    out_api->destroy = bridge_destroy_v44;
+#endif
+    return OPENSPM_OK;
+}

@@ -1,0 +1,38 @@
+name: Package ModernGekko Sys data
+
+on:
+  push:
+    paths:
+      - ".github/workflows/package-sys.yml"
+  workflow_dispatch:
+
+jobs:
+  package-sys:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch pinned RecompCore
+        run: |
+          set -euxo pipefail
+
+          git init RecompCore
+          git -C RecompCore remote add origin \
+            https://github.com/ExpansionPak/RecompCore.git
+
+          git -C RecompCore fetch --depth=1 origin \
+            55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac
+
+          git -C RecompCore checkout --detach FETCH_HEAD
+
+          test "$(git -C RecompCore rev-parse HEAD)" = \
+            "55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac"
+
+          test -d RecompCore/Data/Sys
+
+      - name: Upload Sys data
+        uses: actions/upload-artifact@v4
+        with:
+          name: spm-moderngekko-sys
+          path: RecompCore/Data/Sys/
+          if-no-files-found: error
+          retention-days: 30

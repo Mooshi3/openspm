@@ -1,0 +1,172 @@
+/*
+ * M14 local-module bridge v22 / direct-BL cold-entry rescue.
+ *
+ * Runtime after the v21 HOME seam reaches seq=0/stage=1, proving seqMain()
+ * executed, then repeatedly materializes 0x801A7ACC before executing the next
+ * direct linked branch.  Exact player-owned R8PE01 bytes are:
+ *
+ *   0x801A7AC8: bl 0x8017B72C   (seqMain)
+ *   0x801A7ACC: bl 0x8023CCF0   (nandMain)
+ *
+ * 0x801A7ACC is therefore both a legal BL continuation (PC+4 of seqMain) and a
+ * direct BL instruction itself.  The private DolRecomp collector is already
+ * supposed to make every BL/BCL+4 a cold entry, but this cross-128-instruction
+ * chunk case is still reaching the fallback/host-call path before the BL runs.
+ *
+ * Keep moving without special-casing game logic: after every ordinary host-call
+ * layer has declined an address, if the current guest instruction is a direct
+ * PowerPC B-form instruction with LK=1, execute exactly that instruction's
+ * architectural effect (LR=PC+4, PC=branch target).  No registers, memory or
+ * condition state are changed.  The target then goes back through normal native
+ * dispatch.  This is a bounded correctness safety net for a missing LLVM cold
+ * entry, not HLE of the called game function.
+ *
+ * Region-query semantics are delegated untouched.  v21's HOME system-UI seam,
+ * v20 DSP task completion, v19 cold-resume recovery and all older platform/input
+ * behavior remain underneath.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev31_system_ui_base
+#include "legacy_c_adapter_v21.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_v32_underlying_create;
+static openspm_native_destroy_fn g_m14_v32_underlying_destroy;
+static PPCHostCall g_m14_v32_underlying_host_call;
+static uint64_t g_m14_v32_bl_rescues;
+static uint32_t g_m14_v32_bl_logged;
+
+static int bridge_v32_decode_direct_bl(CPUState *cpu, uint32_t address,
+                                       uint32_t *out_target) {
+    uint32_t raw;
+    int32_t displacement;
+    uint32_t target;
+
+    if (cpu == NULL || out_target == NULL ||
+        !bridge_m14_context_address_valid(cpu, address, 4u))
+        return 0;
+    raw = mem_read32(cpu, address);
+    /* PowerPC B-form: primary opcode 18. Require LK=1; accept AA=0/1. */
+    if ((raw >> 26) != 18u || (raw & 1u) == 0u)
+        return 0;
+
+    displacement = (int32_t)(raw & UINT32_C(0x03FFFFFC));
+    if ((displacement & INT32_C(0x02000000)) != 0)
+        displacement |= (int32_t)UINT32_C(0xFC000000);
+    target = (raw & 2u) != 0u
+                 ? (uint32_t)displacement
+                 : address + (uint32_t)displacement;
+    if (!bridge_m14_context_address_valid(cpu, target, 4u))
+        return 0;
+    *out_target = target;
+    return 1;
+}
+
+static void bridge_v32_log_rescue_once(CPUState *cpu, uint32_t address,
+                                       uint32_t target) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    char message[256];
+    if (g_m14_v32_bl_logged || cpu == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(message, sizeof(message),
+                   "M14 LLVM direct-BL cold-entry rescue active: executed unhandled linked branch at 0x%08X -> 0x%08X (LR=PC+4); compiler continuation-entry audit remains open.",
+                   (unsigned)address, (unsigned)target);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+    g_m14_v32_bl_logged = 1u;
+}
+
+static bool bridge_host_call_v32(CPUState *cpu, u32 address) {
+    uint32_t target = 0u;
+    bool handled;
+
+    if (cpu == NULL) return false;
+
+    /* Native-region queries use false=allow / true=block, not ordinary
+       host-call handled semantics. Never reinterpret a false query as an
+       unhandled guest instruction. */
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return g_m14_v32_underlying_host_call != NULL
+                   ? g_m14_v32_underlying_host_call(cpu, address)
+                   : false;
+
+    handled = g_m14_v32_underlying_host_call != NULL
+                  ? g_m14_v32_underlying_host_call(cpu, address)
+                  : false;
+    if (handled) return true;
+
+    if (!bridge_v32_decode_direct_bl(cpu, (uint32_t)address, &target))
+        return false;
+
+    cpu->lr = (uint32_t)address + 4u;
+    cpu->pc = target;
+    ++g_m14_v32_bl_rescues;
+    bridge_v32_log_rescue_once(cpu, (uint32_t)address, target);
+    return true;
+}
+
+static int OPENSPM_CALL bridge_create_v32(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v32_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v32_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v32_underlying_host_call = instance->cpu.host_call;
+    g_m14_v32_bl_rescues = 0u;
+    g_m14_v32_bl_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v32;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v32(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v32_bl_rescues != 0u &&
+        instance->runtime != NULL && instance->runtime->host != NULL &&
+        instance->runtime->host->log != NULL) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM direct-BL cold-entry rescue stats rescues=%llu.",
+                       (unsigned long long)g_m14_v32_bl_rescues);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v32_underlying_host_call;
+    if (g_m14_v32_underlying_destroy != NULL)
+        g_m14_v32_underlying_destroy(opaque);
+    g_m14_v32_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev31_system_ui_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v32_underlying_create = out_api->create;
+    g_m14_v32_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev32-llvm-direct-bl-rescue";
+    out_api->create = bridge_create_v32;
+    out_api->destroy = bridge_destroy_v32;
+#endif
+    return OPENSPM_OK;
+}

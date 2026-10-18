@@ -1,0 +1,432 @@
+/*
+ * M14 local-module bridge v40 / dev51 test-ready GX + input contract.
+ *
+ * dev50 removes the bring-up probes from LLVM's native-region hot path.  Keep
+ * that production router unchanged, then close two player-facing contracts
+ * before asking for the next Windows test:
+ *
+ *   1. PC-native GXBeginDisplayList/GXEndDisplayList must replace only Wii CPU
+ *      FIFO transport.  The retail SDK also flushes pending dirty GX state,
+ *      optionally saves/restores the 0x600-byte GXData CPU shadow, preserves
+ *      cpCtrlReg across the restore, and maintains dlistActive.  A player-local
+ *      build-time scanner proves the exact R8PE01 fields, __GXData pointer slot
+ *      and __GXSetDirtyState helper.  dev51 reproduces those CPU-visible
+ *      semantics around dev48's bounded PC recorder and never enters the Wii
+ *      FIFO/write-gather setup body.
+ *
+ *   2. Input remains one coherent sample per simulation retrace.  v8 emits one
+ *      scheduler-idle presentation/input safepoint per delivered VI epoch;
+ *      backend dev23 latches Windows keys there; dev24 exposes that snapshot as
+ *      real KPADRead/WPADProbe and dev26 adds release/repeat fidelity.  dev51
+ *      wraps only the semantic host service to count those exact boundaries so
+ *      a player log can prove frame latches and Wii API reads without changing
+ *      any button state or polling cadence.
+ *
+ * Dirty GX state is flushed BEFORE the PC display-list recorder is activated,
+ * matching Revolution GX ordering.  The dirty helper runs as a bounded scratch
+ * guest callback: registers are disposable, while guest RAM and OpenSPM's GX
+ * write-gather/FIFO services remain shared.  dev48 then flushes any partial
+ * write-gather line before switching the physical destination to the caller's
+ * display-list buffer.
+ *
+ * Historical source-contract markers retained for CMake/archaeology:
+ * m14-dev49-llvm-pc-display-list-return
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ * m14-dev50-llvm-production-router
+ * m14-dev51-llvm-test-ready-gx-input
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev50_production_base
+#include "legacy_c_adapter_v39.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#include "openspm_local_gx_dl_semantics.h"
+
+#define OPENSPM_M14_DEV51_INPUT_PRESSED UINT32_C(0x80235AB8)
+#define OPENSPM_M14_DEV51_WPAD_PROBE    UINT32_C(0x802CE890)
+#define OPENSPM_M14_DEV51_KPAD_READ     UINT32_C(0x802DF4F0)
+
+static openspm_native_create_fn g_m14_dev51_underlying_create;
+static openspm_native_destroy_fn g_m14_dev51_underlying_destroy;
+static PPCHostCall g_m14_dev51_underlying_host_call;
+static openspm_m14_hostcall_handle_fn g_m14_dev51_underlying_service_handle;
+static openspm_bridge_instance *g_m14_dev51_instance;
+
+static uint8_t g_m14_dev51_saved_gxdata[OPENSPM_LOCAL_GXDL_DATA_SIZE];
+static uint32_t g_m14_dev51_saved_gxdata_address;
+static uint32_t g_m14_dev51_saved_gxdata_valid;
+static uint64_t g_m14_dev51_gx_dirty_flushes;
+static uint64_t g_m14_dev51_gx_saves;
+static uint64_t g_m14_dev51_gx_restores;
+static uint64_t g_m14_dev51_gx_shadow_failures;
+static uint64_t g_m14_dev51_input_frames;
+static uint64_t g_m14_dev51_input_pressed_getters;
+static uint64_t g_m14_dev51_wpad_probes;
+static uint64_t g_m14_dev51_kpad_reads;
+static uint32_t g_m14_dev51_input_frame_logged;
+static uint32_t g_m14_dev51_kpad_logged;
+static uint32_t g_m14_dev51_wpad_logged;
+
+static uint32_t bridge_dev51_expr_address(const CPUState *cpu,
+                                          uint32_t mode,
+                                          uint32_t value,
+                                          int *out_ok) {
+    uint32_t address = 0u;
+    int ok = 1;
+    if (cpu == NULL) ok = 0;
+    else if (mode == OPENSPM_LOCAL_GXDL_EXPR_ABSOLUTE)
+        address = value;
+    else if (mode == OPENSPM_LOCAL_GXDL_EXPR_R13)
+        address = cpu->gpr[13] + value;
+    else if (mode == OPENSPM_LOCAL_GXDL_EXPR_R2)
+        address = cpu->gpr[2] + value;
+    else
+        ok = 0;
+    if (out_ok != NULL) *out_ok = ok;
+    return address;
+}
+
+static int bridge_dev51_gxdata(CPUState *cpu, uint32_t *out_address) {
+    uint32_t slot;
+    uint32_t gxdata;
+    int ok = 0;
+    if (cpu == NULL || out_address == NULL) return 0;
+
+    slot = bridge_dev51_expr_address(cpu,
+                                    OPENSPM_LOCAL_GXDL_DATA_SLOT_MODE,
+                                    OPENSPM_LOCAL_GXDL_DATA_SLOT_VALUE,
+                                    &ok);
+    if (!ok || !bridge_m14_context_address_valid(cpu, slot, 4u)) return 0;
+    gxdata = mem_read32(cpu, slot);
+    if (gxdata == 0u ||
+        !bridge_m14_context_address_valid(cpu, gxdata,
+                                          OPENSPM_LOCAL_GXDL_DATA_SIZE))
+        return 0;
+    *out_address = gxdata;
+    return 1;
+}
+
+static void bridge_dev51_copy_from_guest(CPUState *cpu, uint32_t address,
+                                         uint8_t *dest, uint32_t size) {
+    uint32_t i;
+    for (i = 0u; i < size; ++i)
+        dest[i] = mem_read8(cpu, address + i);
+}
+
+static void bridge_dev51_copy_to_guest(CPUState *cpu, uint32_t address,
+                                       const uint8_t *source, uint32_t size) {
+    uint32_t i;
+    for (i = 0u; i < size; ++i)
+        mem_write8(cpu, address + i, source[i]);
+}
+
+static bool bridge_dev51_gx_fail(CPUState *cpu, uint32_t target,
+                                 uint32_t detail, const char *reason) {
+    openspm_bridge_instance *instance = g_m14_dev51_instance;
+    char message[384];
+    ++g_m14_dev51_gx_shadow_failures;
+    if (instance != NULL) {
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM GX shadow fail-closed #%llu target=0x%08X detail=%u reason=%s pc=0x%08X lr=0x%08X.",
+                       (unsigned long long)g_m14_dev51_gx_shadow_failures,
+                       (unsigned)target, (unsigned)detail,
+                       reason != NULL ? reason : "unknown",
+                       (unsigned)(cpu != NULL ? cpu->pc : 0u),
+                       (unsigned)(cpu != NULL ? cpu->lr : 0u));
+        bridge_v44_log(instance, message);
+        bridge_request_fallback(instance, target, detail);
+    }
+    if (cpu != NULL) cpu->pc = target;
+    return true;
+}
+
+static int bridge_dev51_flush_dirty_gx(CPUState *cpu, uint32_t gxdata) {
+    openspm_bridge_instance *instance = g_m14_dev51_instance;
+    uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS] = {0};
+    uint32_t dirty;
+    int result;
+    if (cpu == NULL || instance == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+
+    dirty = mem_read32(cpu, gxdata + OPENSPM_LOCAL_GXDL_DIRTY_OFF);
+    if (dirty == 0u) return OPENSPM_OK;
+
+    /* __GXSetDirtyState is ordinary player code. Run it from a disposable
+       register snapshot before recorder activation; shared RAM + WPAR/FIFO
+       effects are the exact CPU-visible behavior we need to retain. */
+    result = bridge_run_m14_event(instance,
+                                  OPENSPM_LOCAL_GXDL_DIRTY_HELPER,
+                                  0u, args);
+    if (result == OPENSPM_OK) ++g_m14_dev51_gx_dirty_flushes;
+    return result;
+}
+
+static int bridge_dev51_dev48_succeeded(openspm_bridge_instance *instance,
+                                        CPUState *cpu,
+                                        uint32_t target,
+                                        uint32_t return_pc,
+                                        bool handled) {
+    if (!handled || instance == NULL || cpu == NULL) return 0;
+    if (instance->fallback_requested && instance->fallback_address == target)
+        return 0;
+    return ((uint32_t)cpu->pc == return_pc);
+}
+
+static bool bridge_dev51_begin_display_list(CPUState *cpu) {
+    openspm_bridge_instance *instance = g_m14_dev51_instance;
+    uint32_t gxdata;
+    uint32_t return_pc;
+    uint8_t save;
+    bool handled;
+    int result;
+
+    if (cpu == NULL || instance == NULL || cpu != &instance->cpu)
+        return g_m14_dev51_underlying_host_call != NULL
+                   ? g_m14_dev51_underlying_host_call(
+                         cpu, OPENSPM_LOCAL_V19_GX_BEGIN)
+                   : false;
+    if (g_m14_dev51_saved_gxdata_valid)
+        return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_BEGIN, 51u,
+                                    "nested GXBeginDisplayList shadow snapshot");
+    if (!bridge_dev51_gxdata(cpu, &gxdata))
+        return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_BEGIN, 52u,
+                                    "derived __GXData pointer is not guest RAM");
+
+    result = bridge_dev51_flush_dirty_gx(cpu, gxdata);
+    if (result != OPENSPM_OK)
+        return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_BEGIN, 53u,
+                                    "player __GXSetDirtyState callback failed");
+
+    /* The dirty helper can legally reload/update GX globals. Resolve the player
+       slot again before taking the save-context snapshot. */
+    if (!bridge_dev51_gxdata(cpu, &gxdata))
+        return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_BEGIN, 54u,
+                                    "__GXData pointer invalid after dirty flush");
+
+    save = mem_read8(cpu, gxdata + OPENSPM_LOCAL_GXDL_SAVE_OFF);
+    if (save != 0u) {
+        bridge_dev51_copy_from_guest(cpu, gxdata,
+                                     g_m14_dev51_saved_gxdata,
+                                     OPENSPM_LOCAL_GXDL_DATA_SIZE);
+        g_m14_dev51_saved_gxdata_address = gxdata;
+        g_m14_dev51_saved_gxdata_valid = 1u;
+        ++g_m14_dev51_gx_saves;
+    } else {
+        g_m14_dev51_saved_gxdata_address = 0u;
+        g_m14_dev51_saved_gxdata_valid = 0u;
+    }
+
+    return_pc = (uint32_t)cpu->lr;
+    handled = bridge_dev48_host_display_list(cpu, OPENSPM_LOCAL_V19_GX_BEGIN);
+    if (!bridge_dev51_dev48_succeeded(instance, cpu,
+                                      OPENSPM_LOCAL_V19_GX_BEGIN,
+                                      return_pc, handled)) {
+        g_m14_dev51_saved_gxdata_address = 0u;
+        g_m14_dev51_saved_gxdata_valid = 0u;
+        return handled;
+    }
+
+    /* No guest code runs between public Begin entry and this write. Therefore
+       setting dlistActive after the host recorder transition is observationally
+       equivalent to retail's write immediately before GXSetCPUFifo, while also
+       leaving the guest shadow unchanged if recorder setup fails. */
+    mem_write8(cpu, gxdata + OPENSPM_LOCAL_GXDL_ACTIVE_OFF, 1u);
+    return true;
+}
+
+static bool bridge_dev51_end_display_list(CPUState *cpu) {
+    openspm_bridge_instance *instance = g_m14_dev51_instance;
+    uint32_t gxdata;
+    uint32_t return_pc;
+    uint32_t cp_ctrl = 0u;
+    uint8_t save;
+    bool handled;
+
+    if (cpu == NULL || instance == NULL || cpu != &instance->cpu)
+        return g_m14_dev51_underlying_host_call != NULL
+                   ? g_m14_dev51_underlying_host_call(
+                         cpu, OPENSPM_LOCAL_V19_GX_END)
+                   : false;
+    if (!bridge_dev51_gxdata(cpu, &gxdata))
+        return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_END, 55u,
+                                    "derived __GXData pointer is not guest RAM");
+
+    save = mem_read8(cpu, gxdata + OPENSPM_LOCAL_GXDL_SAVE_OFF);
+    if (save != 0u) {
+        if (!g_m14_dev51_saved_gxdata_valid ||
+            g_m14_dev51_saved_gxdata_address != gxdata)
+            return bridge_dev51_gx_fail(cpu, OPENSPM_LOCAL_V19_GX_END, 56u,
+                                        "GXEndDisplayList has no matching saved GXData");
+        cp_ctrl = mem_read32(cpu, gxdata + OPENSPM_LOCAL_GXDL_CP_CTRL_OFF);
+    }
+
+    return_pc = (uint32_t)cpu->lr;
+    handled = bridge_dev48_host_display_list(cpu, OPENSPM_LOCAL_V19_GX_END);
+    if (!bridge_dev51_dev48_succeeded(instance, cpu,
+                                      OPENSPM_LOCAL_V19_GX_END,
+                                      return_pc, handled))
+        return handled;
+
+    if (save != 0u) {
+        bridge_dev51_copy_to_guest(cpu, gxdata,
+                                   g_m14_dev51_saved_gxdata,
+                                   OPENSPM_LOCAL_GXDL_DATA_SIZE);
+        /* Retail protects this save/restore with OSDisableInterrupts. OpenSPM's
+           semantic host callback is synchronous: no guest thread can observe
+           the copy midway through. Preserve the only intentional post-copy
+           exception exactly: current cpCtrlReg wins over the saved value. */
+        mem_write32(cpu, gxdata + OPENSPM_LOCAL_GXDL_CP_CTRL_OFF, cp_ctrl);
+        ++g_m14_dev51_gx_restores;
+    }
+    mem_write8(cpu, gxdata + OPENSPM_LOCAL_GXDL_ACTIVE_OFF, 0u);
+    g_m14_dev51_saved_gxdata_address = 0u;
+    g_m14_dev51_saved_gxdata_valid = 0u;
+    return true;
+}
+
+static bool bridge_host_call_dev51(CPUState *cpu, u32 address) {
+    if ((uint32_t)address == OPENSPM_LOCAL_V19_GX_BEGIN)
+        return bridge_dev51_begin_display_list(cpu);
+    if ((uint32_t)address == OPENSPM_LOCAL_V19_GX_END)
+        return bridge_dev51_end_display_list(cpu);
+    return g_m14_dev51_underlying_host_call != NULL
+               ? g_m14_dev51_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_dev51_hostcall_service(
+    void *context,
+    uint32_t target_address,
+    openspm_m14_hostcall_state *state) {
+    int result;
+    if (g_m14_dev51_underlying_service_handle == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    result = g_m14_dev51_underlying_service_handle(context,
+                                                   target_address, state);
+    if (result != OPENSPM_OK) return result;
+
+    if (target_address == OPENSPM_M14_HOST_EVENT_PRESENT_SAFEPOINT) {
+        ++g_m14_dev51_input_frames;
+        if (!g_m14_dev51_input_frame_logged && g_m14_dev51_instance != NULL) {
+            bridge_v44_log(g_m14_dev51_instance,
+                "M14 LLVM input frame latch proven: scheduler-idle safepoint reached the semantic backend; keyboard/pointer state is sampled once for this complete VI simulation frame.");
+            g_m14_dev51_input_frame_logged = 1u;
+        }
+    } else if (target_address == OPENSPM_M14_DEV51_INPUT_PRESSED) {
+        ++g_m14_dev51_input_pressed_getters;
+    } else if (target_address == OPENSPM_M14_DEV51_WPAD_PROBE) {
+        ++g_m14_dev51_wpad_probes;
+        if (!g_m14_dev51_wpad_logged && g_m14_dev51_instance != NULL) {
+            bridge_v44_log(g_m14_dev51_instance,
+                "M14 LLVM WPAD route proven: player WPADProbe reached OpenSPM's connected-controller semantic service.");
+            g_m14_dev51_wpad_logged = 1u;
+        }
+    } else if (target_address == OPENSPM_M14_DEV51_KPAD_READ) {
+        ++g_m14_dev51_kpad_reads;
+        if (!g_m14_dev51_kpad_logged && g_m14_dev51_instance != NULL) {
+            bridge_v44_log(g_m14_dev51_instance,
+                "M14 LLVM KPAD route proven: player KPADRead reached the frame-latched PC input service; held/pressed/released/repeat state remains backend-authoritative.");
+            g_m14_dev51_kpad_logged = 1u;
+        }
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_dev51(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev51_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev51_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev51_instance = instance;
+    g_m14_dev51_underlying_host_call = instance->cpu.host_call;
+    g_m14_dev51_underlying_service_handle =
+        g_m14_have_hostcall ? g_m14_hostcall.handle : NULL;
+
+    memset(g_m14_dev51_saved_gxdata, 0, sizeof(g_m14_dev51_saved_gxdata));
+    g_m14_dev51_saved_gxdata_address = 0u;
+    g_m14_dev51_saved_gxdata_valid = 0u;
+    g_m14_dev51_gx_dirty_flushes = 0u;
+    g_m14_dev51_gx_saves = 0u;
+    g_m14_dev51_gx_restores = 0u;
+    g_m14_dev51_gx_shadow_failures = 0u;
+    g_m14_dev51_input_frames = 0u;
+    g_m14_dev51_input_pressed_getters = 0u;
+    g_m14_dev51_wpad_probes = 0u;
+    g_m14_dev51_kpad_reads = 0u;
+    g_m14_dev51_input_frame_logged = 0u;
+    g_m14_dev51_kpad_logged = 0u;
+    g_m14_dev51_wpad_logged = 0u;
+
+    instance->cpu.host_call = bridge_host_call_dev51;
+    if (g_m14_have_hostcall && g_m14_hostcall.handle != NULL)
+        g_m14_hostcall.handle = bridge_dev51_hostcall_service;
+
+    bridge_v44_log(instance,
+        "M14 LLVM test-ready GX/input layer active: player-derived GXData dirty/save/restore semantics wrap the PC display-list recorder; frame-latched WPAD/KPAD routing is counted without changing input state.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev51(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[640];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM test-ready stats gx_dirty_flushes=%llu gx_saves=%llu gx_restores=%llu gx_failures=%llu input_frames=%llu pressed_getters=%llu wpad_probes=%llu kpad_reads=%llu saved_gxdata_live=%u.",
+            (unsigned long long)g_m14_dev51_gx_dirty_flushes,
+            (unsigned long long)g_m14_dev51_gx_saves,
+            (unsigned long long)g_m14_dev51_gx_restores,
+            (unsigned long long)g_m14_dev51_gx_shadow_failures,
+            (unsigned long long)g_m14_dev51_input_frames,
+            (unsigned long long)g_m14_dev51_input_pressed_getters,
+            (unsigned long long)g_m14_dev51_wpad_probes,
+            (unsigned long long)g_m14_dev51_kpad_reads,
+            (unsigned)g_m14_dev51_saved_gxdata_valid);
+        bridge_v44_log(instance, message);
+
+        if (instance->cpu.host_call == bridge_host_call_dev51)
+            instance->cpu.host_call = g_m14_dev51_underlying_host_call;
+    }
+    if (g_m14_have_hostcall &&
+        g_m14_hostcall.handle == bridge_dev51_hostcall_service)
+        g_m14_hostcall.handle = g_m14_dev51_underlying_service_handle;
+
+    g_m14_dev51_instance = NULL;
+    g_m14_dev51_underlying_host_call = NULL;
+    g_m14_dev51_underlying_service_handle = NULL;
+    if (g_m14_dev51_underlying_destroy != NULL)
+        g_m14_dev51_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev50_production_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev51_underlying_create = out_api->create;
+    g_m14_dev51_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev51-llvm-test-ready-gx-input";
+    out_api->create = bridge_create_dev51;
+    out_api->destroy = bridge_destroy_dev51;
+#endif
+    return OPENSPM_OK;
+}

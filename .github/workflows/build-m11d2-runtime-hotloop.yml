@@ -1,0 +1,172 @@
+name: Build SPM M11D2 runtime hotloop Windows runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - m11d2-runtime-hotloop
+    paths:
+      - "ci/TRIGGER-M11D2-BUILD.txt"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-windows-m11d2:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Windows build environment
+        run: choco install ninja --no-progress -y
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch exact pinned ModernGekko and RecompCore
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init ModernGekko
+          git -C ModernGekko remote add origin https://github.com/ExpansionPak/ModernGekko.git
+          git -C ModernGekko fetch --depth=1 origin 5417826c31187d4dadf8588c7aa25bf107782936
+          git -C ModernGekko checkout --detach FETCH_HEAD
+          git -C ModernGekko submodule update --init --recursive --force
+          test "$(git -C ModernGekko rev-parse HEAD)" = 5417826c31187d4dadf8588c7aa25bf107782936
+          test "$(git -C ModernGekko/vendor/dolphin rev-parse HEAD)" = 55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac
+
+      - name: Apply ABI3 and runtime-selectable MMU compatibility
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('ModernGekko/include/moderngekko/cpu_state.h')
+          s = p.read_text()
+          assert s.count('#define MODERNGEKKO_CPU_ABI_VERSION 4u') == 1
+          assert s.count('    int64_t cycle_budget;\n') == 1
+          s = s.replace('#define MODERNGEKKO_CPU_ABI_VERSION 4u', '#define MODERNGEKKO_CPU_ABI_VERSION 3u', 1)
+          s = s.replace('    int64_t cycle_budget;\n', '', 1)
+          p.write_text(s)
+
+          p = Path('ModernGekko/src/runtime/dolphin_runtime.cpp')
+          s = p.read_text()
+          anchor = '  Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());'
+          assert s.count(anchor) == 1
+          replacement = '''  Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());
+          const char* m10_mmu_env = std::getenv("M10_MMU");
+          const bool m10_mmu_enabled = !m10_mmu_env || !*m10_mmu_env || *m10_mmu_env != '0';
+          Config::SetBase(Config::MAIN_MMU, m10_mmu_enabled);
+          std::fprintf(stderr, "[M10DIAG] MMU=%s\\n", m10_mmu_enabled ? "ON" : "OFF");
+          std::fflush(stderr);'''
+          p.write_text(s.replace(anchor, replacement, 1))
+          PY
+
+      - name: Apply M11C M11D and M11D2 runtime stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          PATCH="$GITHUB_WORKSPACE/ci/recompcore-portable-rel-discovery.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$PATCH"
+          HIDAPI_PATCH="$GITHUB_WORKSPACE/ci/recompcore-hidapi-nonfatal.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$HIDAPI_PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$HIDAPI_PATCH"
+          OPENSPM_PATCH="$GITHUB_WORKSPACE/ci/m11-openspm-ultrawide-recompcore.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$OPENSPM_PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$OPENSPM_PATCH"
+          python ci/m11b_apply.py
+          python ci/m11c_apply.py
+          python ci/m11d_idle_scheduler.py
+          python ci/m11d2_gate_busywait.py
+          git -C ModernGekko/vendor/dolphin diff --check
+          git -C ModernGekko diff --check
+          grep -q 'openspm_busywait_enabled && !configured_idle' ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+          grep -q '\[OPENSPM-LAB\] analyzer_busywait=' ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+          grep -q 'OPENSPM_IDLE_PC' ModernGekko/src/runtime/dolphin_runtime.cpp
+          grep -q 'OPENSPM-FASTPATH' ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+          python ci/test_rel_discovery_model.py | tee m11d2-rel-model.log
+
+      - name: Apply Windows runtime diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Runtime-only milestone: the exact M11C game DLL and its first-fault
+          # generated-code instrumentation are reused byte-for-byte below.
+          python ci/m10_windows_instrument.py
+
+      - name: Cache compiled ModernGekko objects
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: spm-m11-ultrawide-windows-5417826c-55c7b023
+          variant: sccache
+          max-size: 2G
+
+      - name: Configure ModernGekko
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S ModernGekko -B ModernGekko/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=ON \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF \
+            -DMODERNGEKKO_ENABLE_DISC_TOOL=OFF \
+            2>&1 | tee m11d2-configure.log
+
+      - name: Build M11D2 Windows frontend only
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build ModernGekko/build --target moderngekko-run -j2 2>&1 | tee m11d2-build.log
+
+      - name: Download exact green M11C game-module bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: spm-m11c-runtime-fastpath-windows-runtime
+          path: m11c-dist
+          github-token: ${{ github.token }}
+          run-id: 34091670172
+
+      - name: Package M11D2 runtime-only bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $runner = Get-ChildItem ModernGekko/build -Recurse -Filter moderngekko-run.exe | Select-Object -First 1
+          if (!$runner) { throw 'moderngekko-run.exe not found' }
+          Copy-Item $runner.FullName dist/moderngekko-run.exe
+          Copy-Item m11c-dist/gR8PE01_recomp.dll dist/gR8PE01_recomp.dll
+          Copy-Item m11c-dist/Sys dist/Sys -Recurse
+          Copy-Item ci/RUN-M11D2-OPTIMIZED.cmd dist/RUN-OPENSPM.cmd
+          Copy-Item ci/RUN-M11D2-OPTIMIZED.cmd dist/RUN-M11D2-OPTIMIZED.cmd
+          Copy-Item ci/RUN-M11D2-BASELINE.cmd dist/RUN-M11D2-BASELINE.cmd
+          Copy-Item ci/RUN-M11D2-PERF.cmd dist/RUN-OPENSPM-PERF.cmd
+          Copy-Item m11c-dist/RUN-1-FIRSTFAULT-MMU-OFF.cmd,m11c-dist/RUN-2-FIRSTFAULT-MMU-ON.cmd dist/
+          Copy-Item m11d2-rel-model.log,m11d2-configure.log,m11d2-build.log dist/
+          @"
+          milestone=M11D2-runtime-hotloop
+          base_game_module=M11C-runtime-fastpath
+          game_module=reused-byte-for-byte-from-M11C
+          game_id=R8PE01
+          module_abi=3
+          cpu_abi=3
+          known_scheduler_idle=0x8027551C,enabled-by-default-in-RUN-OPENSPM
+          analyzer_busywait=experimental,opt-in-only,disabled-path-gated-outside-dispatch-hot-loop
+          perf_default=off
+          dispatch_sampling_default=off
+          host_backend=temporary-RecompCore-adapter
+          "@ | Set-Content dist/BUILD-PROVENANCE.txt
+          Get-FileHash dist/moderngekko-run.exe,dist/gR8PE01_recomp.dll -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content dist/SHA256SUMS.txt
+
+      - name: Upload M11D2 runtime bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: spm-m11d2-runtime-hotloop-windows-runtime
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

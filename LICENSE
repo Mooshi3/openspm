@@ -1,0 +1,44 @@
+MIT License
+
+Copyright (c) 2026 the OpenSPM contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+Files under other licenses
+
+OpenSPM's own code is MIT (above). These files are not:
+
+- The DolRecomp adaptation scripts patch DolRecomp's source and carry pieces of
+  it, so they are under DolRecomp's license, the GNU General Public License
+  version 3 (see licenses/GPL-3.0.txt). Each one says so in its first lines
+  (SPDX-License-Identifier: GPL-3.0-only):
+    tools/native_bridge/_apply_openspm_llvm_codegen_patch_base*.py
+    tools/native_bridge/apply_openspm_llvm_wpar_codegen_patch.py
+    tools/native_bridge/apply_llvm_scene_profile.py
+    tools/native_bridge/test_llvm_native_pipeline.py
+    tools/native_bridge/test_scene_profile.py
+- ci/*.patch are historical patches to a Dolphin fork (GPL-2.0-or-later).
+
+Third-party software OpenSPM uses or ships, and its licenses:
+THIRD-PARTY-NOTICES.md.
+
+OpenSPM contains no Nintendo code or assets. The native game module is built on
+the player's own PC from the player's own copy of the game and is never
+distributed.

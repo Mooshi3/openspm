@@ -1,0 +1,2395 @@
+/*
+ * M14 dev68 LLVM runnable-idle repair over dev67/dev63/dev58.
+ *
+ * dev67's Windows log exposed the PC-only idle gate: GX finish wakes a thread
+ * (RunQueueBits=0x8000), but v7 sleeps until VI because PC still equals the idle
+ * continuation. v7 now reads the live run queue before sleeping, allowing the
+ * existing native scheduler to run. No guest context/queue or VI deadline is
+ * fabricated. The generated-C baseline keeps its historical path.
+ *
+ * The slice profiler now uses host monotonic time, explicitly reports time in
+ * idle Sleep, and gives Space-Saving estimates their error bounds. MSVC clock()
+ * measures wall time, not CPU time; its 1 ms granularity also hid short slices.
+ *
+ * dev66 proved that OpenSPM's ordinary semantic router was spectacularly
+ * wasteful but was not the missing 2x: a clean long run produced ~529 million
+ * public host callbacks, ~526 million exact-PC bypass hits, and only ~2.84
+ * million calls into the underlying production router, yet spmarioMain still
+ * remained about 30-31 Hz against 60-62 VI retraces.  Therefore do not spend
+ * another iteration optimizing router comparisons.
+ *
+ * The same run class also exposed a correctness risk in dev66's learning rule.
+ * One wedding-cutscene AFK run stopped making guest progress at 0x80065128 for
+ * minutes while VI remained healthy.  A false/no-immediate-state-change callback
+ * is not proof that an address is permanently non-semantic: a state-dependent
+ * callback can be dormant on its first visit and become necessary later.
+ * Because dev66 did not produce a cadence win, that speculative ordinary-PC
+ * cache is retired completely rather than patched with more exclusions.
+ *
+ * dev67 keeps the proven dev63 positive native-region admission cache, exact
+ * dev58/v19 semantics, and the existing chunk-128 LLVM objects.  It adds only
+ * low-frequency observation around the native run() boundary:
+ *
+ *   - elapsed run-slice histogram + weighted heavy pairs of start/end guest PCs;
+ *   - a bounded local instruction/register dump if 0x80065128 remains the exact
+ *     returned PC for 64 and 1024 consecutive slices.
+ *
+ * No host_call callback is wrapped or classified here, so ordinary dispatch
+ * semantics are exactly the v41/dev58 production path again.  The profiler runs
+ * once per native slice (hundreds per second), not once per guest/public
+ * dispatch (hundreds of millions per session), keeping measurement overhead
+ * negligible relative to the pathology being investigated.
+ *
+ * Source-contract anchors inherited through the included bridge chain:
+ * m14-dev49-llvm-pc-display-list-return
+ * m14-dev51-llvm-test-ready-gx-input
+ * m14-dev52-llvm-frame-phase-continuation
+ * m14-dev63-llvm-inline-admission-cache
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ *
+ * Previous marker: m14-dev67-llvm-safe-slice-profiler
+ * Active marker: m14-dev68-llvm-runnable-idle-wake
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev67_base
+#include "legacy_c_adapter_v41.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+
+#ifndef OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS
+#error "LLVM bridge requires OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS"
+#endif
+#if OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS != 128 && \
+    OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS != 256 && \
+    OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS != 512
+#error "Unsupported OpenSPM LLVM chunk A/B geometry"
+#endif
+#define OPENSPM_M14_STRINGIFY_INNER(value) #value
+#define OPENSPM_M14_STRINGIFY(value) OPENSPM_M14_STRINGIFY_INNER(value)
+#ifndef OPENSPM_M14_LLVM_STATE_IN_MEMORY
+#error "LLVM bridge requires OPENSPM_M14_LLVM_STATE_IN_MEMORY"
+#endif
+#if OPENSPM_M14_LLVM_STATE_IN_MEMORY != 0 && \
+    OPENSPM_M14_LLVM_STATE_IN_MEMORY != 1
+#error "Unsupported OpenSPM LLVM state-memory A/B mode"
+#endif
+#ifndef OPENSPM_M14_HEAVY_DIAGNOSTICS
+#error "LLVM bridge requires OPENSPM_M14_HEAVY_DIAGNOSTICS"
+#endif
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS != 0 && \
+    OPENSPM_M14_HEAVY_DIAGNOSTICS != 1
+#error "Unsupported OpenSPM LLVM heavy-diagnostics mode"
+#endif
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+#define OPENSPM_M14_DIAGNOSTIC_SUFFIX "-profile"
+#else
+#define OPENSPM_M14_DIAGNOSTIC_SUFFIX "-normal"
+#endif
+#if OPENSPM_M14_LLVM_STATE_IN_MEMORY
+#define OPENSPM_M14_EXPERIMENT_VERSION \
+    "m14-dev122-chunk" OPENSPM_M14_STRINGIFY(OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS) "-sim1-yold" OPENSPM_M14_DIAGNOSTIC_SUFFIX
+#else
+#define OPENSPM_M14_EXPERIMENT_VERSION \
+    "m14-dev122-chunk" OPENSPM_M14_STRINGIFY(OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS) "-sim0-yold" OPENSPM_M14_DIAGNOSTIC_SUFFIX
+#endif
+
+/*
+ * ABI consumed only by the private pinned DolRecomp dev63 function-entry patch.
+ * Each entry is exactly three uint32_t fields: start, end, valid. Generated
+ * LLVM reproduces bridge_dev58_region_hash() and performs read-only loads.
+ * v41 remains sole owner/writer of cache contents.
+ */
+void *openspm_m14_llvm_region_cache_ptr = (void *)g_m14_dev58_region_cache;
+
+/* dev85 observation-only counter. Generated LLVM increments this only when the
+   legacy x86 SJLJ cycle guard actually takes its voluntary budget-exit edge. */
+uint64_t g_m14_dev85_budget_exit_count;
+void *openspm_m14_llvm_budget_exit_counter_ptr =
+    (void *)&g_m14_dev85_budget_exit_count;
+
+#define OPENSPM_M14_DEV67_PROFILE_SLOTS 8u
+#define OPENSPM_M14_DEV67_HANG_PC UINT32_C(0x80065128)
+
+typedef struct openspm_m14_dev67_pair_slot {
+    uint32_t start_pc;
+    uint32_t end_pc;
+    uint64_t wall_us;
+    uint64_t error_us;
+    uint64_t calls;
+} openspm_m14_dev67_pair_slot;
+
+static openspm_native_create_fn g_m14_dev67_underlying_create;
+static openspm_native_run_fn g_m14_dev67_underlying_run;
+static openspm_native_destroy_fn g_m14_dev67_underlying_destroy;
+static openspm_bridge_instance *g_m14_dev67_instance;
+static openspm_m14_dev67_pair_slot
+    g_m14_dev67_pairs[OPENSPM_M14_DEV67_PROFILE_SLOTS];
+static uint64_t g_m14_dev67_slice_calls;
+static uint64_t g_m14_dev67_slice_wall_us;
+static uint64_t g_m14_dev67_slice_max_us;
+static uint64_t g_m14_dev67_hist[6];
+static uint64_t g_m14_dev67_hang_consecutive;
+static uint64_t g_m14_dev67_hang_max_consecutive;
+static uint64_t g_m14_dev68_idle_entry_calls;
+static uint64_t g_m14_dev68_idle_entry_us;
+
+/* dev79 correlation only: once per ~1 host second, report the delta of the
+   existing direct-BL rescue counter. This is intentionally outside the
+   billion-scale host-call path and changes no guest state. */
+static uint64_t g_m14_dev79_rescue_window_ns;
+static uint64_t g_m14_dev79_rescue_window_count;
+static uint64_t g_m14_dev83_ordinary_window_count;
+static uint64_t g_m14_dev85_budget_window_count;
+static uint64_t g_m14_dev113_nested_window_attempts;
+static uint64_t g_m14_dev113_nested_window_steps;
+
+/* dev95: observation-only US2 sequence transition trace.
+ *
+ * Seeky's US2 symbol map matches this exact player build (spmarioMain
+ * 0x801A7AAC). Keep seqSetSeq host-visible through dev87 and record only rare
+ * sequence requests/transitions. Guest state is never modified.
+ */
+#define OPENSPM_M14_DEV95_SEQ_SET_SEQ UINT32_C(0x8017B834)
+#define OPENSPM_M14_DEV95_SEQ_WORK    UINT32_C(0x804D0D60)
+#define OPENSPM_M14_DEV95_SEQ_GAMEOVER UINT32_C(4)
+
+/* dev96: Seeky's EU0 data map translated by the independently proven
+ * seqWork delta lands exactly on the US2 globals beside seq_mapchange_wp:
+ *   EU0 seqWork 0x80512360 -> US2 0x804D0D60 (-0x41600)
+ *   EU0 now/next/prev 0x805AE0B8/C/0 -> US2 0x8056CAB8/C/C0.
+ * Observing next_seq at the exact native spmarioMain entry catches direct
+ * native-to-native seqSetSeq calls that never cross CPUState::host_call. */
+#define OPENSPM_M14_DEV96_NOW_SEQ     UINT32_C(0x8056CAB8)
+#define OPENSPM_M14_DEV96_NEXT_SEQ    UINT32_C(0x8056CABC)
+#define OPENSPM_M14_DEV96_PREV_SEQ    UINT32_C(0x8056CAC0)
+
+/* The same -0x41600 BSS relocation maps Seeky's EU0 marioWork 0x80510458
+ * and MarioPouchWork 0x80511A28 to these exact US2 addresses. seqWork in the
+ * same contiguous block independently validates the relocation. */
+#define OPENSPM_M14_DEV96_MARIO_WORK   UINT32_C(0x804CEE58)
+#define OPENSPM_M14_DEV96_POUCH_WORK   UINT32_C(0x804D0428)
+#define OPENSPM_M14_DEV96_POUCH_HP_OFF UINT32_C(0x0000000C)
+#define OPENSPM_M14_DEV96_MARIO_FLAGS_OFF UINT32_C(0x00000000)
+#define OPENSPM_M14_DEV96_MARIO_DISP_FLAGS_OFF UINT32_C(0x00000008)
+#define OPENSPM_M14_DEV96_MARIO_MOTION_OFF UINT32_C(0x0000002C)
+#define OPENSPM_M14_DEV96_MARIO_POS_OFF UINT32_C(0x0000005C)
+#define OPENSPM_M14_DEV105_MARIO_POSETIME_OFF UINT32_C(0x00000024)
+#define OPENSPM_M14_DEV105_MARIO_SUBMOTION_OFF UINT32_C(0x0000003C)
+#define OPENSPM_M14_DEV105_MARIO_AIRTIMER_OFF UINT32_C(0x00000050)
+#define OPENSPM_M14_DEV105_ON_HP_EQUALS_0 UINT32_C(0x801615E4)
+
+/* Broadway PE bounding-box MMIO. An all-reset 1023,0,1023,0 result means the
+ * guest's just-finished bbox probe rasterized no surviving fragments. */
+#define OPENSPM_M14_DEV96_BBOX_LEFT   UINT32_C(0xCC001010)
+#define OPENSPM_M14_DEV96_BBOX_RIGHT  UINT32_C(0xCC001012)
+#define OPENSPM_M14_DEV96_BBOX_TOP    UINT32_C(0xCC001014)
+#define OPENSPM_M14_DEV96_BBOX_BOTTOM UINT32_C(0xCC001016)
+
+static PPCHostCall g_m14_dev95_underlying_host_call;
+static u64 (*g_m14_dev96_underlying_external_read)(CPUState *, u32, u8);
+static uint32_t g_m14_dev95_prev_seq;
+static uint32_t g_m14_dev95_prev_stage;
+static uint32_t g_m14_dev96_prev_next_seq;
+static uint32_t g_m14_dev96_prev_prev_seq;
+static uint64_t g_m14_dev95_seqset_calls;
+static uint64_t g_m14_dev95_gameover_requests;
+static uint64_t g_m14_dev96_next_gameover_observations;
+static uint32_t g_m14_dev96_prev_hp_raw;
+static uint64_t g_m14_dev96_hp_changes;
+static uint16_t g_m14_dev96_bbox_values[4];
+static uint32_t g_m14_dev96_bbox_mask;
+static uint32_t g_m14_dev96_bbox_first_pc;
+static uint32_t g_m14_dev96_bbox_first_lr;
+static uint64_t g_m14_dev96_bbox_reads;
+static uint64_t g_m14_dev96_bbox_empty_reads;
+
+/* dev122: correlate only genuinely long produced frames with the already-proven
+ * live world camera. The earlier CSV proved CamEntry camera 5 state and viewMtx
+ * are numerically smooth; this companion sample tells us whether a >20 ms frame
+ * actually contains a repeated camera transform or merely presents late. */
+#define OPENSPM_M14_DEV122_CAM_PTR_TABLE UINT32_C(0x804C9F80)
+#define OPENSPM_M14_DEV122_CAM_ID 5u
+#define OPENSPM_M14_DEV122_CAM_VIEW_MTX_OFF UINT32_C(0x00000054)
+#define OPENSPM_M14_DEV122_CAM_POS_OFF UINT32_C(0x0000015C)
+#define OPENSPM_M14_DEV122_CAM_TARGET_OFF UINT32_C(0x00000168)
+static uint32_t g_m14_dev122_have_camera_sample;
+static float g_m14_dev122_prev_mario_x;
+static float g_m14_dev122_prev_cam_pos_x;
+static float g_m14_dev122_prev_cam_target_x;
+static float g_m14_dev122_prev_cam_view_tx;
+
+/* dev99: dispDraw's linked indirect callback fast path calls the exact generated
+ * dispatcher in-process instead of SJLJ-escaping to the outer run loop. This
+ * helper intentionally reuses dolrecomp_call(): replacements, host semantics,
+ * physical aliases and indexed native lookup keep their existing order.
+ * dolrecomp_call_enter/leave provide the compiler's existing bounded host-stack
+ * recursion contract. */
+static uint64_t g_m14_dev99_nested_attempts;
+static uint64_t g_m14_dev99_nested_handled;
+static uint64_t g_m14_dev99_nested_normal_returns;
+static uint64_t g_m14_dev99_nested_abnormal_returns;
+static uint64_t g_m14_dev99_nested_depth_fallbacks;
+static uint64_t g_m14_dev99_nested_lookup_misses;
+static uint64_t g_m14_dev100_nested_budget_yields;
+static uint64_t g_m14_dev105_nested_steps;
+static uint64_t g_m14_dev105_step_limit_yields;
+static uint64_t g_m14_dev105_no_progress_yields;
+static uint64_t g_m14_dev117_same_pc_progress;
+static uint64_t g_m14_dev105_hp0_motion24_ticks;
+static uint64_t g_m14_dev105_hp0_motion24_logs;
+static uint64_t g_m14_dev105_onhp0_host_calls;
+static uint32_t g_m14_dev105_last_submotion;
+static uint32_t g_m14_dev105_last_prev_motion;
+
+/* dev111: NPC-active-cost + Mario-motion probe.
+ *
+ * dev110's live A/B proved that clearing NPCEntry::active makes the heavy room
+ * immediately smooth, while global logic freeze only partially helps and the
+ * documented hidden+frozen flag does not. Count exact dispDraw callback targets
+ * at the already-existing dev105 nested-call boundary without adding clocks or
+ * CFG edges to generated guest code.
+ *
+ * At phase 3 (after spmarioMain), sample Mario X/Z once per produced frame.
+ * This separates guest-position backsteps from uneven frame delivery. */
+#define OPENSPM_M14_DEV111_DISP_SLOTS 256u
+#define OPENSPM_M14_DEV111_REPORT_FRAMES 16u
+typedef struct openspm_m14_dev111_disp_slot {
+    uint32_t target;
+    uint64_t count;
+} openspm_m14_dev111_disp_slot;
+
+static openspm_m14_dev111_disp_slot
+    g_m14_dev111_disp_slots[OPENSPM_M14_DEV111_DISP_SLOTS];
+static uint64_t g_m14_dev111_disp_total;
+static uint64_t g_m14_dev111_disp_collisions;
+static uint32_t g_m14_dev111_report_frames;
+static uint64_t g_m14_dev111_motion_samples;
+static uint64_t g_m14_dev111_motion_duplicates;
+static uint64_t g_m14_dev111_motion_x_moves;
+static uint64_t g_m14_dev111_motion_x_reversals;
+static double g_m14_dev111_motion_abs_x_total;
+static float g_m14_dev111_motion_abs_x_min;
+static float g_m14_dev111_motion_abs_x_max;
+static float g_m14_dev111_motion_abs_z_max;
+static float g_m14_dev111_prev_x;
+static float g_m14_dev111_prev_z;
+static float g_m14_dev111_prev_dx;
+static uint8_t g_m14_dev111_have_position;
+
+/* dev112: classify dispDraw callbacks by callbackParam ownership without
+ * mutating NPC state. Public SPM's DispCallback ABI is (cameraId, param), so
+ * r4 at the exact linked call is callbackParam. Cache the live NPC table once
+ * per produced frame, then the hot callback path only performs integer range
+ * checks and counter increments. */
+#define OPENSPM_M14_DEV112_NPCDRV_WP UINT32_C(0x8056CB88)
+#define OPENSPM_M14_DEV112_NPC_WORK_NUM UINT32_C(0x0004)
+#define OPENSPM_M14_DEV112_NPC_WORK_ENTRIES UINT32_C(0x0008)
+#define OPENSPM_M14_DEV112_NPC_ENTRY_SIZE UINT32_C(0x0748)
+
+static uint32_t g_m14_dev112_npc_entries;
+static uint32_t g_m14_dev112_npc_count;
+static uint32_t g_m14_dev112_npc_end;
+static uint64_t g_m14_dev112_npc_param_callbacks;
+static uint64_t g_m14_dev112_npc_exact_callbacks;
+static openspm_m14_dev111_disp_slot
+    g_m14_dev112_npc_slots[OPENSPM_M14_DEV111_DISP_SLOTS];
+
+/* dev115: the Yold active-set sweep proved that the dominant dispDraw callback
+ * at 0x8008533C stays exactly 300 calls/produced-frame while direct NPCEntry
+ * callbacks fall from 16/frame to zero. Seeky's US2 linker map places this PC
+ * inside the mapdrv.c address envelope, but not on a named public symbol.
+ *
+ * Characterize this exact target without clocks or guest mutation: count its
+ * callbackParam cardinality and camera IDs at the already-existing dev105
+ * dispDraw boundary. This tells us whether 300/frame means hundreds of map
+ * objects, repeated camera/pane passes, or pathological revisits of a small set.
+ */
+#define OPENSPM_M14_DEV115_MAP_TARGET UINT32_C(0x8008533C)
+#define OPENSPM_M14_DEV115_PARAM_SLOTS 512u
+#define OPENSPM_M14_DEV115_CAMERA_SLOTS 16u
+typedef struct openspm_m14_dev115_param_slot {
+    uint32_t param;
+    uint64_t count;
+} openspm_m14_dev115_param_slot;
+
+static openspm_m14_dev115_param_slot
+    g_m14_dev115_param_slots[OPENSPM_M14_DEV115_PARAM_SLOTS];
+static uint64_t
+    g_m14_dev115_camera_counts[OPENSPM_M14_DEV115_CAMERA_SLOTS];
+static uint64_t g_m14_dev115_calls;
+static uint64_t g_m14_dev115_param_collisions;
+static uint64_t g_m14_dev115_camera_other;
+
+static void bridge_dev115_note_map_callback(CPUState *cpu, uint32_t target) {
+    uint32_t param, camera, index;
+    openspm_m14_dev115_param_slot *slot;
+    if (cpu == NULL || target != OPENSPM_M14_DEV115_MAP_TARGET)
+        return;
+    ++g_m14_dev115_calls;
+    camera = (uint32_t)cpu->gpr[3];
+    if (camera < OPENSPM_M14_DEV115_CAMERA_SLOTS)
+        ++g_m14_dev115_camera_counts[camera];
+    else
+        ++g_m14_dev115_camera_other;
+    param = (uint32_t)cpu->gpr[4];
+    index =
+        (((param >> 2u) * UINT32_C(2654435761)) ^ (param >> 13u)) &
+        (OPENSPM_M14_DEV115_PARAM_SLOTS - 1u);
+    slot = &g_m14_dev115_param_slots[index];
+    if (slot->count == 0u || slot->param == param) {
+        slot->param = param;
+        ++slot->count;
+    } else {
+        ++g_m14_dev115_param_collisions;
+    }
+}
+
+static void bridge_dev112_refresh_npc_table(CPUState *cpu) {
+    uint32_t work = 0u, count = 0u, entries = 0u;
+    uint64_t end;
+    g_m14_dev112_npc_entries = 0u;
+    g_m14_dev112_npc_count = 0u;
+    g_m14_dev112_npc_end = 0u;
+    if (cpu == NULL ||
+        !bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV112_NPCDRV_WP, UINT32_C(4)))
+        return;
+    work = mem_read32(cpu, OPENSPM_M14_DEV112_NPCDRV_WP);
+    if (work == 0u ||
+        !bridge_m14_context_address_valid(
+            cpu, work + OPENSPM_M14_DEV112_NPC_WORK_NUM, UINT32_C(8)))
+        return;
+    count = mem_read32(cpu, work + OPENSPM_M14_DEV112_NPC_WORK_NUM);
+    entries = mem_read32(cpu, work + OPENSPM_M14_DEV112_NPC_WORK_ENTRIES);
+    if (count == 0u || count > UINT32_C(4096) || entries == 0u)
+        return;
+    end = (uint64_t)entries +
+          (uint64_t)count * (uint64_t)OPENSPM_M14_DEV112_NPC_ENTRY_SIZE;
+    if (end > UINT32_MAX)
+        return;
+    g_m14_dev112_npc_entries = entries;
+    g_m14_dev112_npc_count = count;
+    g_m14_dev112_npc_end = (uint32_t)end;
+}
+
+static void bridge_dev112_note_disp_owner(CPUState *cpu, uint32_t target) {
+    uint32_t param, offset, index;
+    openspm_m14_dev111_disp_slot *slot;
+    if (cpu == NULL || g_m14_dev112_npc_entries == 0u)
+        return;
+    param = (uint32_t)cpu->gpr[4];
+    if (param < g_m14_dev112_npc_entries || param >= g_m14_dev112_npc_end)
+        return;
+    ++g_m14_dev112_npc_param_callbacks;
+    offset = param - g_m14_dev112_npc_entries;
+    if ((offset % OPENSPM_M14_DEV112_NPC_ENTRY_SIZE) != 0u)
+        return;
+    ++g_m14_dev112_npc_exact_callbacks;
+    index =
+        (((target >> 2u) * UINT32_C(2654435761)) ^ (target >> 13u)) &
+        (OPENSPM_M14_DEV111_DISP_SLOTS - 1u);
+    slot = &g_m14_dev112_npc_slots[index];
+    if (slot->count == 0u || slot->target == target) {
+        slot->target = target;
+        ++slot->count;
+    }
+}
+
+static void bridge_dev111_note_disp_target(uint32_t target) {
+    uint32_t index =
+        (((target >> 2u) * UINT32_C(2654435761)) ^ (target >> 13u)) &
+        (OPENSPM_M14_DEV111_DISP_SLOTS - 1u);
+    openspm_m14_dev111_disp_slot *slot = &g_m14_dev111_disp_slots[index];
+    ++g_m14_dev111_disp_total;
+    if (slot->count == 0u || slot->target == target) {
+        slot->target = target;
+        ++slot->count;
+    } else {
+        ++g_m14_dev111_disp_collisions;
+    }
+}
+
+/* dev106: exact generated-entry truth. These counters are incremented from
+ * LLVM block-entry hooks and therefore observe native-to-native calls that
+ * never cross CPUState::host_call. */
+static uint64_t g_m14_dev106_native_onhp0_entries;
+static uint64_t g_m14_dev106_native_seqset_entries;
+static uint64_t g_m14_dev106_pre_hp0_onhp0_entries;
+static uint64_t g_m14_dev106_pre_hp0_seqset_entries;
+static uint32_t g_m14_dev106_hp0_active;
+
+void openspm_m14_note_death_entry_native(u32 pc) {
+    if (pc == OPENSPM_M14_DEV105_ON_HP_EQUALS_0)
+        ++g_m14_dev106_native_onhp0_entries;
+    else if (pc == OPENSPM_M14_DEV95_SEQ_SET_SEQ)
+        ++g_m14_dev106_native_seqset_entries;
+}
+
+/* OpenSPM draw tags (Stage B, opt-in OPENSPM_M14_DRAW_TAGS=1).
+ *
+ * Every GX draw SPM issues during spmarioDisp comes from one dispDraw
+ * callback: spmarioDisp (0x801A7D1C) only calls camDraw (0x8005557C), which
+ * per camPtrTbl slot sets projection/viewport/scissor/matrices and calls
+ * dispDraw(camId) (0x8005B028). dispEntry allocates 16-byte entries in pool
+ * order from 0x8056D1C8; dispDraw walks the z-sorted entry pointers
+ * (array 0x8056D1CC, count 0x8056D1D0; entry: u8 camId +0, u8 render mode +1,
+ * u8 scissor +2, f32 z +4, callback +8, param +12), writes scissor and
+ * render-mode GX state, stores the entry in 0x8056D1D4 and calls
+ * callback(camId, param) at the bctrl 0x8005B29C. Between callbacks only GX
+ * state is written, never a primitive. The generated LLVM body routes that
+ * exact bctrl through the dev105 helper below, so "owner begins" lands in the
+ * gathered FIFO byte stream at the exact position of the call and "owner ends"
+ * when the callback returns to 0x8005B2A0 inside the helper. A callback the
+ * helper hands back to the outer dispatcher (budget/step yield) keeps its
+ * owner until the next callback's begin, the next frame marker (spmarioDisp
+ * entry) or the DEMODoneRender end marker: no primitive can be issued in
+ * between, so attribution stays exact.
+ *
+ * Markers are never emitted while a display list is being recorded (they
+ * would land in guest RAM and change the SDK-visible list size), and nothing
+ * at all is emitted or read with the variable unset.
+ *
+ * Stage C camera views: before the first owner of each 3D (perspective)
+ * camera in a frame, the camera's world->view matrix CamEntry+0x54 (the 3x4
+ * Mtx camDraw loads for that camera's callbacks) is sent once as a 24-word
+ * view record (BP 0x7C/0x7D, see m14_draw_tags.h). The renderer interpolates
+ * the camera from these instead of guessing it from geometry. */
+#include "m14_draw_tags.h"
+
+#define OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE UINT32_C(0x8005B29C)
+#define OPENSPM_M14_DRAW_TAGS_CALLBACK_RETURN UINT32_C(0x8005B2A0)
+#define OPENSPM_M14_DRAW_TAGS_SPMARIO_DISP UINT32_C(0x801A7D1C)
+#define OPENSPM_M14_DRAW_TAGS_DONE_RENDER UINT32_C(0x801A8B64)
+#define OPENSPM_M14_DRAW_TAGS_POOL UINT32_C(0x8056D1C8)
+#define OPENSPM_M14_DRAW_TAGS_COUNT UINT32_C(0x8056D1D0)
+#define OPENSPM_M14_DRAW_TAGS_CUR_ENTRY UINT32_C(0x8056D1D4)
+#define OPENSPM_M14_DRAW_TAGS_CAM_PTR_TABLE UINT32_C(0x804C9F80)
+#define OPENSPM_M14_DRAW_TAGS_CAM_ORTHO_OFF UINT32_C(0x00000158)
+#define OPENSPM_M14_DRAW_TAGS_CAM_VIEW_OFF UINT32_C(0x00000054)
+#define OPENSPM_M14_DRAW_TAGS_CAM_SLOTS 15u
+#define OPENSPM_M14_DRAW_TAGS_REPORT_NS UINT64_C(1000000000)
+
+typedef struct openspm_m14_draw_tags_state {
+    int mode; /* 0 = not read yet, 1 = off, 2 = on */
+    uint32_t reported;
+    uint32_t open;
+    uint32_t frame_seq;
+    uint64_t report_ns;
+    uint64_t frames;
+    uint64_t callbacks;
+    uint64_t begins;
+    uint64_t normal_ends;
+    uint64_t escaped;
+    uint64_t phase_ends;
+    uint64_t entry_mismatch;
+    uint64_t skipped_dl;
+    uint64_t skipped_nofifo;
+    uint64_t emit_failures;
+    uint64_t views;
+    uint64_t view_failures;
+    uint32_t view_sent; /* bit per camera: view record sent this frame */
+    m14_draw_tag_occurrences occurrences;
+} openspm_m14_draw_tags_state;
+
+static openspm_m14_draw_tags_state g_m14_draw_tags;
+
+static int bridge_m14_draw_tags_enabled(void) {
+    if (g_m14_draw_tags.mode == 0) {
+        const char *value = getenv("OPENSPM_M14_DRAW_TAGS");
+        g_m14_draw_tags.mode = (value != NULL && value[0] == '1') ? 2 : 1;
+    }
+    return g_m14_draw_tags.mode == 2;
+}
+
+/* True while any display-list recorder or the game's own GXData dlist flag is
+ * active: FIFO bytes then belong to a list, not to the live frame. */
+static int bridge_m14_draw_tags_in_display_list(CPUState *cpu) {
+    uint32_t gxdata = 0u;
+    if (g_m14_v19_dl.recorder_active || g_m14_v19_dl.begin_pending ||
+        g_m14_v19_dl.end_pending ||
+        g_m14_dev48_begin_calls != g_m14_dev48_end_calls)
+        return 1;
+    if (cpu == NULL || !bridge_dev51_gxdata(cpu, &gxdata))
+        return 1; /* fail closed: cannot prove the live FIFO is the target */
+    return mem_read8(cpu, gxdata + OPENSPM_LOCAL_GXDL_ACTIVE_OFF) != 0u;
+}
+
+/* Append BP words to the proven dev16 32-byte write-gather in stream order. */
+static int bridge_m14_draw_tags_emit(openspm_bridge_instance *instance,
+                                     CPUState *cpu,
+                                     uint32_t source_pc,
+                                     const uint32_t *words,
+                                     uint32_t count) {
+    uint8_t bytes[2u * OPENSPM_M14_DRAW_TAG_WORD_BYTES];
+    uint32_t size, i;
+    if (count == 0u || count > 2u) return 0;
+    if (!g_m14_v8_have_gx_fifo || g_m14_v8_gx_fifo.submit == NULL) {
+        ++g_m14_draw_tags.skipped_nofifo;
+        return 0;
+    }
+    if (bridge_m14_draw_tags_in_display_list(cpu)) {
+        ++g_m14_draw_tags.skipped_dl;
+        return 0;
+    }
+    size = m14_draw_tags_encode(words, count, bytes);
+    if (size > OPENSPM_M14_WG_GATHER_BYTES - g_m14_v8_wg_size &&
+        bridge_flush_wg_v8(instance, source_pc) != OPENSPM_OK) {
+        ++g_m14_draw_tags.emit_failures;
+        return 0;
+    }
+    for (i = 0u; i < size; ++i)
+        g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = bytes[i];
+    if (g_m14_v8_wg_size == OPENSPM_M14_WG_GATHER_BYTES &&
+        bridge_flush_wg_v8(instance, source_pc) != OPENSPM_OK) {
+        ++g_m14_draw_tags.emit_failures;
+        return 0;
+    }
+    return 1;
+}
+
+static void bridge_m14_draw_tags_end(openspm_bridge_instance *instance,
+                                     CPUState *cpu,
+                                     uint32_t source_pc) {
+    uint32_t words[1];
+    if (!g_m14_draw_tags.open) return;
+    (void)bridge_m14_draw_tags_emit(instance, cpu, source_pc, words,
+                                    m14_draw_tags_end_words(words));
+    g_m14_draw_tags.open = 0u;
+}
+
+/* Once per 3D camera per frame, before its first owner: the view record. */
+static void bridge_m14_draw_tags_view(openspm_bridge_instance *instance,
+                                      CPUState *cpu,
+                                      uint32_t camera,
+                                      uint32_t cam) {
+    uint32_t bits[OPENSPM_M14_DRAW_TAG_VIEW_ELEMENTS];
+    uint32_t words[OPENSPM_M14_DRAW_TAG_VIEW_WORDS];
+    uint32_t i, count;
+    int ok;
+    if (camera >= 32u || (g_m14_draw_tags.view_sent & (UINT32_C(1) << camera)) != 0u)
+        return;
+    /* Marked sent even on failure: one attempt per camera per frame. */
+    g_m14_draw_tags.view_sent |= UINT32_C(1) << camera;
+    ok = cam != 0u &&
+         bridge_m14_context_address_valid(
+             cpu, cam + OPENSPM_M14_DRAW_TAGS_CAM_VIEW_OFF,
+             4u * OPENSPM_M14_DRAW_TAG_VIEW_ELEMENTS);
+    if (ok) {
+        for (i = 0u; i < OPENSPM_M14_DRAW_TAG_VIEW_ELEMENTS; ++i)
+            bits[i] = mem_read32(cpu, cam + OPENSPM_M14_DRAW_TAGS_CAM_VIEW_OFF + 4u * i);
+        count = m14_draw_tags_view_words(camera, bits, words);
+        for (i = 0u; i < count && ok; i += 2u)
+            ok = bridge_m14_draw_tags_emit(instance, cpu,
+                                           OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE,
+                                           words + i, 2u);
+    }
+    if (ok)
+        ++g_m14_draw_tags.views;
+    else
+        ++g_m14_draw_tags.view_failures;
+}
+
+/* At the exact bctrl: r3 = camId, r4 = callbackParam, CTR target = callback. */
+static void bridge_m14_draw_tags_begin(openspm_bridge_instance *instance,
+                                       CPUState *cpu,
+                                       uint32_t callback) {
+    uint32_t camera, param, entry = 0u, cam = 0u, occurrence, owner;
+    uint32_t pool = 0u, index = 0u, ortho = 0u;
+    uint32_t words[2];
+    ++g_m14_draw_tags.callbacks;
+    camera = (uint32_t)cpu->gpr[3];
+    param = (uint32_t)cpu->gpr[4];
+    if (bridge_m14_context_address_valid(cpu, OPENSPM_M14_DRAW_TAGS_CUR_ENTRY, 4u))
+        entry = mem_read32(cpu, OPENSPM_M14_DRAW_TAGS_CUR_ENTRY);
+    if (entry == 0u || camera >= OPENSPM_M14_DRAW_TAGS_CAM_SLOTS ||
+        !bridge_m14_context_address_valid(cpu, entry, 16u) ||
+        (uint32_t)mem_read8(cpu, entry) != camera ||
+        mem_read32(cpu, entry + 8u) != callback ||
+        mem_read32(cpu, entry + 12u) != param) {
+        /* Not the dispDraw shape this was derived from: leave it untagged. */
+        ++g_m14_draw_tags.entry_mismatch;
+        bridge_m14_draw_tags_end(instance, cpu, OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE);
+        return;
+    }
+    if (bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DRAW_TAGS_CAM_PTR_TABLE + camera * 4u, 4u))
+        cam = mem_read32(cpu, OPENSPM_M14_DRAW_TAGS_CAM_PTR_TABLE + camera * 4u);
+    /* camDraw picks C_MTXOrtho when CamEntry+0x158 is nonzero, else
+       C_MTXPerspective: this is the 2D/UI vs 3D-world split per camera. */
+    if (cam != 0u &&
+        bridge_m14_context_address_valid(
+            cpu, cam + OPENSPM_M14_DRAW_TAGS_CAM_ORTHO_OFF, 4u))
+        ortho = mem_read32(cpu, cam + OPENSPM_M14_DRAW_TAGS_CAM_ORTHO_OFF) != 0u;
+    /* Occurrence among identical (callback, param, camera) entries is taken in
+       dispEntry registration order (pool + index * 16), which the z sort does
+       not change. Resolve the pool lazily up to this entry once per frame. */
+    if (!bridge_m14_context_address_valid(cpu, OPENSPM_M14_DRAW_TAGS_POOL, 4u) ||
+        (pool = mem_read32(cpu, OPENSPM_M14_DRAW_TAGS_POOL)) == 0u ||
+        entry < pool || ((entry - pool) & 15u) != 0u ||
+        (index = (entry - pool) >> 4) >= OPENSPM_M14_DRAW_TAG_MAX_ENTRIES ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_DRAW_TAGS_COUNT, 4u) ||
+        index >= mem_read32(cpu, OPENSPM_M14_DRAW_TAGS_COUNT)) {
+        ++g_m14_draw_tags.entry_mismatch;
+        bridge_m14_draw_tags_end(instance, cpu, OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE);
+        return;
+    }
+    while (g_m14_draw_tags.occurrences.scanned <= index) {
+        const uint32_t scan = g_m14_draw_tags.occurrences.scanned;
+        const uint32_t at = pool + scan * 16u;
+        if (!bridge_m14_context_address_valid(cpu, at, 16u) ||
+            !m14_draw_tags_scan_entry(&g_m14_draw_tags.occurrences, scan,
+                                      mem_read32(cpu, at + 8u),
+                                      mem_read32(cpu, at + 12u),
+                                      (uint32_t)mem_read8(cpu, at))) {
+            ++g_m14_draw_tags.entry_mismatch;
+            bridge_m14_draw_tags_end(instance, cpu, OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE);
+            return;
+        }
+    }
+    occurrence = m14_draw_tags_registered_occurrence(&g_m14_draw_tags.occurrences,
+                                                     index);
+    owner = m14_draw_tags_owner(callback, param, camera, occurrence);
+    if (!ortho) bridge_m14_draw_tags_view(instance, cpu, camera, cam);
+    if (bridge_m14_draw_tags_emit(
+            instance, cpu, OPENSPM_M14_DRAW_TAGS_DISPDRAW_SITE, words,
+            m14_draw_tags_begin_words(owner, camera, ortho, words))) {
+        ++g_m14_draw_tags.begins;
+        g_m14_draw_tags.open = 1u;
+    }
+}
+
+static void bridge_m14_draw_tags_report(openspm_bridge_instance *instance) {
+    char message[768];
+    const uint64_t now = bridge_m14_now_ns(instance);
+    if (!g_m14_draw_tags.reported) {
+        bridge_v44_log(instance,
+            "M14 draw tags active: dispDraw callback owners (callback, param, camera, occurrence) are emitted as BP 0x7E/0x7F markers at bctrl 0x8005B29C, callback return 0x8005B2A0, spmarioDisp entry (frame) and DEMODoneRender (end); never inside display-list recording.");
+        g_m14_draw_tags.reported = 1u;
+        g_m14_draw_tags.report_ns = now;
+        return;
+    }
+    if (now - g_m14_draw_tags.report_ns < OPENSPM_M14_DRAW_TAGS_REPORT_NS)
+        return;
+    g_m14_draw_tags.report_ns = now;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 draw tags bridge: frames=%llu callbacks=%llu begins=%llu normal_ends=%llu escaped=%llu phase_ends=%llu entry_mismatch=%llu skipped_dl=%llu skipped_nofifo=%llu emit_failures=%llu occurrence_overflows=%u views=%llu view_failures=%llu.",
+        (unsigned long long)g_m14_draw_tags.frames,
+        (unsigned long long)g_m14_draw_tags.callbacks,
+        (unsigned long long)g_m14_draw_tags.begins,
+        (unsigned long long)g_m14_draw_tags.normal_ends,
+        (unsigned long long)g_m14_draw_tags.escaped,
+        (unsigned long long)g_m14_draw_tags.phase_ends,
+        (unsigned long long)g_m14_draw_tags.entry_mismatch,
+        (unsigned long long)g_m14_draw_tags.skipped_dl,
+        (unsigned long long)g_m14_draw_tags.skipped_nofifo,
+        (unsigned long long)g_m14_draw_tags.emit_failures,
+        (unsigned)g_m14_draw_tags.occurrences.overflows,
+        (unsigned long long)g_m14_draw_tags.views,
+        (unsigned long long)g_m14_draw_tags.view_failures);
+    bridge_v44_log(instance, message);
+}
+
+/* Frame phases from the dev81 native block-entry hook (no CPUState needed). */
+static void bridge_m14_draw_tags_phase(openspm_bridge_instance *instance,
+                                       uint32_t phase) {
+    uint32_t words[2];
+    CPUState *cpu;
+    if (instance == NULL || !bridge_m14_draw_tags_enabled()) return;
+    cpu = &instance->cpu;
+    if (phase == 1u) { /* spmarioDisp entry: a new game frame's draws start */
+        ++g_m14_draw_tags.frames;
+        ++g_m14_draw_tags.frame_seq;
+        m14_draw_tags_new_frame(&g_m14_draw_tags.occurrences);
+        g_m14_draw_tags.view_sent = 0u;
+        if (g_m14_draw_tags.open) ++g_m14_draw_tags.phase_ends;
+        g_m14_draw_tags.open = 0u;
+        (void)bridge_m14_draw_tags_emit(
+            instance, cpu, OPENSPM_M14_DRAW_TAGS_SPMARIO_DISP, words,
+            m14_draw_tags_frame_words(g_m14_draw_tags.frame_seq, words));
+        bridge_m14_draw_tags_report(instance);
+    } else if (phase == 3u && g_m14_draw_tags.open) { /* DEMODoneRender */
+        ++g_m14_draw_tags.phase_ends;
+        bridge_m14_draw_tags_end(instance, cpu, OPENSPM_M14_DRAW_TAGS_DONE_RENDER);
+    }
+}
+
+int openspm_m14_dev99_nested_dispatch(CPUState *cpu,
+                                      u32 target,
+                                      u32 continuation) {
+    openspm_bridge_instance *instance;
+    int handled;
+
+    ++g_m14_dev99_nested_attempts;
+    if (cpu == NULL) {
+        ++g_m14_dev99_nested_lookup_misses;
+        return 0;
+    }
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) {
+        ++g_m14_dev99_nested_lookup_misses;
+        return 0;
+    }
+    if (cpu->downcount <= 0) {
+        ++g_m14_dev100_nested_budget_yields;
+        return 0;
+    }
+    if (!dolrecomp_call_enter()) {
+        ++g_m14_dev99_nested_depth_fallbacks;
+        return 0;
+    }
+
+    handled = dolrecomp_call(cpu, target);
+    dolrecomp_call_leave();
+    if (!handled) {
+        ++g_m14_dev99_nested_lookup_misses;
+        return 0;
+    }
+    ++g_m14_dev99_nested_handled;
+
+    /* Any semantic fallback requested by the nested callback must return to the
+       existing outer bridge immediately, even if PC happens to equal PC+4. */
+    if (instance->fallback_requested) {
+        ++g_m14_dev99_nested_abnormal_returns;
+        return 0;
+    }
+    if (cpu->exception == 0u && (uint32_t)cpu->pc == (uint32_t)continuation) {
+        ++g_m14_dev99_nested_normal_returns;
+        /* Nested wrappers own fresh local guard counters. Honor the shared
+           outer budget before resuming the parent callback walker. */
+        if (cpu->downcount <= 0) {
+            ++g_m14_dev100_nested_budget_yields;
+            return 0;
+        }
+    } else {
+        ++g_m14_dev99_nested_abnormal_returns;
+    }
+    return 1;
+}
+
+/* dev117 over dev105: chunk256->512 did not reduce the heavy callback walk,
+ * proving explicit partitions/function exits dominate the ~23 generated steps
+ * per dispDraw callback. Keep dev105's exact 32768-cycle charge quantum, host
+ * semantics and fail-closed behavior, but remove two artificial outer-dispatch
+ * exits:
+ *
+ *  - a generated chunk returning to the same PC is real forward progress when
+ *    negative CPUState.downcount moved farther from zero (guest cycles ran);
+ *  - permit up to 128 small generated chunks inside the SAME 32768-cycle
+ *    quantum before the step-count fallback.
+ *
+ * Same PC with unchanged/non-decreasing charge still fails closed, as do
+ * semantic fallback, exception, lookup miss, recursion failure and the cycle
+ * quantum. No callback is skipped or reordered. */
+#define OPENSPM_M14_DEV105_CPUSTATE_NESTED_QUANTUM INT64_C(32768)
+#define OPENSPM_M14_DEV105_CPUSTATE_NESTED_MAX_STEPS 128u
+
+static int bridge_dev105_cpustate_nested_dispatch(CPUState *cpu,
+                                                  u32 target,
+                                                  u32 continuation) {
+    openspm_bridge_instance *instance;
+    uint32_t steps;
+    int credited_handled = 0;
+
+    ++g_m14_dev99_nested_attempts;
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    bridge_dev111_note_disp_target((uint32_t)target);
+    bridge_dev112_note_disp_owner(cpu, (uint32_t)target);
+    bridge_dev115_note_map_callback(cpu, (uint32_t)target);
+#endif
+    if (cpu == NULL) {
+        ++g_m14_dev99_nested_lookup_misses;
+        return 0;
+    }
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) {
+        ++g_m14_dev99_nested_lookup_misses;
+        return 0;
+    }
+    if (cpu->downcount <= -OPENSPM_M14_DEV105_CPUSTATE_NESTED_QUANTUM) {
+        ++g_m14_dev100_nested_budget_yields;
+        return 0;
+    }
+    if (!dolrecomp_call_enter()) {
+        ++g_m14_dev99_nested_depth_fallbacks;
+        return 0;
+    }
+
+    cpu->pc = target;
+    for (steps = 0u; steps < OPENSPM_M14_DEV105_CPUSTATE_NESTED_MAX_STEPS;
+         ++steps) {
+        uint32_t before_pc;
+        int64_t before_downcount;
+        int handled;
+
+        if (cpu->exception != 0u || instance->fallback_requested) {
+            ++g_m14_dev99_nested_abnormal_returns;
+            dolrecomp_call_leave();
+            return 0;
+        }
+        if ((uint32_t)cpu->pc == (uint32_t)continuation) {
+            ++g_m14_dev99_nested_normal_returns;
+            if (cpu->downcount <= -OPENSPM_M14_DEV105_CPUSTATE_NESTED_QUANTUM) {
+                ++g_m14_dev100_nested_budget_yields;
+                dolrecomp_call_leave();
+                return 0;
+            }
+            dolrecomp_call_leave();
+            return 1;
+        }
+        if (cpu->downcount <= -OPENSPM_M14_DEV105_CPUSTATE_NESTED_QUANTUM) {
+            ++g_m14_dev100_nested_budget_yields;
+            dolrecomp_call_leave();
+            return 0;
+        }
+
+        before_pc = (uint32_t)cpu->pc;
+        before_downcount = cpu->downcount;
+        handled = dolrecomp_call(cpu, before_pc);
+        ++g_m14_dev105_nested_steps;
+        if (!handled) {
+            ++g_m14_dev99_nested_lookup_misses;
+            dolrecomp_call_leave();
+            return 0;
+        }
+        if (!credited_handled) {
+            ++g_m14_dev99_nested_handled;
+            credited_handled = 1;
+        }
+        if (instance->fallback_requested || cpu->exception != 0u) {
+            ++g_m14_dev99_nested_abnormal_returns;
+            dolrecomp_call_leave();
+            return 0;
+        }
+        if ((uint32_t)cpu->pc == before_pc) {
+            if (cpu->downcount < before_downcount) {
+                ++g_m14_dev117_same_pc_progress;
+                continue;
+            }
+            ++g_m14_dev105_no_progress_yields;
+            dolrecomp_call_leave();
+            return 0;
+        }
+    }
+
+    ++g_m14_dev105_step_limit_yields;
+    dolrecomp_call_leave();
+    return 0;
+}
+
+/* Generated LLVM calls this at the exact dispDraw bctrl (see the codegen
+ * patch). With draw tags off it is the dev105 walker unchanged. */
+int openspm_m14_dev105_cpustate_nested_dispatch(CPUState *cpu,
+                                                u32 target,
+                                                u32 continuation) {
+    openspm_bridge_instance *instance;
+    int handled;
+    if (!bridge_m14_draw_tags_enabled())
+        return bridge_dev105_cpustate_nested_dispatch(cpu, target, continuation);
+    instance = cpu != NULL ? bridge_from_cpu(cpu) : NULL;
+    if (instance == NULL || cpu != &instance->cpu ||
+        (uint32_t)continuation != OPENSPM_M14_DRAW_TAGS_CALLBACK_RETURN)
+        return bridge_dev105_cpustate_nested_dispatch(cpu, target, continuation);
+    bridge_m14_draw_tags_begin(instance, cpu, (uint32_t)target);
+    handled = bridge_dev105_cpustate_nested_dispatch(cpu, target, continuation);
+    if ((uint32_t)cpu->pc == (uint32_t)continuation && cpu->exception == 0u) {
+        /* The callback returned here: close its owner at the exact point. */
+        if (g_m14_draw_tags.open) ++g_m14_draw_tags.normal_ends;
+        bridge_m14_draw_tags_end(instance, cpu, OPENSPM_M14_DRAW_TAGS_CALLBACK_RETURN);
+    } else if (g_m14_draw_tags.open) {
+        ++g_m14_draw_tags.escaped; /* finishes in the outer dispatcher */
+    }
+    return handled;
+}
+
+static float bridge_dev96_float_from_bits(uint32_t bits) {
+    union {
+        uint32_t bits;
+        float value;
+    } converted;
+    converted.bits = bits;
+    return converted.value;
+}
+
+static int bridge_dev96_read_player_state(
+    CPUState *cpu,
+    int32_t *out_hp,
+    uint32_t *out_flags,
+    uint32_t *out_disp_flags,
+    uint32_t *out_motion,
+    float *out_x,
+    float *out_y,
+    float *out_z) {
+    uint32_t motion_word;
+    if (cpu == NULL ||
+        !bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_POUCH_WORK + OPENSPM_M14_DEV96_POUCH_HP_OFF,
+            UINT32_C(4)) ||
+        !bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK,
+            OPENSPM_M14_DEV96_MARIO_POS_OFF + UINT32_C(12)))
+        return 0;
+
+    if (out_hp != NULL)
+        *out_hp = (int32_t)mem_read32(
+            cpu, OPENSPM_M14_DEV96_POUCH_WORK + OPENSPM_M14_DEV96_POUCH_HP_OFF);
+    if (out_flags != NULL)
+        *out_flags = mem_read32(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_FLAGS_OFF);
+    if (out_disp_flags != NULL)
+        *out_disp_flags = mem_read32(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK +
+                 OPENSPM_M14_DEV96_MARIO_DISP_FLAGS_OFF);
+    motion_word = mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_MOTION_OFF);
+    if (out_motion != NULL)
+        *out_motion = motion_word >> 16u;
+    if (out_x != NULL)
+        *out_x = bridge_dev96_float_from_bits(mem_read32(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF));
+    if (out_y != NULL)
+        *out_y = bridge_dev96_float_from_bits(mem_read32(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF +
+                 UINT32_C(4)));
+    if (out_z != NULL)
+        *out_z = bridge_dev96_float_from_bits(mem_read32(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF +
+                 UINT32_C(8)));
+    return 1;
+}
+
+/* dev105 observation-only split for the player's newly clarified pit repro:
+ * walking off the edge can Game Over, while jumping into the same pit can reach
+ * HP=0/MOT_24 and never request seq 4. Sample only that exact stalled state.
+ * poseTime is the high halfword at +0x24; motion/prevMotion share +0x2C. */
+static void bridge_dev105_note_hp0_motion24(openspm_bridge_instance *instance) {
+    CPUState *cpu;
+    int32_t hp;
+    uint32_t motion_word;
+    uint32_t motion;
+    uint32_t prev_motion;
+    uint32_t pose_word;
+    int16_t pose_time;
+    int32_t submotion;
+    float air_time;
+    float x, y, z;
+    uint32_t seq = UINT32_MAX;
+    uint32_t next_seq = UINT32_MAX;
+    uint64_t n;
+    int changed;
+    char message[640];
+
+    if (instance == NULL) return;
+    cpu = &instance->cpu;
+    if (!bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_POUCH_WORK + OPENSPM_M14_DEV96_POUCH_HP_OFF,
+            UINT32_C(4)) ||
+        !bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK,
+            OPENSPM_M14_DEV96_MARIO_POS_OFF + UINT32_C(12)))
+        return;
+
+    hp = (int32_t)mem_read32(
+        cpu, OPENSPM_M14_DEV96_POUCH_WORK + OPENSPM_M14_DEV96_POUCH_HP_OFF);
+    motion_word = mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_MOTION_OFF);
+    motion = motion_word >> 16u;
+    if (hp != 0 || motion != 24u) {
+        g_m14_dev106_pre_hp0_onhp0_entries =
+            g_m14_dev106_native_onhp0_entries;
+        g_m14_dev106_pre_hp0_seqset_entries =
+            g_m14_dev106_native_seqset_entries;
+        g_m14_dev106_hp0_active = 0u;
+        return;
+    }
+    if (!g_m14_dev106_hp0_active)
+        g_m14_dev106_hp0_active = 1u;
+
+    prev_motion = motion_word & UINT32_C(0xFFFF);
+    pose_word = mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV105_MARIO_POSETIME_OFF);
+    pose_time = (int16_t)(pose_word >> 16u);
+    submotion = (int32_t)mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV105_MARIO_SUBMOTION_OFF);
+    air_time = bridge_dev96_float_from_bits(mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV105_MARIO_AIRTIMER_OFF));
+    x = bridge_dev96_float_from_bits(mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF));
+    y = bridge_dev96_float_from_bits(mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF +
+             UINT32_C(4)));
+    z = bridge_dev96_float_from_bits(mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF +
+             UINT32_C(8)));
+    if (bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV95_SEQ_WORK, UINT32_C(4)))
+        seq = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK);
+    if (bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_NEXT_SEQ, UINT32_C(4)))
+        next_seq = mem_read32(cpu, OPENSPM_M14_DEV96_NEXT_SEQ);
+
+    n = ++g_m14_dev105_hp0_motion24_ticks;
+    changed =
+        submotion != (int32_t)g_m14_dev105_last_submotion ||
+        prev_motion != g_m14_dev105_last_prev_motion;
+    if (n <= UINT64_C(16) || (n & (n - UINT64_C(1))) == 0u || changed) {
+        ++g_m14_dev105_hp0_motion24_logs;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev106 jump-death truth n=%llu hp=0 motion=24 prev_motion=%u submotion=%d pose_time=%d air=%.3f pos=(%.3f,%.3f,%.3f) seq=%d next_seq=%d native_onHp0=%llu(+%llu) native_seqSetSeq=%llu(+%llu) host_onHp0=%llu pc=0x%08X lr=0x%08X.",
+            (unsigned long long)n, (unsigned)prev_motion, (int)submotion,
+            (int)pose_time, (double)air_time, (double)x, (double)y, (double)z,
+            (int32_t)seq, (int32_t)next_seq,
+            (unsigned long long)g_m14_dev106_native_onhp0_entries,
+            (unsigned long long)(g_m14_dev106_native_onhp0_entries -
+                                 g_m14_dev106_pre_hp0_onhp0_entries),
+            (unsigned long long)g_m14_dev106_native_seqset_entries,
+            (unsigned long long)(g_m14_dev106_native_seqset_entries -
+                                 g_m14_dev106_pre_hp0_seqset_entries),
+            (unsigned long long)g_m14_dev105_onhp0_host_calls,
+            (unsigned)cpu->pc, (unsigned)cpu->lr);
+        bridge_v44_log(instance, message);
+    }
+    g_m14_dev105_last_submotion = (uint32_t)submotion;
+    g_m14_dev105_last_prev_motion = prev_motion;
+}
+
+static void bridge_dev96_note_player_state(openspm_bridge_instance *instance,
+                                           const char *where) {
+    CPUState *cpu;
+    int32_t hp;
+    uint32_t hp_raw;
+    uint32_t flags;
+    uint32_t disp_flags;
+    uint32_t motion;
+    float x, y, z;
+    char message[512];
+
+    if (instance == NULL) return;
+    cpu = &instance->cpu;
+    if (!bridge_dev96_read_player_state(
+            cpu, &hp, &flags, &disp_flags, &motion, &x, &y, &z))
+        return;
+    hp_raw = (uint32_t)hp;
+    if (hp_raw == g_m14_dev96_prev_hp_raw)
+        return;
+
+    ++g_m14_dev96_hp_changes;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev96 player state where=%s hp=%d mario_flags=0x%08X disp_flags=0x%08X motion=%u pos=(%.3f,%.3f,%.3f) pc=0x%08X lr=0x%08X change=%llu.",
+        where != NULL ? where : "unknown",
+        (int)hp, (unsigned)flags, (unsigned)disp_flags, (unsigned)motion,
+        (double)x, (double)y, (double)z,
+        (unsigned)cpu->pc, (unsigned)cpu->lr,
+        (unsigned long long)g_m14_dev96_hp_changes);
+    bridge_v44_log(instance, message);
+    g_m14_dev96_prev_hp_raw = hp_raw;
+}
+
+static void bridge_dev95_note_seq_state(openspm_bridge_instance *instance,
+                                        const char *where) {
+    CPUState *cpu;
+    uint32_t seq;
+    uint32_t stage;
+    uint32_t now_seq = UINT32_MAX;
+    uint32_t next_seq = UINT32_MAX;
+    uint32_t prev_seq = UINT32_MAX;
+    char message[448];
+
+    if (instance == NULL) return;
+    cpu = &instance->cpu;
+    if (!bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV95_SEQ_WORK, UINT32_C(8)))
+        return;
+
+    seq = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK);
+    stage = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK + UINT32_C(4));
+    if (bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_NOW_SEQ, UINT32_C(12))) {
+        now_seq = mem_read32(cpu, OPENSPM_M14_DEV96_NOW_SEQ);
+        next_seq = mem_read32(cpu, OPENSPM_M14_DEV96_NEXT_SEQ);
+        prev_seq = mem_read32(cpu, OPENSPM_M14_DEV96_PREV_SEQ);
+    }
+
+    if (next_seq == OPENSPM_M14_DEV95_SEQ_GAMEOVER &&
+        g_m14_dev96_prev_next_seq != OPENSPM_M14_DEV95_SEQ_GAMEOVER) {
+        ++g_m14_dev96_next_gameover_observations;
+    }
+
+    if (seq == g_m14_dev95_prev_seq &&
+        stage == g_m14_dev95_prev_stage &&
+        next_seq == g_m14_dev96_prev_next_seq &&
+        prev_seq == g_m14_dev96_prev_prev_seq)
+        return;
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev96 sequence truth where=%s seqWork=%d stage=%u now_seq=%d next_seq=%d prev_seq=%d pc=0x%08X lr=0x%08X.",
+        where != NULL ? where : "unknown",
+        (int32_t)seq, (unsigned)stage,
+        (int32_t)now_seq, (int32_t)next_seq, (int32_t)prev_seq,
+        (unsigned)cpu->pc, (unsigned)cpu->lr);
+    bridge_v44_log(instance, message);
+    g_m14_dev95_prev_seq = seq;
+    g_m14_dev95_prev_stage = stage;
+    g_m14_dev96_prev_next_seq = next_seq;
+    g_m14_dev96_prev_prev_seq = prev_seq;
+}
+
+/* Observation-only wrapper around the already-proven external bus reader.
+ * It records complete four-register PE bbox transactions after the underlying
+ * Wii/Aurora service has produced the value. No value, ordering or guest state
+ * is changed. Empty-result logging is bounded to the first 16 and powers of two. */
+static u64 bridge_external_read_dev96(CPUState *cpu, u32 address, u8 width) {
+    u64 value = 0u;
+    uint32_t index;
+    if (g_m14_dev96_underlying_external_read != NULL)
+        value = g_m14_dev96_underlying_external_read(cpu, address, width);
+
+    if (width != 2u ||
+        address < OPENSPM_M14_DEV96_BBOX_LEFT ||
+        address > OPENSPM_M14_DEV96_BBOX_BOTTOM ||
+        ((address - OPENSPM_M14_DEV96_BBOX_LEFT) & UINT32_C(1)) != 0u)
+        return value;
+
+    index = (address - OPENSPM_M14_DEV96_BBOX_LEFT) >> 1u;
+    if (index >= 4u) return value;
+    if (index == 0u || g_m14_dev96_bbox_mask == 0u) {
+        g_m14_dev96_bbox_mask = 0u;
+        g_m14_dev96_bbox_first_pc = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+        g_m14_dev96_bbox_first_lr = cpu != NULL ? (uint32_t)cpu->lr : 0u;
+    }
+    g_m14_dev96_bbox_values[index] = (uint16_t)value;
+    g_m14_dev96_bbox_mask |= UINT32_C(1) << index;
+
+    if (g_m14_dev96_bbox_mask == UINT32_C(0xF)) {
+        const int empty =
+            g_m14_dev96_bbox_values[0] == UINT16_C(1023) &&
+            g_m14_dev96_bbox_values[1] == UINT16_C(0) &&
+            g_m14_dev96_bbox_values[2] == UINT16_C(1023) &&
+            g_m14_dev96_bbox_values[3] == UINT16_C(0);
+        ++g_m14_dev96_bbox_reads;
+        if (empty) {
+            const uint64_t n = ++g_m14_dev96_bbox_empty_reads;
+            if (n <= UINT64_C(16) || (n & (n - UINT64_C(1))) == 0u) {
+                uint32_t now_seq = UINT32_MAX;
+                uint32_t next_seq = UINT32_MAX;
+                uint32_t seq = UINT32_MAX;
+                uint32_t stage = UINT32_MAX;
+                int32_t hp = INT32_MIN;
+                uint32_t mario_flags = UINT32_MAX;
+                uint32_t disp_flags = UINT32_MAX;
+                uint32_t motion = UINT32_MAX;
+                float x = 0.0f, y = 0.0f, z = 0.0f;
+                char message[768];
+                if (cpu != NULL &&
+                    bridge_m14_context_address_valid(
+                        cpu, OPENSPM_M14_DEV96_NOW_SEQ, UINT32_C(8))) {
+                    now_seq = mem_read32(cpu, OPENSPM_M14_DEV96_NOW_SEQ);
+                    next_seq = mem_read32(cpu, OPENSPM_M14_DEV96_NEXT_SEQ);
+                }
+                if (cpu != NULL &&
+                    bridge_m14_context_address_valid(
+                        cpu, OPENSPM_M14_DEV95_SEQ_WORK, UINT32_C(8))) {
+                    seq = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK);
+                    stage = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK + UINT32_C(4));
+                }
+                (void)bridge_dev96_read_player_state(
+                    cpu, &hp, &mario_flags, &disp_flags, &motion, &x, &y, &z);
+                (void)snprintf(
+                    message, sizeof(message),
+                    "M14 LLVM dev96 empty PE bbox n=%llu total=%llu caller_pc=0x%08X caller_lr=0x%08X seq=%d stage=%u now_seq=%d next_seq=%d hp=%d mario_flags=0x%08X disp_flags=0x%08X motion=%u pos=(%.3f,%.3f,%.3f) bounds=1023,0,1023,0.",
+                    (unsigned long long)n,
+                    (unsigned long long)g_m14_dev96_bbox_reads,
+                    (unsigned)g_m14_dev96_bbox_first_pc,
+                    (unsigned)g_m14_dev96_bbox_first_lr,
+                    (int32_t)seq, (unsigned)stage,
+                    (int32_t)now_seq, (int32_t)next_seq,
+                    (int)hp, (unsigned)mario_flags, (unsigned)disp_flags,
+                    (unsigned)motion, (double)x, (double)y, (double)z);
+                if (g_m14_dev67_instance != NULL)
+                    bridge_v44_log(g_m14_dev67_instance, message);
+            }
+        }
+        g_m14_dev96_bbox_mask = 0u;
+    }
+    return value;
+}
+
+static bool bridge_host_call_dev95(CPUState *cpu, u32 address) {
+    if (cpu != NULL && (uint32_t)address == OPENSPM_M14_DEV105_ON_HP_EQUALS_0) {
+        const uint64_t n = ++g_m14_dev105_onhp0_host_calls;
+        if (g_m14_dev67_instance != NULL &&
+            (n <= UINT64_C(8) || (n & (n - UINT64_C(1))) == 0u)) {
+            char hp_message[320];
+            const uint32_t motion_word = mem_read32(
+                cpu, OPENSPM_M14_DEV96_MARIO_WORK +
+                     OPENSPM_M14_DEV96_MARIO_MOTION_OFF);
+            (void)snprintf(
+                hp_message, sizeof(hp_message),
+                "M14 LLVM dev105 host-visible onHpEquals0 n=%llu lr=0x%08X arg=%d hp=%d motion=%u prev_motion=%u.",
+                (unsigned long long)n, (unsigned)cpu->lr,
+                (int32_t)cpu->gpr[3],
+                (int32_t)mem_read32(
+                    cpu, OPENSPM_M14_DEV96_POUCH_WORK +
+                         OPENSPM_M14_DEV96_POUCH_HP_OFF),
+                (unsigned)(motion_word >> 16u),
+                (unsigned)(motion_word & UINT32_C(0xFFFF)));
+            bridge_v44_log(g_m14_dev67_instance, hp_message);
+        }
+    }
+
+    if (cpu != NULL && (uint32_t)address == OPENSPM_M14_DEV95_SEQ_SET_SEQ) {
+        uint32_t seq = UINT32_MAX;
+        uint32_t stage = UINT32_MAX;
+        const uint32_t requested = (uint32_t)cpu->gpr[3];
+        char message[384];
+
+        ++g_m14_dev95_seqset_calls;
+        if (requested == OPENSPM_M14_DEV95_SEQ_GAMEOVER)
+            ++g_m14_dev95_gameover_requests;
+        if (bridge_m14_context_address_valid(
+                cpu, OPENSPM_M14_DEV95_SEQ_WORK, UINT32_C(8))) {
+            seq = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK);
+            stage = mem_read32(cpu, OPENSPM_M14_DEV95_SEQ_WORK + UINT32_C(4));
+        }
+        if (g_m14_dev67_instance != NULL) {
+            (void)snprintf(
+                message, sizeof(message),
+                "M14 LLVM dev95 seqSetSeq request=%d pre_seq=%d pre_stage=%u lr=0x%08X p0=0x%08X p1=0x%08X call=%llu.",
+                (int32_t)requested, (int32_t)seq, (unsigned)stage,
+                (unsigned)cpu->lr, (unsigned)cpu->gpr[4],
+                (unsigned)cpu->gpr[5],
+                (unsigned long long)g_m14_dev95_seqset_calls);
+            bridge_v44_log(g_m14_dev67_instance, message);
+        }
+    }
+
+    return g_m14_dev95_underlying_host_call != NULL
+               ? g_m14_dev95_underlying_host_call(cpu, address)
+               : false;
+}
+
+/* dev100 samples whole display/main intervals, including cold escapes. */
+#include "m14_scene_profile.h"
+static m14_scene_profile g_m14_scene_profile;
+uint32_t openspm_m14_scene_profile_active;
+
+void openspm_m14_scene_interval(uint32_t kind, uint32_t site, uint32_t target) {
+    if (!openspm_m14_scene_profile_active || g_m14_dev67_instance == NULL)
+        return;
+    m14_scene_boundary(&g_m14_scene_profile, kind, site, target,
+                      bridge_m14_now_ns(g_m14_dev67_instance));
+}
+
+static void bridge_dev100_report(openspm_bridge_instance *instance,
+                                  uint64_t now, int force) {
+    m14_scene_profile *p = &g_m14_scene_profile;
+    char message[640];
+    uint32_t kind, rank, i;
+    uint8_t emitted[M14_SCENE_SLOTS];
+    if (p->active) return;
+    if (p->report_ns == 0u) p->report_ns = now;
+    if (!force && (now < p->report_ns ||
+        now - p->report_ns < UINT64_C(2000000000))) return;
+    if (p->sampled[1] == 0u && p->sampled[2] == 0u) return;
+    memset(emitted, 0, sizeof(emitted));
+    (void)snprintf(message, sizeof(message),
+        "M14 LLVM dev100 scene intervals sampled_disp=%llu sampled_main=%llu disp_us=%llu main_us=%llu overflow_disp_us=%llu overflow_main_us=%llu; 1/64 frames, intervals include caller gaps and cold escapes, not exclusive function CPU time.",
+        (unsigned long long)p->sampled[1], (unsigned long long)p->sampled[2],
+        (unsigned long long)(p->total_ns[1] / 1000u),
+        (unsigned long long)(p->total_ns[2] / 1000u),
+        (unsigned long long)(p->overflow_ns[1] / 1000u),
+        (unsigned long long)(p->overflow_ns[2] / 1000u));
+    bridge_v44_log(instance, message);
+    for (kind = 1u; kind <= 2u; ++kind) {
+        for (rank = 0u; rank < 5u; ++rank) {
+            uint32_t best = M14_SCENE_SLOTS;
+            for (i = 0u; i < M14_SCENE_SLOTS; ++i) {
+                if (!emitted[i] && p->slots[i].kind == kind &&
+                    (best == M14_SCENE_SLOTS || p->slots[i].ns > p->slots[best].ns))
+                    best = i;
+            }
+            if (best == M14_SCENE_SLOTS) break;
+            emitted[best] = 1u;
+            (void)snprintf(message, sizeof(message),
+                "M14 LLVM dev100 scene owner phase=%s site=0x%08X target=0x%08X intervals=%llu total_us=%llu max_us=%llu sampled_frames=%llu.",
+                kind == 1u ? "disp" : "main", (unsigned)p->slots[best].site,
+                (unsigned)p->slots[best].target,
+                (unsigned long long)p->slots[best].intervals,
+                (unsigned long long)(p->slots[best].ns / 1000u),
+                (unsigned long long)(p->slots[best].max_ns / 1000u),
+                (unsigned long long)p->sampled[kind]);
+            bridge_v44_log(instance, message);
+        }
+    }
+    m14_scene_drain(p, now);
+}
+
+static float bridge_dev111_absf(float v) {
+    return v < 0.0f ? -v : v;
+}
+
+static void bridge_dev111_note_motion(openspm_bridge_instance *instance) {
+    float x = 0.0f, z = 0.0f;
+    float dx, dz, adx, adz;
+    if (instance == NULL ||
+        !bridge_dev96_read_player_state(
+            &instance->cpu, NULL, NULL, NULL, NULL, &x, NULL, &z))
+        return;
+
+    if (!g_m14_dev111_have_position) {
+        g_m14_dev111_prev_x = x;
+        g_m14_dev111_prev_z = z;
+        g_m14_dev111_prev_dx = 0.0f;
+        g_m14_dev111_have_position = 1u;
+        return;
+    }
+
+    dx = x - g_m14_dev111_prev_x;
+    dz = z - g_m14_dev111_prev_z;
+    adx = bridge_dev111_absf(dx);
+    adz = bridge_dev111_absf(dz);
+    ++g_m14_dev111_motion_samples;
+    if (adx < 0.0001f && adz < 0.0001f)
+        ++g_m14_dev111_motion_duplicates;
+    if (adx >= 0.0001f) {
+        ++g_m14_dev111_motion_x_moves;
+        g_m14_dev111_motion_abs_x_total += (double)adx;
+        if (g_m14_dev111_motion_abs_x_min == 0.0f ||
+            adx < g_m14_dev111_motion_abs_x_min)
+            g_m14_dev111_motion_abs_x_min = adx;
+        if (adx > g_m14_dev111_motion_abs_x_max)
+            g_m14_dev111_motion_abs_x_max = adx;
+        if (bridge_dev111_absf(g_m14_dev111_prev_dx) >= 0.0001f &&
+            ((dx < 0.0f && g_m14_dev111_prev_dx > 0.0f) ||
+             (dx > 0.0f && g_m14_dev111_prev_dx < 0.0f)))
+            ++g_m14_dev111_motion_x_reversals;
+        g_m14_dev111_prev_dx = dx;
+    }
+    if (adz > g_m14_dev111_motion_abs_z_max)
+        g_m14_dev111_motion_abs_z_max = adz;
+    g_m14_dev111_prev_x = x;
+    g_m14_dev111_prev_z = z;
+}
+
+static void bridge_dev111_report(openspm_bridge_instance *instance) {
+    uint8_t emitted[OPENSPM_M14_DEV111_DISP_SLOTS];
+    uint32_t rank, i;
+    char message[768];
+    size_t used;
+    int wrote;
+
+    if (instance == NULL) return;
+    memset(emitted, 0, sizeof(emitted));
+    wrote = snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev111 NPC/display census frames=%u callbacks=%llu collisions=%llu top=",
+        (unsigned)g_m14_dev111_report_frames,
+        (unsigned long long)g_m14_dev111_disp_total,
+        (unsigned long long)g_m14_dev111_disp_collisions);
+    if (wrote < 0) wrote = 0;
+    used = (size_t)wrote < sizeof(message)
+        ? (size_t)wrote : sizeof(message) - 1u;
+
+    for (rank = 0u; rank < 8u && used + 48u < sizeof(message); ++rank) {
+        uint32_t best = OPENSPM_M14_DEV111_DISP_SLOTS;
+        for (i = 0u; i < OPENSPM_M14_DEV111_DISP_SLOTS; ++i) {
+            if (!emitted[i] && g_m14_dev111_disp_slots[i].count != 0u &&
+                (best == OPENSPM_M14_DEV111_DISP_SLOTS ||
+                 g_m14_dev111_disp_slots[i].count >
+                     g_m14_dev111_disp_slots[best].count))
+                best = i;
+        }
+        if (best == OPENSPM_M14_DEV111_DISP_SLOTS) break;
+        emitted[best] = 1u;
+        wrote = snprintf(
+            message + used, sizeof(message) - used,
+            " [0x%08X:%llu]",
+            (unsigned)g_m14_dev111_disp_slots[best].target,
+            (unsigned long long)g_m14_dev111_disp_slots[best].count);
+        if (wrote <= 0) break;
+        used += (size_t)wrote;
+    }
+    bridge_v44_log(instance, message);
+
+    memset(emitted, 0, sizeof(emitted));
+    wrote = snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev112 NPC-owned disp callbacks param_in_table=%llu exact_entry=%llu table=0x%08X count=%u top=",
+        (unsigned long long)g_m14_dev112_npc_param_callbacks,
+        (unsigned long long)g_m14_dev112_npc_exact_callbacks,
+        (unsigned)g_m14_dev112_npc_entries,
+        (unsigned)g_m14_dev112_npc_count);
+    if (wrote < 0) wrote = 0;
+    used = (size_t)wrote < sizeof(message)
+        ? (size_t)wrote : sizeof(message) - 1u;
+    for (rank = 0u; rank < 8u && used + 48u < sizeof(message); ++rank) {
+        uint32_t best = OPENSPM_M14_DEV111_DISP_SLOTS;
+        for (i = 0u; i < OPENSPM_M14_DEV111_DISP_SLOTS; ++i) {
+            if (!emitted[i] && g_m14_dev112_npc_slots[i].count != 0u &&
+                (best == OPENSPM_M14_DEV111_DISP_SLOTS ||
+                 g_m14_dev112_npc_slots[i].count >
+                     g_m14_dev112_npc_slots[best].count))
+                best = i;
+        }
+        if (best == OPENSPM_M14_DEV111_DISP_SLOTS) break;
+        emitted[best] = 1u;
+        wrote = snprintf(
+            message + used, sizeof(message) - used,
+            " [0x%08X:%llu]",
+            (unsigned)g_m14_dev112_npc_slots[best].target,
+            (unsigned long long)g_m14_dev112_npc_slots[best].count);
+        if (wrote <= 0) break;
+        used += (size_t)wrote;
+    }
+    bridge_v44_log(instance, message);
+
+    {
+        uint32_t unique_params = 0u;
+        uint32_t camera;
+        uint8_t param_emitted[OPENSPM_M14_DEV115_PARAM_SLOTS];
+        memset(param_emitted, 0, sizeof(param_emitted));
+        for (i = 0u; i < OPENSPM_M14_DEV115_PARAM_SLOTS; ++i)
+            if (g_m14_dev115_param_slots[i].count != 0u)
+                ++unique_params;
+        wrote = snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev115 map-range callback target=0x%08X calls=%llu unique_params=%u param_collisions=%llu cameras=",
+            (unsigned)OPENSPM_M14_DEV115_MAP_TARGET,
+            (unsigned long long)g_m14_dev115_calls,
+            (unsigned)unique_params,
+            (unsigned long long)g_m14_dev115_param_collisions);
+        if (wrote < 0) wrote = 0;
+        used = (size_t)wrote < sizeof(message)
+            ? (size_t)wrote : sizeof(message) - 1u;
+        for (camera = 0u;
+             camera < OPENSPM_M14_DEV115_CAMERA_SLOTS &&
+             used + 32u < sizeof(message);
+             ++camera) {
+            if (g_m14_dev115_camera_counts[camera] == 0u)
+                continue;
+            wrote = snprintf(
+                message + used, sizeof(message) - used,
+                " [%u:%llu]", (unsigned)camera,
+                (unsigned long long)g_m14_dev115_camera_counts[camera]);
+            if (wrote <= 0) break;
+            used += (size_t)wrote;
+        }
+        if (g_m14_dev115_camera_other != 0u && used + 40u < sizeof(message)) {
+            wrote = snprintf(
+                message + used, sizeof(message) - used,
+                " [other:%llu]",
+                (unsigned long long)g_m14_dev115_camera_other);
+            if (wrote > 0) used += (size_t)wrote;
+        }
+        if (used + 16u < sizeof(message)) {
+            wrote = snprintf(message + used, sizeof(message) - used,
+                             " top_params=");
+            if (wrote > 0) used += (size_t)wrote;
+        }
+        for (rank = 0u; rank < 6u && used + 48u < sizeof(message); ++rank) {
+            uint32_t best = OPENSPM_M14_DEV115_PARAM_SLOTS;
+            for (i = 0u; i < OPENSPM_M14_DEV115_PARAM_SLOTS; ++i) {
+                if (!param_emitted[i] &&
+                    g_m14_dev115_param_slots[i].count != 0u &&
+                    (best == OPENSPM_M14_DEV115_PARAM_SLOTS ||
+                     g_m14_dev115_param_slots[i].count >
+                         g_m14_dev115_param_slots[best].count))
+                    best = i;
+            }
+            if (best == OPENSPM_M14_DEV115_PARAM_SLOTS) break;
+            param_emitted[best] = 1u;
+            wrote = snprintf(
+                message + used, sizeof(message) - used,
+                " [0x%08X:%llu]",
+                (unsigned)g_m14_dev115_param_slots[best].param,
+                (unsigned long long)g_m14_dev115_param_slots[best].count);
+            if (wrote <= 0) break;
+            used += (size_t)wrote;
+        }
+        bridge_v44_log(instance, message);
+    }
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev111 Mario motion frames=%llu duplicates=%llu x_moves=%llu x_reversals=%llu avg_abs_dx=%.6f min_abs_dx=%.6f max_abs_dx=%.6f max_abs_dz=%.6f; sampled after spmarioMain once per produced frame.",
+        (unsigned long long)g_m14_dev111_motion_samples,
+        (unsigned long long)g_m14_dev111_motion_duplicates,
+        (unsigned long long)g_m14_dev111_motion_x_moves,
+        (unsigned long long)g_m14_dev111_motion_x_reversals,
+        g_m14_dev111_motion_x_moves != 0u
+            ? g_m14_dev111_motion_abs_x_total /
+              (double)g_m14_dev111_motion_x_moves : 0.0,
+        (double)g_m14_dev111_motion_abs_x_min,
+        (double)g_m14_dev111_motion_abs_x_max,
+        (double)g_m14_dev111_motion_abs_z_max);
+    bridge_v44_log(instance, message);
+
+    memset(g_m14_dev111_disp_slots, 0, sizeof(g_m14_dev111_disp_slots));
+    memset(g_m14_dev112_npc_slots, 0, sizeof(g_m14_dev112_npc_slots));
+    memset(g_m14_dev115_param_slots, 0, sizeof(g_m14_dev115_param_slots));
+    memset(g_m14_dev115_camera_counts, 0, sizeof(g_m14_dev115_camera_counts));
+    g_m14_dev111_disp_total = 0u;
+    g_m14_dev111_disp_collisions = 0u;
+    g_m14_dev112_npc_param_callbacks = 0u;
+    g_m14_dev112_npc_exact_callbacks = 0u;
+    g_m14_dev115_calls = 0u;
+    g_m14_dev115_param_collisions = 0u;
+    g_m14_dev115_camera_other = 0u;
+    g_m14_dev111_report_frames = 0u;
+    g_m14_dev111_motion_samples = 0u;
+    g_m14_dev111_motion_duplicates = 0u;
+    g_m14_dev111_motion_x_moves = 0u;
+    g_m14_dev111_motion_x_reversals = 0u;
+    g_m14_dev111_motion_abs_x_total = 0.0;
+    g_m14_dev111_motion_abs_x_min = 0.0f;
+    g_m14_dev111_motion_abs_x_max = 0.0f;
+    g_m14_dev111_motion_abs_z_max = 0.0f;
+}
+
+static void bridge_dev122_sample_camera_tail(
+    openspm_bridge_instance *instance, uint32_t phase) {
+    CPUState *cpu;
+    uint32_t cam_ptr_addr;
+    uint32_t cam_ptr;
+    float mario_x;
+    float cam_pos_x;
+    float cam_target_x;
+    float cam_view_tx;
+    float mario_dx = 0.0f;
+    float pos_dx = 0.0f;
+    float target_dx = 0.0f;
+    float view_dx = 0.0f;
+
+    if (instance == NULL || phase != 0u) return;
+    cpu = &instance->cpu;
+    cam_ptr_addr = OPENSPM_M14_DEV122_CAM_PTR_TABLE +
+                   OPENSPM_M14_DEV122_CAM_ID * UINT32_C(4);
+    if (!bridge_m14_context_address_valid(cpu, cam_ptr_addr, UINT32_C(4)) ||
+        !bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV96_MARIO_WORK +
+                     OPENSPM_M14_DEV96_MARIO_POS_OFF,
+            UINT32_C(4)))
+        return;
+
+    cam_ptr = mem_read32(cpu, cam_ptr_addr);
+    if (cam_ptr == 0u ||
+        !bridge_m14_context_address_valid(
+            cpu, cam_ptr + OPENSPM_M14_DEV122_CAM_VIEW_MTX_OFF,
+            UINT32_C(48)) ||
+        !bridge_m14_context_address_valid(
+            cpu, cam_ptr + OPENSPM_M14_DEV122_CAM_POS_OFF,
+            UINT32_C(16)))
+        return;
+
+    mario_x = bridge_dev96_float_from_bits(mem_read32(
+        cpu, OPENSPM_M14_DEV96_MARIO_WORK + OPENSPM_M14_DEV96_MARIO_POS_OFF));
+    cam_pos_x = bridge_dev96_float_from_bits(mem_read32(
+        cpu, cam_ptr + OPENSPM_M14_DEV122_CAM_POS_OFF));
+    cam_target_x = bridge_dev96_float_from_bits(mem_read32(
+        cpu, cam_ptr + OPENSPM_M14_DEV122_CAM_TARGET_OFF));
+    cam_view_tx = bridge_dev96_float_from_bits(mem_read32(
+        cpu, cam_ptr + OPENSPM_M14_DEV122_CAM_VIEW_MTX_OFF + UINT32_C(12)));
+
+    if (g_m14_dev122_have_camera_sample) {
+        mario_dx = mario_x - g_m14_dev122_prev_mario_x;
+        pos_dx = cam_pos_x - g_m14_dev122_prev_cam_pos_x;
+        target_dx = cam_target_x - g_m14_dev122_prev_cam_target_x;
+        view_dx = cam_view_tx - g_m14_dev122_prev_cam_view_tx;
+    }
+
+    if (g_m14_v21_tail_pending_id != 0u) {
+        char message[640];
+        const uint64_t tail_id = g_m14_v21_tail_pending_id;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 dev122 camera tail n=%llu have_prev=%u mario_x=%.6f mario_dx=%.6f cam5_pos_x=%.6f pos_dx=%.6f cam5_target_x=%.6f target_dx=%.6f cam5_view_tx=%.6f view_dx=%.6f view_repeat=%u.",
+            (unsigned long long)tail_id,
+            (unsigned)g_m14_dev122_have_camera_sample,
+            (double)mario_x, (double)mario_dx,
+            (double)cam_pos_x, (double)pos_dx,
+            (double)cam_target_x, (double)target_dx,
+            (double)cam_view_tx, (double)view_dx,
+            (unsigned)(g_m14_dev122_have_camera_sample &&
+                       bridge_dev111_absf(view_dx) < 1.0e-6f));
+        bridge_v44_log(instance, message);
+        g_m14_v21_tail_pending_id = 0u;
+    }
+
+    g_m14_dev122_prev_mario_x = mario_x;
+    g_m14_dev122_prev_cam_pos_x = cam_pos_x;
+    g_m14_dev122_prev_cam_target_x = cam_target_x;
+    g_m14_dev122_prev_cam_view_tx = cam_view_tx;
+    g_m14_dev122_have_camera_sample = 1u;
+}
+
+/* dev81: exact native LLVM frame-phase marker.
+ *
+ * The older phase profiler is semantically sound but its LLVM observation path
+ * depended on a phase PC escaping through the public dispatcher. Native direct
+ * execution can cross those entries without that escape, so complete 0->1->2->3
+ * windows were never guaranteed. Generated LLVM now calls this host-only helper
+ * at the four proven frame-loop entries. It intentionally takes no CPUState:
+ * no guest register/memory state is materialized merely to read a host clock.
+ * The retained v21 profiler owns timing/window logging and sees the persistent
+ * CPU only as an instance locator. */
+static void bridge_dev118_report(openspm_bridge_instance *instance,
+                                 uint64_t now,
+                                 int force);
+
+void openspm_m14_note_frame_phase_native(u32 phase) {
+    openspm_bridge_instance *instance = g_m14_dev67_instance;
+    if (instance == NULL || phase >= OPENSPM_M14_FRAME_PHASE_COUNT)
+        return;
+    bridge_m14_draw_tags_phase(instance, (uint32_t)phase);
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    /* dev121 keeps the retired scene/call-owner sampler only in explicit
+       profiling builds. Normal play still retains the lightweight v21 four-
+       phase cadence probe below. */
+    m14_scene_phase(&g_m14_scene_profile, phase,
+        (g_m14_scene_profile.active ||
+         (phase == 1u && (g_m14_scene_profile.frame & 63u) == 0u))
+            ? bridge_m14_now_ns(instance) : 0u);
+    openspm_m14_scene_profile_active = g_m14_scene_profile.active;
+#endif
+    openspm_m14_note_frame_phase_v20(&instance->cpu, phase);
+    bridge_dev122_sample_camera_tail(instance, phase);
+#if !OPENSPM_M14_HEAVY_DIAGNOSTICS
+    if (phase == 0u)
+        bridge_dev118_report(instance, bridge_m14_now_ns(instance), 0);
+#endif
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    if (phase == 0u) {
+        bridge_dev112_refresh_npc_table(&instance->cpu);
+        ++g_m14_dev111_report_frames;
+        if (g_m14_dev111_report_frames >= OPENSPM_M14_DEV111_REPORT_FRAMES)
+            bridge_dev111_report(instance);
+    }
+#endif
+    if (phase == 2u) {
+        openspm_m14_note_spmario_main_v20(&instance->cpu);
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+        bridge_dev95_note_seq_state(instance, "spmarioMain");
+        bridge_dev96_note_player_state(instance, "spmarioMain");
+        bridge_dev105_note_hp0_motion24(instance);
+#endif
+    }
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    else if (phase == 3u) {
+        bridge_dev111_note_motion(instance);
+    }
+#endif
+}
+
+static uint64_t bridge_dev67_elapsed_us(uint64_t before, uint64_t after) {
+    if (after < before) return 0u;
+    return (after - before) / UINT64_C(1000);
+}
+
+/* dev118 end-of-frame/retrace pacing report.
+ *
+ * The old "done" phase intentionally spans DEMODoneRender through the next
+ * DEMOBeforeRender, so it cannot separate real work from scheduler idle/wait.
+ * These counters live at the VI boundary instead and report only once per host
+ * second: from_idle means Nintendo's scheduler reached true idle before the
+ * fixed deadline; busy_due means the deadline arrived before that happened. */
+typedef struct openspm_m14_dev118_report_state {
+    uint64_t report_ns;
+    uint64_t updates;
+    uint32_t retraces;
+    uint64_t expired;
+    uint64_t idle_ready;
+    uint64_t ready_margin_total_ns;
+    uint64_t delivery_count;
+    uint64_t delivery_from_idle;
+    uint64_t delivery_busy;
+    uint64_t late_total_ns;
+    uint64_t late_over_1ms;
+    uint64_t late_over_2ms;
+    uint64_t sleep1;
+    uint64_t yield0;
+    uint64_t sleep_crossings;
+    uint64_t event_total_ns;
+} openspm_m14_dev118_report_state;
+
+static openspm_m14_dev118_report_state g_m14_dev118_report;
+
+static void bridge_dev118_snapshot(openspm_m14_dev118_report_state *r,
+                                   uint64_t now) {
+    const openspm_m14_dev118_pacing_state *p = &g_m14_dev118_pacing;
+    r->report_ns = now;
+    r->updates = g_m14_v20_spmario_main_total;
+    r->retraces = g_m14_retrace_ticks;
+    r->expired = g_m14_v20_expired_deadlines;
+    r->idle_ready = p->idle_ready_count;
+    r->ready_margin_total_ns = p->idle_ready_margin_total_ns;
+    r->delivery_count = p->delivery_count;
+    r->delivery_from_idle = p->delivery_from_idle_count;
+    r->delivery_busy = p->delivery_busy_count;
+    r->late_total_ns = p->delivery_late_total_ns;
+    r->late_over_1ms = p->delivery_late_over_1ms;
+    r->late_over_2ms = p->delivery_late_over_2ms;
+    r->sleep1 = p->sleep1_calls;
+    r->yield0 = p->yield0_calls;
+    r->sleep_crossings = p->sleep_crossings;
+    r->event_total_ns = p->event_total_ns;
+}
+
+static void bridge_dev118_report(openspm_bridge_instance *instance,
+                                 uint64_t now,
+                                 int force) {
+    openspm_m14_dev118_report_state *r = &g_m14_dev118_report;
+    const openspm_m14_dev118_pacing_state *p = &g_m14_dev118_pacing;
+    uint64_t elapsed;
+    uint64_t deliveries;
+    uint64_t ready;
+    uint64_t late_total;
+    uint64_t event_total;
+    uint64_t updates;
+    uint32_t retraces;
+    uint64_t expired;
+    char message[1024];
+
+    if (instance == NULL || now == 0u) return;
+    if (r->report_ns == 0u) {
+        bridge_dev118_snapshot(r, now);
+        return;
+    }
+    elapsed = now >= r->report_ns ? now - r->report_ns : 0u;
+    if (!force && elapsed < UINT64_C(1000000000)) return;
+
+    deliveries = p->delivery_count - r->delivery_count;
+    ready = p->idle_ready_count - r->idle_ready;
+    late_total = p->delivery_late_total_ns - r->late_total_ns;
+    event_total = p->event_total_ns - r->event_total_ns;
+    updates = g_m14_v20_spmario_main_total - r->updates;
+    retraces = g_m14_retrace_ticks - r->retraces;
+    expired = g_m14_v20_expired_deadlines - r->expired;
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 dev118 pacing host_ms=%llu frames=%llu retraces=%u "
+        "deliveries=%llu from_idle=%llu busy_due=%llu idle_ready=%llu "
+        "ready_margin_avg_us=%llu ready_margin_min_us=%llu ready_margin_max_us=%llu "
+        "delivery_late_avg_us=%llu delivery_late_max_us=%llu "
+        "late_gt1ms=%llu late_gt2ms=%llu sleep1=%llu yield0=%llu "
+        "sleep_cross=%llu sleep_overshoot_max_us=%llu "
+        "vi_handler_avg_us=%llu vi_handler_max_us=%llu expired=%llu precise=%u spin2ms=%u.",
+        (unsigned long long)(elapsed / UINT64_C(1000000)),
+        (unsigned long long)updates,
+        (unsigned)retraces,
+        (unsigned long long)deliveries,
+        (unsigned long long)(p->delivery_from_idle_count - r->delivery_from_idle),
+        (unsigned long long)(p->delivery_busy_count - r->delivery_busy),
+        (unsigned long long)ready,
+        (unsigned long long)(ready != 0u
+            ? (p->idle_ready_margin_total_ns - r->ready_margin_total_ns) /
+              ready / UINT64_C(1000)
+            : 0u),
+        (unsigned long long)(p->idle_ready_margin_min_ns / UINT64_C(1000)),
+        (unsigned long long)(p->idle_ready_margin_max_ns / UINT64_C(1000)),
+        (unsigned long long)(deliveries != 0u
+            ? late_total / deliveries / UINT64_C(1000) : 0u),
+        (unsigned long long)(p->delivery_late_max_ns / UINT64_C(1000)),
+        (unsigned long long)(p->delivery_late_over_1ms - r->late_over_1ms),
+        (unsigned long long)(p->delivery_late_over_2ms - r->late_over_2ms),
+        (unsigned long long)(p->sleep1_calls - r->sleep1),
+        (unsigned long long)(p->yield0_calls - r->yield0),
+        (unsigned long long)(p->sleep_crossings - r->sleep_crossings),
+        (unsigned long long)(p->sleep_overshoot_max_ns / UINT64_C(1000)),
+        (unsigned long long)(deliveries != 0u
+            ? event_total / deliveries / UINT64_C(1000) : 0u),
+        (unsigned long long)(p->event_max_ns / UINT64_C(1000)),
+        (unsigned long long)expired,
+        (unsigned)bridge_m14_dev118_precise_wait_enabled(),
+        (unsigned)bridge_m14_dev126_final_spin_enabled());
+    bridge_v44_log(instance, message);
+    bridge_dev118_snapshot(r, now);
+}
+
+/* Weighted Space-Saving sketch.  It is diagnostic only: exact PCs are retained
+   for the heaviest run-boundary pairs without an O(number-of-PCs) table. */
+static void bridge_dev67_note_pair(uint32_t start_pc, uint32_t end_pc,
+                                   uint64_t wall_us) {
+    uint32_t i;
+    uint32_t empty = OPENSPM_M14_DEV67_PROFILE_SLOTS;
+    uint32_t lightest = 0u;
+
+    for (i = 0u; i < OPENSPM_M14_DEV67_PROFILE_SLOTS; ++i) {
+        openspm_m14_dev67_pair_slot *slot = &g_m14_dev67_pairs[i];
+        if (slot->calls != 0u && slot->start_pc == start_pc &&
+            slot->end_pc == end_pc) {
+            slot->wall_us += wall_us;
+            ++slot->calls;
+            return;
+        }
+        if (empty == OPENSPM_M14_DEV67_PROFILE_SLOTS && slot->calls == 0u)
+            empty = i;
+        if (slot->wall_us < g_m14_dev67_pairs[lightest].wall_us)
+            lightest = i;
+    }
+
+    if (empty != OPENSPM_M14_DEV67_PROFILE_SLOTS) {
+        g_m14_dev67_pairs[empty].start_pc = start_pc;
+        g_m14_dev67_pairs[empty].end_pc = end_pc;
+        g_m14_dev67_pairs[empty].wall_us = wall_us;
+        g_m14_dev67_pairs[empty].calls = 1u;
+        return;
+    }
+
+    g_m14_dev67_pairs[lightest].start_pc = start_pc;
+    g_m14_dev67_pairs[lightest].end_pc = end_pc;
+    g_m14_dev67_pairs[lightest].error_us =
+        g_m14_dev67_pairs[lightest].wall_us;
+    g_m14_dev67_pairs[lightest].wall_us += wall_us;
+    g_m14_dev67_pairs[lightest].calls = 1u;
+}
+
+static void bridge_dev67_note_duration(uint64_t wall_us) {
+    if (wall_us <= 250u) ++g_m14_dev67_hist[0];
+    else if (wall_us <= 500u) ++g_m14_dev67_hist[1];
+    else if (wall_us <= 1000u) ++g_m14_dev67_hist[2];
+    else if (wall_us <= 2000u) ++g_m14_dev67_hist[3];
+    else if (wall_us <= 4000u) ++g_m14_dev67_hist[4];
+    else ++g_m14_dev67_hist[5];
+}
+
+static void bridge_dev67_log_hang_snapshot(openspm_bridge_instance *instance,
+                                           uint64_t consecutive) {
+    CPUState *cpu;
+    uint32_t pc;
+    char message[1152];
+    if (instance == NULL) return;
+    cpu = &instance->cpu;
+    pc = (uint32_t)cpu->pc;
+
+    if (bridge_m14_context_address_valid(cpu, pc - UINT32_C(16), UINT32_C(36))) {
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev67 stationary diagnostic count=%llu pc=0x%08X lr=0x%08X ctr=0x%08X cr=0x%08X xer=0x%08X msr=0x%08X downcount=%lld insn=[%08X %08X %08X %08X <%08X> %08X %08X %08X %08X] r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r12=%08X r29=%08X r30=%08X r31=%08X.",
+            (unsigned long long)consecutive,
+            (unsigned)pc, (unsigned)cpu->lr, (unsigned)cpu->ctr,
+            (unsigned)cpu->cr, (unsigned)cpu->xer, (unsigned)cpu->msr,
+            (long long)cpu->downcount,
+            (unsigned)mem_read32(cpu, pc - UINT32_C(16)),
+            (unsigned)mem_read32(cpu, pc - UINT32_C(12)),
+            (unsigned)mem_read32(cpu, pc - UINT32_C(8)),
+            (unsigned)mem_read32(cpu, pc - UINT32_C(4)),
+            (unsigned)mem_read32(cpu, pc),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(4)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(8)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(12)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(16)),
+            (unsigned)cpu->gpr[3], (unsigned)cpu->gpr[4],
+            (unsigned)cpu->gpr[5], (unsigned)cpu->gpr[6],
+            (unsigned)cpu->gpr[7], (unsigned)cpu->gpr[8],
+            (unsigned)cpu->gpr[9], (unsigned)cpu->gpr[10],
+            (unsigned)cpu->gpr[11], (unsigned)cpu->gpr[12],
+            (unsigned)cpu->gpr[29], (unsigned)cpu->gpr[30],
+            (unsigned)cpu->gpr[31]);
+    } else {
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev67 stationary diagnostic count=%llu pc=0x%08X lr=0x%08X ctr=0x%08X cr=0x%08X msr=0x%08X; surrounding player text is not mapped.",
+            (unsigned long long)consecutive,
+            (unsigned)pc, (unsigned)cpu->lr, (unsigned)cpu->ctr,
+            (unsigned)cpu->cr, (unsigned)cpu->msr);
+    }
+    bridge_v44_log(instance, message);
+}
+
+static int OPENSPM_CALL bridge_run_dev67(void *opaque,
+                                        uint64_t soft_cycle_budget,
+                                        openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    uint32_t start_pc;
+    uint32_t end_pc;
+    uint64_t before;
+    uint64_t after;
+    uint64_t wall_us;
+    int result;
+#endif
+
+    if (instance == NULL || g_m14_dev67_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+#if !OPENSPM_M14_HEAVY_DIAGNOSTICS
+    /* dev121: normal play no longer profiles every native slice. Historical
+       dev67 wrapped ~155k slices/sec with two host clock reads plus histogram,
+       pair, hang and cadence bookkeeping. That data was diagnostic-only and
+       can consume the remaining 60 Hz headroom. Preserve the exact underlying
+       runtime call and all guest semantics; full profiling remains available
+       with heavy_diag=1. */
+    return g_m14_dev67_underlying_run(opaque, soft_cycle_budget, out_exit);
+#else
+    start_pc = (uint32_t)instance->cpu.pc;
+    before = bridge_m14_now_ns(instance);
+    result = g_m14_dev67_underlying_run(opaque, soft_cycle_budget, out_exit);
+    after = bridge_m14_now_ns(instance);
+    end_pc = (uint32_t)instance->cpu.pc;
+    wall_us = bridge_dev67_elapsed_us(before, after);
+    bridge_dev100_report(instance, after, 0);
+    bridge_dev118_report(instance, after, 0);
+
+    ++g_m14_dev67_slice_calls;
+    g_m14_dev67_slice_wall_us += wall_us;
+    if (start_pc == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+        ++g_m14_dev68_idle_entry_calls;
+        g_m14_dev68_idle_entry_us += wall_us;
+    }
+    if (wall_us > g_m14_dev67_slice_max_us)
+        g_m14_dev67_slice_max_us = wall_us;
+    bridge_dev67_note_duration(wall_us);
+    bridge_dev67_note_pair(start_pc, end_pc, wall_us);
+
+    if (end_pc == OPENSPM_M14_DEV67_HANG_PC) {
+        ++g_m14_dev67_hang_consecutive;
+        if (g_m14_dev67_hang_consecutive > g_m14_dev67_hang_max_consecutive)
+            g_m14_dev67_hang_max_consecutive = g_m14_dev67_hang_consecutive;
+        if (g_m14_dev67_hang_consecutive == UINT64_C(64) ||
+            g_m14_dev67_hang_consecutive == UINT64_C(1024))
+            bridge_dev67_log_hang_snapshot(instance,
+                                           g_m14_dev67_hang_consecutive);
+    } else {
+        g_m14_dev67_hang_consecutive = 0u;
+    }
+
+    if (g_m14_dev79_rescue_window_ns == 0u) {
+        g_m14_dev79_rescue_window_ns = after;
+        g_m14_dev79_rescue_window_count = g_m14_dev50_bl_rescues;
+        g_m14_dev83_ordinary_window_count = g_m14_dev50_ordinary_calls;
+        g_m14_dev85_budget_window_count = g_m14_dev85_budget_exit_count;
+        g_m14_dev113_nested_window_attempts = g_m14_dev99_nested_attempts;
+        g_m14_dev113_nested_window_steps = g_m14_dev105_nested_steps;
+    } else if (after >= g_m14_dev79_rescue_window_ns &&
+               after - g_m14_dev79_rescue_window_ns >= UINT64_C(1000000000)) {
+        const uint64_t elapsed_ns = after - g_m14_dev79_rescue_window_ns;
+        const uint64_t now_count = g_m14_dev50_bl_rescues;
+        const uint64_t delta = now_count >= g_m14_dev79_rescue_window_count
+            ? now_count - g_m14_dev79_rescue_window_count : 0u;
+        const uint64_t rate = elapsed_ns != 0u
+            ? (delta * UINT64_C(1000000000)) / elapsed_ns : 0u;
+        const uint64_t ordinary_now = g_m14_dev50_ordinary_calls;
+        const uint64_t ordinary_delta =
+            ordinary_now >= g_m14_dev83_ordinary_window_count
+                ? ordinary_now - g_m14_dev83_ordinary_window_count : 0u;
+        const uint64_t ordinary_rate = elapsed_ns != 0u
+            ? (ordinary_delta * UINT64_C(1000000000)) / elapsed_ns : 0u;
+        const uint64_t budget_now = g_m14_dev85_budget_exit_count;
+        const uint64_t budget_delta =
+            budget_now >= g_m14_dev85_budget_window_count
+                ? budget_now - g_m14_dev85_budget_window_count : 0u;
+        const uint64_t budget_rate = elapsed_ns != 0u
+            ? (budget_delta * UINT64_C(1000000000)) / elapsed_ns : 0u;
+        const uint64_t nested_attempts_now = g_m14_dev99_nested_attempts;
+        const uint64_t nested_steps_now = g_m14_dev105_nested_steps;
+        const uint64_t nested_attempts_delta =
+            nested_attempts_now >= g_m14_dev113_nested_window_attempts
+                ? nested_attempts_now - g_m14_dev113_nested_window_attempts : 0u;
+        const uint64_t nested_steps_delta =
+            nested_steps_now >= g_m14_dev113_nested_window_steps
+                ? nested_steps_now - g_m14_dev113_nested_window_steps : 0u;
+        const uint64_t nested_steps_per_attempt_x1000 =
+            nested_attempts_delta != 0u
+                ? (nested_steps_delta * UINT64_C(1000)) / nested_attempts_delta
+                : 0u;
+        char message[560];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev113 cadence chunk=%u state_mem=%u host_ms=%llu bl_rescues=%llu bl_rate_per_s=%llu ordinary=%llu ordinary_rate_per_s=%llu budget_exits=%llu budget_exit_rate_per_s=%llu nested_attempts=%llu nested_steps=%llu nested_steps_per_attempt_x1000=%llu pc=0x%08X.",
+            (unsigned)OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS,
+            (unsigned)OPENSPM_M14_LLVM_STATE_IN_MEMORY,
+            (unsigned long long)(elapsed_ns / UINT64_C(1000000)),
+            (unsigned long long)delta,
+            (unsigned long long)rate,
+            (unsigned long long)ordinary_delta,
+            (unsigned long long)ordinary_rate,
+            (unsigned long long)budget_delta,
+            (unsigned long long)budget_rate,
+            (unsigned long long)nested_attempts_delta,
+            (unsigned long long)nested_steps_delta,
+            (unsigned long long)nested_steps_per_attempt_x1000,
+            (unsigned)end_pc);
+        bridge_v44_log(instance, message);
+        g_m14_dev79_rescue_window_ns = after;
+        g_m14_dev79_rescue_window_count = now_count;
+        g_m14_dev83_ordinary_window_count = ordinary_now;
+        g_m14_dev85_budget_window_count = budget_now;
+        g_m14_dev113_nested_window_attempts = nested_attempts_now;
+        g_m14_dev113_nested_window_steps = nested_steps_now;
+    }
+
+    return result;
+#endif
+}
+
+static int OPENSPM_CALL bridge_create_dev67(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev67_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev67_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK)
+        return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev67_instance = instance;
+    /* Fresh counters; OPENSPM_M14_DRAW_TAGS is re-read per instance. */
+    memset(&g_m14_draw_tags, 0, sizeof(g_m14_draw_tags));
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    g_m14_dev95_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_dev95;
+    g_m14_dev96_underlying_external_read = instance->cpu.external_read;
+    instance->cpu.external_read = bridge_external_read_dev96;
+#else
+    g_m14_dev95_underlying_host_call = NULL;
+    g_m14_dev96_underlying_external_read = NULL;
+#endif
+    g_m14_dev95_prev_seq = UINT32_MAX;
+    g_m14_dev95_prev_stage = UINT32_MAX;
+    g_m14_dev96_prev_next_seq = UINT32_MAX;
+    g_m14_dev96_prev_prev_seq = UINT32_MAX;
+    g_m14_dev95_seqset_calls = 0u;
+    g_m14_dev95_gameover_requests = 0u;
+    g_m14_dev96_next_gameover_observations = 0u;
+    g_m14_dev96_prev_hp_raw = UINT32_MAX;
+    g_m14_dev96_hp_changes = 0u;
+    memset(g_m14_dev96_bbox_values, 0, sizeof(g_m14_dev96_bbox_values));
+    g_m14_dev96_bbox_mask = 0u;
+    g_m14_dev96_bbox_first_pc = 0u;
+    g_m14_dev96_bbox_first_lr = 0u;
+    g_m14_dev96_bbox_reads = 0u;
+    g_m14_dev96_bbox_empty_reads = 0u;
+    g_m14_dev122_have_camera_sample = 0u;
+    g_m14_dev122_prev_mario_x = 0.0f;
+    g_m14_dev122_prev_cam_pos_x = 0.0f;
+    g_m14_dev122_prev_cam_target_x = 0.0f;
+    g_m14_dev122_prev_cam_view_tx = 0.0f;
+    memset(&g_m14_scene_profile, 0, sizeof(g_m14_scene_profile));
+    openspm_m14_scene_profile_active = 0u;
+    g_m14_dev100_nested_budget_yields = 0u;
+    g_m14_dev99_nested_attempts = 0u;
+    g_m14_dev99_nested_handled = 0u;
+    g_m14_dev99_nested_normal_returns = 0u;
+    g_m14_dev99_nested_abnormal_returns = 0u;
+    g_m14_dev99_nested_depth_fallbacks = 0u;
+    g_m14_dev99_nested_lookup_misses = 0u;
+    g_m14_dev105_nested_steps = 0u;
+    g_m14_dev105_step_limit_yields = 0u;
+    g_m14_dev105_no_progress_yields = 0u;
+    g_m14_dev117_same_pc_progress = 0u;
+    memset(&g_m14_dev118_report, 0, sizeof(g_m14_dev118_report));
+    g_m14_dev105_hp0_motion24_ticks = 0u;
+    g_m14_dev105_hp0_motion24_logs = 0u;
+    g_m14_dev105_onhp0_host_calls = 0u;
+    g_m14_dev105_last_submotion = UINT32_MAX;
+    g_m14_dev105_last_prev_motion = UINT32_MAX;
+    memset(g_m14_dev111_disp_slots, 0, sizeof(g_m14_dev111_disp_slots));
+    memset(g_m14_dev112_npc_slots, 0, sizeof(g_m14_dev112_npc_slots));
+    memset(g_m14_dev115_param_slots, 0, sizeof(g_m14_dev115_param_slots));
+    memset(g_m14_dev115_camera_counts, 0, sizeof(g_m14_dev115_camera_counts));
+    g_m14_dev111_disp_total = 0u;
+    g_m14_dev112_npc_entries = 0u;
+    g_m14_dev112_npc_count = 0u;
+    g_m14_dev112_npc_end = 0u;
+    g_m14_dev112_npc_param_callbacks = 0u;
+    g_m14_dev112_npc_exact_callbacks = 0u;
+    g_m14_dev115_calls = 0u;
+    g_m14_dev115_param_collisions = 0u;
+    g_m14_dev115_camera_other = 0u;
+    g_m14_dev111_disp_collisions = 0u;
+    g_m14_dev111_report_frames = 0u;
+    g_m14_dev111_motion_samples = 0u;
+    g_m14_dev111_motion_duplicates = 0u;
+    g_m14_dev111_motion_x_moves = 0u;
+    g_m14_dev111_motion_x_reversals = 0u;
+    g_m14_dev111_motion_abs_x_total = 0.0;
+    g_m14_dev111_motion_abs_x_min = 0.0f;
+    g_m14_dev111_motion_abs_x_max = 0.0f;
+    g_m14_dev111_motion_abs_z_max = 0.0f;
+    g_m14_dev111_prev_x = 0.0f;
+    g_m14_dev111_prev_z = 0.0f;
+    g_m14_dev111_prev_dx = 0.0f;
+    g_m14_dev111_have_position = 0u;
+    memset(g_m14_dev67_pairs, 0, sizeof(g_m14_dev67_pairs));
+    memset(g_m14_dev67_hist, 0, sizeof(g_m14_dev67_hist));
+    g_m14_dev67_slice_calls = 0u;
+    g_m14_dev67_slice_wall_us = 0u;
+    g_m14_dev67_slice_max_us = 0u;
+    g_m14_dev67_hang_consecutive = 0u;
+    g_m14_dev67_hang_max_consecutive = 0u;
+    g_m14_dev68_idle_entry_calls = 0u;
+    g_m14_dev68_idle_entry_us = 0u;
+    g_m14_dev79_rescue_window_ns = 0u;
+    g_m14_dev79_rescue_window_count = 0u;
+    g_m14_dev83_ordinary_window_count = 0u;
+    g_m14_dev85_budget_window_count = 0u;
+    g_m14_dev113_nested_window_attempts = 0u;
+    g_m14_dev113_nested_window_steps = 0u;
+    g_m14_dev85_budget_exit_count = 0u;
+    g_m14_dev68_runnable_resumes = 0u;
+    g_m14_dev68_idle_polls = 0u;
+    g_m14_dev68_idle_sleep_ns = 0u;
+    g_m14_dev69_seam_rejects = 0u;
+    g_m14_dev69_host_rejects = 0u;
+#ifdef OPENSPM_M14_DEV87_EXACT_HOSTCALL_PREFILTER
+    openspm_m14_dev87_bypass_count = 0u;
+#endif
+#ifdef OPENSPM_M14_DEV90_STRUCTURAL_NATIVE_FIRST
+    openspm_m14_dev90_native_first_hits = 0u;
+    openspm_m14_dev90_native_first_fallbacks = 0u;
+#endif
+#ifdef OPENSPM_M14_DEV107_DIRECT_BL_NATIVE_FIRST
+    openspm_m14_dev107_direct_bl_native_hits = 0u;
+    openspm_m14_dev107_direct_bl_native_fallbacks = 0u;
+#endif
+
+    bridge_v44_log(instance,
+        "M14 LLVM dev68 runnable-idle wake active: live Nintendo RunQueueBits prevents sleeping runnable work until VI; exact native scheduler owns resumption; fixed 60 Hz retraces and dev67 safe host semantics retained; profiler uses monotonic wall time, not CPU time.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev69 immutable address filters active: absent static seams/host targets skip binary searches; collisions use exact lookup; every dynamic callback and dev68 runnable wake remain active.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev79 rescue cadence correlation active: direct-BL rescue deltas are reported about once per host second; guest state unchanged.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev81 native frame-phase profiler active: exact DEMOBeforeRender/spmarioDisp/spmarioMain/DEMODoneRender LLVM entries call a host-only timestamp helper; no CPUState materialization is requested.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev85 guard-quantum A/B active: private legacy x86 SJLJ codegen uses 32768-cycle voluntary yields instead of 256; host-first semantic routing and outer 200k-cycle safepoint budget are unchanged; exact generated budget-exit and ordinary callback rates are reported with cadence.");
+#ifdef OPENSPM_M14_DEV87_EXACT_HOSTCALL_PREFILTER
+    bridge_v44_log(instance,
+        "M14 LLVM dev87 exact host-call prefilter active: definite ordinary in-image PCs skip only the LLVM->C host callback; semantic/unknown PCs retain host-first routing.");
+#endif
+#ifdef OPENSPM_M14_DEV103_ENTRYONLY_HOSTCALL_FILTER
+    bridge_v44_log(instance,
+        "M14 LLVM dev103 entry-only host filter active: generic dev57 address-taken callback entries no longer pay the host semantic callback unless independently classified by a real semantic/direct-BL/host-target rule; dev97 HP-zero entries remain host-first.");
+#endif
+#ifdef OPENSPM_M14_DEV90_STRUCTURAL_NATIVE_FIRST
+    bridge_v44_log(instance,
+        "M14 LLVM dev129 scheduler-idle dynamic dispatch active: empty Nintendo RunQueueBits side-exits immediately to the host VI-wait path; runnable/unknown idle state stays native so SelectThread remains authoritative. dev90 native-first now covers only the two proven dev79 BL-source entries.");
+#endif
+#ifdef OPENSPM_M14_DEV107_DIRECT_BL_NATIVE_FIRST
+    bridge_v44_log(instance,
+        "M14 LLVM dev108 partition-only A/B active: dev107 legal-entry / reduced-partition layout retained, but broad direct-BL native-first execution is disabled; historical host-first/direct-BL rescue semantics own those PCs.");
+#endif
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    bridge_v44_log(instance,
+        "M14 LLVM dev96 offscreen/death truth probe active: US2 seqWork/now/next/prev plus relocated Mario/Pouch HP state are sampled at native spmarioMain entry; HP transitions log Mario flags/motion/position; complete empty PE bbox reads log guest caller PC/LR plus player/sequence state. Observation-only; guest/render values are unchanged.");
+#else
+    bridge_v44_log(instance,
+        "M14 LLVM dev121 retired correctness probes: sequence/HP/bbox observation wrappers are not installed in normal play; heavy_diag=1 restores them.");
+#endif
+    bridge_v44_log(instance,
+        "M14 LLVM dev99 native-ABI dispDraw nesting retained: historical range A/B remains fail-closed; dev101 proved the measured callback site is CPUState ABI.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev117 CPUState dispDraw progress-aware nesting active: exact site 0x8005B29C walks up to 128 generated chunks inside the unchanged 32768-cycle quantum; same-PC returns continue only when downcount proves guest-cycle progress; semantic fallback, exception, miss, true no-progress and limits fail closed to the historical outer path.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev118 retrace pacing probe active: once-per-second counters separate work-ready-before-VI from busy-at-deadline, Windows wait crossings/overshoot, VI lateness and handler cost; dev121 samples/report-checks at frame cadence instead of every native slice; OPENSPM_M14_PRECISE_IDLE_WAIT changes only final <=2ms idle polling and dev126 can replace only those Sleep(0) yields with an idle-only final spin.");
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    bridge_v44_log(instance,
+        "M14 LLVM dev106 jump-death trace active: HP=0/MOT_24 samples pose/submotion/air/prev-motion plus exact generated-entry counters for native onHpEquals0=0x801615E4 and seqSetSeq=0x8017B834; host-visible counters remain as a cross-check; observation only.");
+#endif
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    bridge_v44_log(instance,
+        "M14 LLVM dev111 NPC/display + Mario-motion probe active: exact dispDraw callback targets are counted without clocks at the existing dev105 boundary, and post-main X/Z movement is sampled once per produced frame; reports every 16 produced frames.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev112 NPC callback ownership probe active: dispDraw r4 callbackParam is range-classified against the live NPCEntry table cached once per produced frame; no NPC state is mutated.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev115 map-range callback census active: exact target 0x8008533C records camera IDs and callbackParam cardinality at the existing dev105 boundary; no clocks or guest mutation.");
+#else
+    bridge_v44_log(instance,
+        "M14 LLVM dev121 quiet normal-play diagnostics mode: dev67 per-slice clocks/histograms, dev95/dev96/dev106 correctness observation, dev111/dev112/dev115 census and Mario-motion sampling are compiled off; guest execution, dev105 callback semantics, VI pacing and lightweight frame-phase telemetry are unchanged.");
+#endif
+    bridge_v44_log(instance,
+        "M14 LLVM dev113 chunk" OPENSPM_M14_STRINGIFY(OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS)
+        " Yold Town A/B active: selected generic LLVM chunk ceiling is "
+        OPENSPM_M14_STRINGIFY(OPENSPM_M14_LLVM_CHUNK_INSTRUCTIONS)
+        " instructions; semantic partitions, legal cold entries, host routing and dev105 fail-closed callback semantics are unchanged.");
+    bridge_v44_log(instance,
+        "M14 LLVM dev114 state-in-memory A/B selected=" OPENSPM_M14_STRINGIFY(OPENSPM_M14_LLVM_STATE_IN_MEMORY)
+        ": when enabled, non-native-ABI guest state lives directly in CPUState; native-ABI ranges and guest semantics are unchanged.");
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+    bridge_dev95_note_seq_state(instance, "create");
+#endif
+    bridge_v44_log(instance,
+        "M14 LLVM dev122 tail attribution active over dev121 quiet path: >20ms produced frames reuse existing phase clocks and attach camera-5/Mario deltas; no per-slice profiling restored.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev67(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        uint32_t i;
+        char message[2048];
+        size_t used;
+        int wrote;
+        const uint64_t avg = g_m14_dev67_slice_calls != 0u
+            ? g_m14_dev67_slice_wall_us / g_m14_dev67_slice_calls : 0u;
+
+        {
+            const uint64_t destroy_now = bridge_m14_now_ns(instance);
+            m14_scene_phase(&g_m14_scene_profile, 3u, destroy_now);
+            openspm_m14_scene_profile_active = 0u;
+            bridge_dev100_report(instance, destroy_now, 1);
+            bridge_dev118_report(instance, destroy_now, 1);
+        }
+
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+        wrote = snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev68 slice stats calls=%llu wall_us=%llu avg_us=%llu max_us=%llu hist_us=[<=250:%llu <=500:%llu <=1000:%llu <=2000:%llu <=4000:%llu >4000:%llu] hang_80065128_max=%llu heavy_pairs=",
+            (unsigned long long)g_m14_dev67_slice_calls,
+            (unsigned long long)g_m14_dev67_slice_wall_us,
+            (unsigned long long)avg,
+            (unsigned long long)g_m14_dev67_slice_max_us,
+            (unsigned long long)g_m14_dev67_hist[0],
+            (unsigned long long)g_m14_dev67_hist[1],
+            (unsigned long long)g_m14_dev67_hist[2],
+            (unsigned long long)g_m14_dev67_hist[3],
+            (unsigned long long)g_m14_dev67_hist[4],
+            (unsigned long long)g_m14_dev67_hist[5],
+            (unsigned long long)g_m14_dev67_hang_max_consecutive);
+        if (wrote < 0) wrote = 0;
+        used = (size_t)wrote < sizeof(message)
+            ? (size_t)wrote : sizeof(message) - 1u;
+        for (i = 0u; i < OPENSPM_M14_DEV67_PROFILE_SLOTS &&
+             used + 144u < sizeof(message); ++i) {
+            const openspm_m14_dev67_pair_slot *slot = &g_m14_dev67_pairs[i];
+            if (slot->calls == 0u) continue;
+            wrote = snprintf(
+                message + used, sizeof(message) - used,
+                " [0x%08X->0x%08X retained_calls=%llu estimate_us=%llu error_us=%llu]",
+                (unsigned)slot->start_pc, (unsigned)slot->end_pc,
+                (unsigned long long)slot->calls,
+                (unsigned long long)slot->wall_us,
+                (unsigned long long)slot->error_us);
+            if (wrote <= 0) break;
+            used += (size_t)wrote;
+        }
+        bridge_v44_log(instance, message);
+#else
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev121 quiet slice profiler stats: per-slice timing disabled in heavy_diag=0; historical dev67 clocks/histograms intentionally not collected.");
+        bridge_v44_log(instance, message);
+#endif
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev68 idle stats runnable_resumes=%llu idle_polls=%llu idle_sleep_us=%llu idle_entry_calls=%llu idle_entry_wall_us=%llu; idle-entry time includes any native work after wake, sleep is measured separately.",
+            (unsigned long long)g_m14_dev68_runnable_resumes,
+            (unsigned long long)g_m14_dev68_idle_polls,
+            (unsigned long long)(g_m14_dev68_idle_sleep_ns / UINT64_C(1000)),
+            (unsigned long long)g_m14_dev68_idle_entry_calls,
+            (unsigned long long)g_m14_dev68_idle_entry_us);
+        bridge_v44_log(instance, message);
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev69 static filter stats seam_rejects=%llu host_rejects=%llu; only immutable table membership filtered, no dynamic callback bypass.",
+            (unsigned long long)g_m14_dev69_seam_rejects,
+            (unsigned long long)g_m14_dev69_host_rejects);
+        bridge_v44_log(instance, message);
+#ifdef OPENSPM_M14_DEV87_EXACT_HOSTCALL_PREFILTER
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev87 host-call prefilter stats bypassed=%llu; bypass means host callback omitted only after exact generated negative classification.",
+            (unsigned long long)openspm_m14_dev87_bypass_count);
+        bridge_v44_log(instance, message);
+#endif
+#ifdef OPENSPM_M14_DEV90_STRUCTURAL_NATIVE_FIRST
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev90 structural native-first stats hits=%llu fallbacks=%llu; hits now cover only the two proven dev79 BL-source entries.",
+            (unsigned long long)openspm_m14_dev90_native_first_hits,
+            (unsigned long long)openspm_m14_dev90_native_first_fallbacks);
+        bridge_v44_log(instance, message);
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev129 scheduler-idle dynamic stats empty_sideexits=%llu runnable_native=%llu unknown_native=%llu; empty queues park immediately, runnable/unknown queues preserve Nintendo SelectThread execution.",
+            (unsigned long long)g_m14_dev129_empty_idle_sideexits,
+            (unsigned long long)g_m14_dev129_runnable_idle_native,
+            (unsigned long long)g_m14_dev129_unknown_idle_native);
+        bridge_v44_log(instance, message);
+#endif
+#ifdef OPENSPM_M14_DEV107_DIRECT_BL_NATIVE_FIRST
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev108 direct-BL A/B stats disabled_hits=%llu disabled_fallbacks=%llu; both should remain zero because broad dev107 native-first execution is disabled.",
+            (unsigned long long)openspm_m14_dev107_direct_bl_native_hits,
+            (unsigned long long)openspm_m14_dev107_direct_bl_native_fallbacks);
+        bridge_v44_log(instance, message);
+#endif
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev105 dispDraw nested stats attempts=%llu handled=%llu normal_returns=%llu abnormal_returns=%llu depth_fallbacks=%llu lookup_misses=%llu budget_yields=%llu nested_steps=%llu step_limit_yields=%llu no_progress_yields=%llu same_pc_progress=%llu.",
+            (unsigned long long)g_m14_dev99_nested_attempts,
+            (unsigned long long)g_m14_dev99_nested_handled,
+            (unsigned long long)g_m14_dev99_nested_normal_returns,
+            (unsigned long long)g_m14_dev99_nested_abnormal_returns,
+            (unsigned long long)g_m14_dev99_nested_depth_fallbacks,
+            (unsigned long long)g_m14_dev99_nested_lookup_misses,
+            (unsigned long long)g_m14_dev100_nested_budget_yields,
+            (unsigned long long)g_m14_dev105_nested_steps,
+            (unsigned long long)g_m14_dev105_step_limit_yields,
+            (unsigned long long)g_m14_dev105_no_progress_yields,
+            (unsigned long long)g_m14_dev117_same_pc_progress);
+        bridge_v44_log(instance, message);
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev106 jump-death stats hp0_motion24_ticks=%llu logs=%llu host_visible_onHpEquals0=%llu native_onHpEquals0=%llu native_seqSetSeq=%llu.",
+            (unsigned long long)g_m14_dev105_hp0_motion24_ticks,
+            (unsigned long long)g_m14_dev105_hp0_motion24_logs,
+            (unsigned long long)g_m14_dev105_onhp0_host_calls,
+            (unsigned long long)g_m14_dev106_native_onhp0_entries,
+            (unsigned long long)g_m14_dev106_native_seqset_entries);
+        bridge_v44_log(instance, message);
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM dev96 sequence/bbox truth stats host_seqSetSeq_calls=%llu host_gameover_requests=%llu next_seq_gameover_observations=%llu hp_changes=%llu final_hp=%d final_seq=%d final_stage=%u final_next_seq=%d bbox_reads=%llu empty_bbox_reads=%llu.",
+            (unsigned long long)g_m14_dev95_seqset_calls,
+            (unsigned long long)g_m14_dev95_gameover_requests,
+            (unsigned long long)g_m14_dev96_next_gameover_observations,
+            (unsigned long long)g_m14_dev96_hp_changes,
+            (int32_t)g_m14_dev96_prev_hp_raw,
+            (int32_t)g_m14_dev95_prev_seq,
+            (unsigned)g_m14_dev95_prev_stage,
+            (int32_t)g_m14_dev96_prev_next_seq,
+            (unsigned long long)g_m14_dev96_bbox_reads,
+            (unsigned long long)g_m14_dev96_bbox_empty_reads);
+        bridge_v44_log(instance, message);
+#if OPENSPM_M14_HEAVY_DIAGNOSTICS
+        if (instance->cpu.host_call == bridge_host_call_dev95)
+            instance->cpu.host_call = g_m14_dev95_underlying_host_call;
+        if (instance->cpu.external_read == bridge_external_read_dev96)
+            instance->cpu.external_read = g_m14_dev96_underlying_external_read;
+#endif
+    }
+
+    g_m14_dev95_underlying_host_call = NULL;
+    g_m14_dev96_underlying_external_read = NULL;
+    g_m14_dev67_instance = NULL;
+    if (g_m14_dev67_underlying_destroy != NULL)
+        g_m14_dev67_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev67_base(requested_abi, out_api);
+    if (result != OPENSPM_OK)
+        return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev67_underlying_create = out_api->create;
+    g_m14_dev67_underlying_run = out_api->run;
+    g_m14_dev67_underlying_destroy = out_api->destroy;
+    out_api->module_version = OPENSPM_M14_EXPERIMENT_VERSION;
+    out_api->create = bridge_create_dev67;
+    out_api->run = bridge_run_dev67;
+    out_api->destroy = bridge_destroy_dev67;
+#endif
+    return OPENSPM_OK;
+}

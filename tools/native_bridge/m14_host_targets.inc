@@ -1,0 +1,56 @@
+/*
+ * M14 semantic host targets mirrored from state/m14-host-targets.json.
+ *
+ * This file is intentionally X-macro data so the local bridge can classify
+ * addresses before DolRecomp's ordinary guest dispatcher claims them. Keep it
+ * synchronized with the JSON manifest; test_host_target_sync.py checks exact
+ * equality so drift is visible instead of silently re-entering Wii SDK code.
+ * Tiny PPC helpers whose complete architectural effects are reproduced inline
+ * are intentionally not listed here.
+ *
+ * GXBeginDisplayList/GXEndDisplayList are deliberately absent. Local-module
+ * bridge v19 keeps their recompiled CPU-side GXData/FIFO shadow semantics native
+ * and brackets only OpenSPM's neutral physical recorder with continuation-safe
+ * guest return-label hooks. This fixes the transient post-call seam that made
+ * v18 lose the recorder transition across a DolRecomp yield.
+ */
+OPENSPM_M14_HOST_TARGET(0x8026DFA0u)
+OPENSPM_M14_HOST_TARGET(0x8026E028u)
+OPENSPM_M14_HOST_TARGET(0x80279CDCu)
+OPENSPM_M14_HOST_TARGET(0x80279BF4u)
+OPENSPM_M14_HOST_TARGET(0x8029778Cu)
+OPENSPM_M14_HOST_TARGET(0x8029792Cu)
+OPENSPM_M14_HOST_TARGET(0x80297B2Cu)
+OPENSPM_M14_HOST_TARGET(0x80297C0Cu)
+OPENSPM_M14_HOST_TARGET(0x80297C84u)
+OPENSPM_M14_HOST_TARGET(0x8029868Cu)
+OPENSPM_M14_HOST_TARGET(0x80298BE8u)
+OPENSPM_M14_HOST_TARGET(0x80299B34u)
+OPENSPM_M14_HOST_TARGET(0x80299D48u)
+OPENSPM_M14_HOST_TARGET(0x8029A500u)
+OPENSPM_M14_HOST_TARGET(0x80236D00u)
+OPENSPM_M14_HOST_TARGET(0x80235AB8u)
+OPENSPM_M14_HOST_TARGET(0x802CE890u)
+OPENSPM_M14_HOST_TARGET(0x802DF4F0u)
+OPENSPM_M14_HOST_TARGET(0x802CD5DCu)
+OPENSPM_M14_HOST_TARGET(0x802A0150u)
+OPENSPM_M14_HOST_TARGET(0x8029A7E0u)
+OPENSPM_M14_HOST_TARGET(0x8029A880u)
+OPENSPM_M14_HOST_TARGET(0x80282A68u)
+OPENSPM_M14_HOST_TARGET(0x80282E10u)
+OPENSPM_M14_HOST_TARGET(0x8028325Cu)
+OPENSPM_M14_HOST_TARGET(0x80285328u)
+OPENSPM_M14_HOST_TARGET(0x8028987Cu)
+OPENSPM_M14_HOST_TARGET(0x802960A0u)
+OPENSPM_M14_HOST_TARGET(0x802961B8u)
+OPENSPM_M14_HOST_TARGET(0x802962D8u)
+OPENSPM_M14_HOST_TARGET(0x80296398u)
+OPENSPM_M14_HOST_TARGET(0x80296440u)
+OPENSPM_M14_HOST_TARGET(0x80296540u)
+OPENSPM_M14_HOST_TARGET(0x80296648u)
+OPENSPM_M14_HOST_TARGET(0x80296748u)
+OPENSPM_M14_HOST_TARGET(0x80296850u)
+OPENSPM_M14_HOST_TARGET(0x80296930u)
+OPENSPM_M14_HOST_TARGET(0x80296A68u)
+OPENSPM_M14_HOST_TARGET(0x80296CD4u)
+OPENSPM_M14_HOST_TARGET(0x80296DB8u)

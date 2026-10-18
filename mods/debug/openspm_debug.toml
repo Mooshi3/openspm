@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_debug.dll in the mods folder.
+id = "openspm.debug"
+name = "OpenSPM Debug"
+version = "13.5-directboot-us2"
+author = "OpenSPM samples"
+description = "Logs guest memory and runtime events once in a while (a health check for the mod interface)."
+requires = ["openspm.guest_memory>=1"]

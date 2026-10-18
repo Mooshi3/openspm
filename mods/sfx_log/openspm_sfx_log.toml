@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_sfx_log.dll in the mods folder.
+id = "openspm.sample.sfx_log"
+name = "SFX Log"
+version = "1.0"
+author = "OpenSPM samples"
+description = "Logs the name of every sound effect the game starts (needs the spsndSFXOn hook enabled)."
+requires = ["openspm.hooks>=1", "openspm.guest_memory>=1"]

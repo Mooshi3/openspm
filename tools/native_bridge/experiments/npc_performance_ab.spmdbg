@@ -1,0 +1,52 @@
+# OpenSPM M14 dev111/dev112 - LAST-NIGHT stable NPC performance capture
+#
+# Pick a reasonably crowded room whose NPCs remain present. The test aborts if
+# num/active/table identity changes during stability checks.
+#
+# During BOTH capture windows, move Mario steadily in one direction when
+# practical (for example hold Right). This lets dev111 compare guest movement
+# steps while dev112 classifies NPC-owned dispDraw callbacks.
+#
+# Non-destructive only: no hide/isolate and no active-bit suppression.
+
+defer speed 1
+defer npcs suspend off
+defer npcs isolate off
+defer npcs freeze off
+
+stable_npcs 2.0 0.20
+
+capture start 01-stable-baseline
+status
+map
+pos
+npcs info
+npcs list
+npcs freeze off
+wait 5
+npcs info
+npcs list
+capture stop
+
+stable_npcs 1.5 0.20
+
+capture start 02-stable-npc-logic-frozen
+status
+map
+pos
+npcs info
+npcs list
+npcs freeze on
+wait 5
+npcs freeze off
+npcs info
+npcs list
+capture stop
+
+stable_npcs 1.5 0.20
+
+status
+map
+pos
+npcs info
+npcs list

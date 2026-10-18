@@ -1,0 +1,1 @@
+M12 retry: isolate unused whole-game dispatch tables from MSVC routine tests.

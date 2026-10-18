@@ -1,0 +1,319 @@
+/*
+ * M14 local-module bridge v24 / deterministic relF allocation proof.
+ *
+ * Runtime 031935 escaped the frame-phase gate and stopped at fallback detail 12
+ * / PC 0x80AF1DDC. With verified relF prolog offset 0x3E11C this is live module
+ * base 0x80AB3CC0, while the LLVM codegen-only image still places relF at the
+ * older observed base 0x80C03F40. SPM allocates relF from HEAP_MAIN and OSLink
+ * relocates code plus embedded pointers at that returned address, so a PC-only
+ * alias would be incorrect.
+ *
+ * For one proof run, make only relF deterministic using the real Revolution
+ * MEMExpHeap allocator. MEMAllocFromExpHeapEx treats negative alignment as a
+ * tail allocation; -0x20 therefore creates a normal tracked 32-byte-aligned
+ * block from the tail. The player-local LLVM seam map now partitions exactly at
+ * relMain's verified `bl __memAlloc` (0x8023C978) and its PC+4 continuation.
+ * This avoids depending on whether LLVM direct-lowers the __memAlloc callee.
+ *
+ * At the callsite validate exact R8PE01 words, HEAP_MAIN/size arguments and live
+ * MemWork metadata, then enter the real guest MEMAllocFromExpHeapEx with r5=-32
+ * and LR set to the original relMain continuation. Intercept that continuation
+ * once to log the actual base/prolog. The old relF codegen base intentionally
+ * remains unchanged for this proof run, so the expected next boundary is the
+ * newly placed relF prolog.
+ *
+ * Signature/heap drift grants one bypass so the original BL executes normally.
+ * A NULL tail allocation likewise retries the original callsite, preserving the
+ * game's __memAlloc failure/assert behavior. Generated-C remains untouched.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev33_nonblocking_phase_base
+#include "legacy_c_adapter_v23.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_RELF_MEMALLOC_ALIGN    UINT32_C(0x801A59D4)
+#define OPENSPM_M14_RELF_MEMALLOC_SDK_CALL UINT32_C(0x801A59D8)
+#define OPENSPM_M14_RELF_MEM_ALLOC_EXP     UINT32_C(0x80293A8C)
+#define OPENSPM_M14_RELF_ALLOC_CALL        UINT32_C(0x8023C978)
+#define OPENSPM_M14_RELF_ALLOC_RETURN      UINT32_C(0x8023C97C)
+#define OPENSPM_M14_MEMORY_WP              UINT32_C(0x8056CB68)
+#define OPENSPM_M14_RELF_SIZE              UINT32_C(0x0031BEC8)
+#define OPENSPM_M14_RELF_PROLOG_OFFSET     UINT32_C(0x0003E11C)
+#define OPENSPM_M14_RELF_OLD_CODEGEN_BASE  UINT32_C(0x80C03F40)
+#define OPENSPM_M14_MEM1_FIRST             UINT32_C(0x80000000)
+#define OPENSPM_M14_MEM1_END               UINT32_C(0x81800000)
+
+#define OPENSPM_M14_RELF_ALLOC_CALL_RAW    UINT32_C(0x4BF69031)
+#define OPENSPM_M14_MEMALLOC_ALIGN_RAW     UINT32_C(0x38A00020)
+#define OPENSPM_M14_MEMALLOC_SDK_CALL_RAW  UINT32_C(0x480EE0B5)
+
+#define OPENSPM_M14_MEMWORK_HEAP_HANDLE_OFF UINT32_C(0x00)
+#define OPENSPM_M14_MEMWORK_HEAP_START_OFF  UINT32_C(0x24)
+#define OPENSPM_M14_MEMWORK_HEAP_END_OFF    UINT32_C(0x48)
+#define OPENSPM_M14_MEMWORK_MIN_SIZE        UINT32_C(0x4C)
+
+static openspm_native_create_fn g_m14_v34_underlying_create;
+static openspm_native_destroy_fn g_m14_v34_underlying_destroy;
+static PPCHostCall g_m14_v34_underlying_host_call;
+static uint32_t g_m14_v34_call_bypass_once;
+static uint32_t g_m14_v34_result_pending;
+static uint32_t g_m14_v34_expected_tail;
+static uint32_t g_m14_v34_heap_start;
+static uint32_t g_m14_v34_heap_end;
+static uint32_t g_m14_v34_actual_base;
+static uint32_t g_m14_v34_refusal_logged;
+static uint64_t g_m14_v34_redirects;
+static uint64_t g_m14_v34_results;
+
+static void bridge_v34_log(CPUState *cpu, openspm_log_level level,
+                           const char *message) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    if (cpu == NULL || message == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, level, message);
+}
+
+static uint32_t bridge_v34_align_down_32(uint32_t value) {
+    return value & ~UINT32_C(31);
+}
+
+static int bridge_v34_range_contains(uint32_t start, uint32_t end,
+                                     uint32_t address) {
+    return end > start && address >= start && address < end;
+}
+
+static int bridge_v34_mem1_range(CPUState *cpu, uint32_t address,
+                                 uint32_t size) {
+    if (size > OPENSPM_M14_MEM1_END - OPENSPM_M14_MEM1_FIRST ||
+        address < OPENSPM_M14_MEM1_FIRST ||
+        address > OPENSPM_M14_MEM1_END - size) return 0;
+    return bridge_m14_context_address_valid(cpu, address, size);
+}
+
+static int bridge_v34_relf_signature(CPUState *cpu,
+                                     uint32_t *out_heap_handle,
+                                     uint32_t *out_heap_start,
+                                     uint32_t *out_heap_end,
+                                     uint32_t *out_expected_tail) {
+    uint32_t memory_wp, heap_handle, heap_start, heap_end, expected_tail;
+
+    if (cpu == NULL || out_heap_handle == NULL || out_heap_start == NULL ||
+        out_heap_end == NULL || out_expected_tail == NULL) return 0;
+    if (!bridge_m14_context_address_valid(cpu, OPENSPM_M14_RELF_ALLOC_CALL, 4u) ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_RELF_MEMALLOC_ALIGN, 8u) ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_MEMORY_WP, 4u)) return 0;
+
+    if (mem_read32(cpu, OPENSPM_M14_RELF_ALLOC_CALL) != OPENSPM_M14_RELF_ALLOC_CALL_RAW ||
+        mem_read32(cpu, OPENSPM_M14_RELF_MEMALLOC_ALIGN) != OPENSPM_M14_MEMALLOC_ALIGN_RAW ||
+        mem_read32(cpu, OPENSPM_M14_RELF_MEMALLOC_SDK_CALL) != OPENSPM_M14_MEMALLOC_SDK_CALL_RAW)
+        return 0;
+
+    /* This is the BL callsite before __memAlloc executes. */
+    if ((uint32_t)cpu->gpr[3] != 0u ||
+        (uint32_t)cpu->gpr[4] != OPENSPM_M14_RELF_SIZE) return 0;
+
+    memory_wp = mem_read32(cpu, OPENSPM_M14_MEMORY_WP);
+    if (!bridge_v34_mem1_range(cpu, memory_wp, OPENSPM_M14_MEMWORK_MIN_SIZE))
+        return 0;
+
+    heap_handle = mem_read32(cpu, memory_wp + OPENSPM_M14_MEMWORK_HEAP_HANDLE_OFF);
+    heap_start = mem_read32(cpu, memory_wp + OPENSPM_M14_MEMWORK_HEAP_START_OFF);
+    heap_end = mem_read32(cpu, memory_wp + OPENSPM_M14_MEMWORK_HEAP_END_OFF);
+    if (!bridge_v34_mem1_range(cpu, heap_handle, 4u) ||
+        heap_start < OPENSPM_M14_MEM1_FIRST || heap_start >= heap_end ||
+        heap_end > OPENSPM_M14_MEM1_END ||
+        heap_end - heap_start < OPENSPM_M14_RELF_SIZE) return 0;
+
+    expected_tail = bridge_v34_align_down_32(heap_end - OPENSPM_M14_RELF_SIZE);
+    if (expected_tail < heap_start ||
+        expected_tail > heap_end - OPENSPM_M14_RELF_SIZE) return 0;
+
+    *out_heap_handle = heap_handle;
+    *out_heap_start = heap_start;
+    *out_heap_end = heap_end;
+    *out_expected_tail = expected_tail;
+    return 1;
+}
+
+static void bridge_v34_refuse_once(CPUState *cpu) {
+    if (g_m14_v34_refusal_logged) return;
+    bridge_v34_log(cpu, OPENSPM_LOG_INFO,
+                   "M14 LLVM relF tail allocation refused: R8PE01 relMain/__memAlloc signature or heap metadata changed; original guest allocator call preserved.");
+    g_m14_v34_refusal_logged = 1u;
+}
+
+static bool bridge_host_call_v34(CPUState *cpu, u32 address) {
+    bool underlying;
+    if (cpu == NULL) return false;
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+
+        underlying = g_m14_v34_underlying_host_call != NULL
+                         ? g_m14_v34_underlying_host_call(cpu, address)
+                         : false;
+        if (underlying) return true;
+
+        if (g_m14_v34_call_bypass_once &&
+            (uint32_t)cpu->pc == OPENSPM_M14_RELF_ALLOC_CALL &&
+            bridge_v34_range_contains(start, end, OPENSPM_M14_RELF_ALLOC_CALL)) {
+            g_m14_v34_call_bypass_once = 0u;
+            return false;
+        }
+        if (!g_m14_v34_result_pending &&
+            (uint32_t)cpu->pc == OPENSPM_M14_RELF_ALLOC_CALL &&
+            bridge_v34_range_contains(start, end, OPENSPM_M14_RELF_ALLOC_CALL))
+            return true;
+        if (g_m14_v34_result_pending &&
+            (uint32_t)cpu->pc == OPENSPM_M14_RELF_ALLOC_RETURN &&
+            bridge_v34_range_contains(start, end, OPENSPM_M14_RELF_ALLOC_RETURN))
+            return true;
+        return false;
+    }
+
+    if ((uint32_t)address == OPENSPM_M14_RELF_ALLOC_CALL &&
+        !g_m14_v34_result_pending) {
+        uint32_t heap_handle = 0u, heap_start = 0u, heap_end = 0u, expected_tail = 0u;
+        char message[320];
+
+        if (!bridge_v34_relf_signature(cpu, &heap_handle, &heap_start,
+                                       &heap_end, &expected_tail)) {
+            g_m14_v34_call_bypass_once = 1u;
+            bridge_v34_refuse_once(cpu);
+            return false;
+        }
+
+        /* Reproduce the architectural effect of the verified BL while choosing
+           the authentic SDK tail-allocation mode. r4 already holds relF size. */
+        cpu->gpr[3] = heap_handle;
+        cpu->gpr[5] = UINT32_C(0xFFFFFFE0); /* signed -32 */
+        cpu->lr = OPENSPM_M14_RELF_ALLOC_RETURN;
+        cpu->pc = OPENSPM_M14_RELF_MEM_ALLOC_EXP;
+        g_m14_v34_heap_start = heap_start;
+        g_m14_v34_heap_end = heap_end;
+        g_m14_v34_expected_tail = expected_tail;
+        g_m14_v34_result_pending = 1u;
+        ++g_m14_v34_redirects;
+
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM relF deterministic-tail allocation active: verified relMain callsite redirected through guest MEMAllocFromExpHeapEx align=-0x20; heap=[0x%08X,0x%08X) empty_tail=0x%08X.",
+                       (unsigned)heap_start, (unsigned)heap_end,
+                       (unsigned)expected_tail);
+        bridge_v34_log(cpu, OPENSPM_LOG_INFO, message);
+        return true;
+    }
+
+    if ((uint32_t)address == OPENSPM_M14_RELF_ALLOC_RETURN &&
+        g_m14_v34_result_pending) {
+        uint32_t actual = (uint32_t)cpu->gpr[3];
+        char message[384];
+        const int match = actual != 0u && actual == g_m14_v34_expected_tail;
+
+        g_m14_v34_result_pending = 0u;
+        g_m14_v34_actual_base = actual;
+        ++g_m14_v34_results;
+
+        if (actual == 0u) {
+            bridge_v34_log(cpu, OPENSPM_LOG_INFO,
+                           "M14 LLVM relF tail allocation returned NULL; retrying the original relMain->__memAlloc call so normal failure/assert handling remains authoritative.");
+            cpu->pc = OPENSPM_M14_RELF_ALLOC_CALL;
+            cpu->gpr[3] = 0u;
+            cpu->gpr[4] = OPENSPM_M14_RELF_SIZE;
+            g_m14_v34_call_bypass_once = 1u;
+            return true;
+        }
+
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM relF tail allocation result: base=0x%08X prolog=0x%08X empty_tail=0x%08X match=%s; old codegen base remains 0x%08X for this proof run.",
+                       (unsigned)actual,
+                       (unsigned)(actual + OPENSPM_M14_RELF_PROLOG_OFFSET),
+                       (unsigned)g_m14_v34_expected_tail,
+                       match ? "yes" : "no",
+                       (unsigned)OPENSPM_M14_RELF_OLD_CODEGEN_BASE);
+        bridge_v34_log(cpu, match ? OPENSPM_LOG_INFO : OPENSPM_LOG_WARN, message);
+        return false;
+    }
+
+    return g_m14_v34_underlying_host_call != NULL
+               ? g_m14_v34_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v34(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v34_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v34_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v34_underlying_host_call = instance->cpu.host_call;
+    g_m14_v34_call_bypass_once = 0u;
+    g_m14_v34_result_pending = 0u;
+    g_m14_v34_expected_tail = 0u;
+    g_m14_v34_heap_start = 0u;
+    g_m14_v34_heap_end = 0u;
+    g_m14_v34_actual_base = 0u;
+    g_m14_v34_refusal_logged = 0u;
+    g_m14_v34_redirects = 0u;
+    g_m14_v34_results = 0u;
+    instance->cpu.host_call = bridge_host_call_v34;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v34(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v34_redirects != 0u &&
+        instance->runtime != NULL && instance->runtime->host != NULL &&
+        instance->runtime->host->log != NULL) {
+        char message[320];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM relF tail-proof stats redirects=%llu results=%llu heap=[0x%08X,0x%08X) expected=0x%08X actual=0x%08X.",
+                       (unsigned long long)g_m14_v34_redirects,
+                       (unsigned long long)g_m14_v34_results,
+                       (unsigned)g_m14_v34_heap_start,
+                       (unsigned)g_m14_v34_heap_end,
+                       (unsigned)g_m14_v34_expected_tail,
+                       (unsigned)g_m14_v34_actual_base);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v34_underlying_host_call;
+    if (g_m14_v34_underlying_destroy != NULL)
+        g_m14_v34_underlying_destroy(opaque);
+    g_m14_v34_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev33_nonblocking_phase_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v34_underlying_create = out_api->create;
+    g_m14_v34_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev34-llvm-relf-tail-proof";
+    out_api->create = bridge_create_v34;
+    out_api->destroy = bridge_destroy_v34;
+#endif
+    return OPENSPM_OK;
+}

@@ -1,0 +1,381 @@
+/*
+ * M14 local-module bridge v33 / LLVM VI wait-queue truth probe.
+ *
+ * dev42 resolved an important timeline mistake rather than a scheduler bug:
+ * `M14 native retrace #N delivered` is emitted only after bridge_run_m14_event()
+ * has already returned. Therefore the later 0x802754D0 native-region query is
+ * the persistent SelectThread performing the normal Nintendo context restore,
+ * not the scratch interrupt CPU swallowing a restored thread. Every dev42
+ * candidate being `persistent-cpu` is expected. The dev41/dev42 transfer-capture
+ * hypothesis is retired; do not weaken those guards to catch persistent code.
+ *
+ * The remaining failure is the first real post-frame wait. The game reaches
+ * seq_logo stage 1, relF/BSS placement is exact, one DrawDone/two display copies
+ * complete, then the main thread disappears into scheduler idle forever while
+ * 60 Hz host retraces continue.
+ *
+ * derive_v19_llvm_seams.py now inspects the player's verified
+ * VIWaitForRetrace body itself. It derives the sole linked call bracketed by the
+ * proven OSDisableInterrupts/OSRestoreInterrupts calls as OSSleepThread, and
+ * performs a tiny constant-expression pass to derive the actual retraceQueue
+ * address expression passed in r3. If the same lwz effective address is visible
+ * both before and after the sleep, it also emits the SDK retraceCount address.
+ * No address is imported from another retail revision.
+ *
+ * v33 changes no guest state and creates no native side exit. Around each normal
+ * top-level run it snapshots that player-derived queue, retraceCount (when
+ * available), Revolution OS run-queue globals, current context/thread and PC.
+ * This distinguishes:
+ *   - VI handler never drains retraceQueue;
+ *   - VI wakes the thread but VIWaitForRetrace immediately requeues it;
+ *   - retraceCount fails to advance, causing the SDK do/while to sleep again;
+ *   - scheduler state is healthy and the real wait is elsewhere.
+ *
+ * The obsolete dev41/dev42 host-call interception wrappers are bypassed for this
+ * run so their persistent-CPU rejection telemetry cannot hide the queue trace.
+ * dev40's read-only scheduler-region telemetry remains in the chain.
+ *
+ * Historical source-contract ancestry:
+ * m14-dev42-llvm-vi-scratch-transfer-fix
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev42_vi_transfer_base
+#include "legacy_c_adapter_v32.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V43_BASELINE_LOG_LIMIT UINT32_C(4)
+#define OPENSPM_M14_V43_STAGE1_LOG_LIMIT UINT32_C(64)
+
+typedef struct openspm_m14_v43_vi_snapshot {
+    uint32_t valid;
+    uint32_t queue_addr;
+    uint32_t queue_head;
+    uint32_t queue_tail;
+    uint32_t count_valid;
+    uint32_t count_addr;
+    uint32_t retrace_count;
+    uint32_t r13;
+    uint32_t runqueue_bits;
+    uint32_t runqueue_hint;
+    uint32_t current_context;
+    uint32_t current_thread;
+    uint32_t seq;
+    uint32_t stage;
+    uint32_t pc;
+    uint32_t retrace_ticks;
+} openspm_m14_v43_vi_snapshot;
+
+static openspm_native_create_fn g_m14_v43_underlying_create;
+static openspm_native_run_fn g_m14_v43_underlying_run;
+static openspm_native_destroy_fn g_m14_v43_underlying_destroy;
+static PPCHostCall g_m14_v43_retired_capture_hook;
+static uint32_t g_m14_v43_capture_hooks_bypassed;
+static uint32_t g_m14_v43_baseline_logs;
+static uint32_t g_m14_v43_stage1_logs;
+static uint32_t g_m14_v43_retrace_observations;
+static uint32_t g_m14_v43_count_advances;
+static uint32_t g_m14_v43_queue_nonempty_after;
+static uint32_t g_m14_v43_queue_changes;
+static uint32_t g_m14_v43_idle_with_waiter;
+
+static void bridge_v43_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_v43_resolve_expr(openspm_bridge_instance *instance,
+                                   uint32_t mode,
+                                   uint32_t value,
+                                   uint32_t *out_address) {
+    uint32_t address;
+    if (instance == NULL || out_address == NULL) return 0;
+    if (mode == OPENSPM_LOCAL_VI_EXPR_ABSOLUTE) {
+        address = value;
+    } else if (mode == OPENSPM_LOCAL_VI_EXPR_R13) {
+        address = (uint32_t)instance->cpu.gpr[13] + value;
+    } else if (mode == OPENSPM_LOCAL_VI_EXPR_R2) {
+        address = (uint32_t)instance->cpu.gpr[2] + value;
+    } else {
+        return 0;
+    }
+    *out_address = address;
+    return 1;
+}
+
+static void bridge_v43_snapshot(openspm_bridge_instance *instance,
+                                openspm_m14_v43_vi_snapshot *out) {
+    uint32_t queue_addr;
+    uint32_t count_addr;
+    uint32_t runq_addr;
+    uint32_t hint_addr;
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    if (instance == NULL) return;
+
+    out->pc = (uint32_t)instance->cpu.pc;
+    out->retrace_ticks = g_m14_retrace_ticks;
+    out->r13 = (uint32_t)instance->cpu.gpr[13];
+
+    if (!bridge_v43_resolve_expr(
+            instance,
+            OPENSPM_LOCAL_VI_SLEEP_QUEUE_MODE,
+            OPENSPM_LOCAL_VI_SLEEP_QUEUE_VALUE,
+            &queue_addr) ||
+        !bridge_m14_context_address_valid(&instance->cpu, queue_addr, 8u)) {
+        return;
+    }
+    out->queue_addr = queue_addr;
+    out->queue_head = mem_read32(&instance->cpu, queue_addr);
+    out->queue_tail = mem_read32(&instance->cpu, queue_addr + UINT32_C(4));
+
+    if (bridge_v43_resolve_expr(
+            instance,
+            OPENSPM_LOCAL_VI_RETRACE_COUNT_MODE,
+            OPENSPM_LOCAL_VI_RETRACE_COUNT_VALUE,
+            &count_addr) &&
+        bridge_m14_context_address_valid(&instance->cpu, count_addr, 4u)) {
+        out->count_valid = 1u;
+        out->count_addr = count_addr;
+        out->retrace_count = mem_read32(&instance->cpu, count_addr);
+    }
+
+    runq_addr = out->r13 - OPENSPM_M14_V39_RUNQUEUE_BITS_DELTA;
+    hint_addr = out->r13 - OPENSPM_M14_V39_RUNQUEUE_HINT_DELTA;
+    if (bridge_m14_context_address_valid(&instance->cpu, runq_addr, 4u))
+        out->runqueue_bits = mem_read32(&instance->cpu, runq_addr);
+    if (bridge_m14_context_address_valid(&instance->cpu, hint_addr, 4u))
+        out->runqueue_hint = mem_read32(&instance->cpu, hint_addr);
+    if (bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_OS_CURRENT_CONTEXT, 4u))
+        out->current_context = mem_read32(&instance->cpu,
+                                          OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_V39_OS_CURRENT_THREAD, 4u))
+        out->current_thread = mem_read32(&instance->cpu,
+                                         OPENSPM_M14_V39_OS_CURRENT_THREAD);
+    if (bridge_m14_context_address_valid(&instance->cpu,
+                                          OPENSPM_M14_TIMING_SEQ_WORK, 8u)) {
+        out->seq = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+        out->stage = mem_read32(&instance->cpu,
+                                OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+    } else {
+        out->seq = UINT32_MAX;
+        out->stage = UINT32_MAX;
+    }
+    out->valid = 1u;
+}
+
+static void bridge_v43_log_transition(
+    openspm_bridge_instance *instance,
+    const openspm_m14_v43_vi_snapshot *before,
+    const openspm_m14_v43_vi_snapshot *after,
+    int result,
+    const openspm_native_exit *out_exit) {
+    uint32_t stage1;
+    uint32_t interesting;
+    uint32_t index;
+    char message[960];
+
+    if (instance == NULL || before == NULL || after == NULL ||
+        !before->valid || !after->valid)
+        return;
+
+    stage1 = ((before->seq == 0u && before->stage == 1u) ||
+              (after->seq == 0u && after->stage == 1u));
+    interesting =
+        before->retrace_ticks != after->retrace_ticks ||
+        before->queue_head != after->queue_head ||
+        before->queue_tail != after->queue_tail ||
+        (before->count_valid && after->count_valid &&
+         before->retrace_count != after->retrace_count) ||
+        before->pc != after->pc ||
+        before->current_thread != after->current_thread;
+    if (!interesting) return;
+
+    if (before->retrace_ticks != after->retrace_ticks)
+        ++g_m14_v43_retrace_observations;
+    if (before->queue_head != after->queue_head ||
+        before->queue_tail != after->queue_tail)
+        ++g_m14_v43_queue_changes;
+    if (after->queue_head != 0u)
+        ++g_m14_v43_queue_nonempty_after;
+    if (before->count_valid && after->count_valid &&
+        before->retrace_count != after->retrace_count)
+        ++g_m14_v43_count_advances;
+    if (after->pc == OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        after->queue_head != 0u)
+        ++g_m14_v43_idle_with_waiter;
+
+    if (stage1) {
+        if (g_m14_v43_stage1_logs >= OPENSPM_M14_V43_STAGE1_LOG_LIMIT) return;
+        index = ++g_m14_v43_stage1_logs;
+    } else {
+        if (g_m14_v43_baseline_logs >= OPENSPM_M14_V43_BASELINE_LOG_LIMIT) return;
+        index = ++g_m14_v43_baseline_logs;
+    }
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM VI wait truth %s#%u tick=%u->%u queue@0x%08X head=0x%08X->0x%08X tail=0x%08X->0x%08X count%s@0x%08X=0x%08X->0x%08X runq=0x%08X->0x%08X hint=0x%08X->0x%08X context=0x%08X->0x%08X thread=0x%08X->0x%08X pc=0x%08X->0x%08X result=%d exit=%u/detail=%u/source=0x%08llX.",
+        stage1 ? "stage1-" : "baseline-", (unsigned)index,
+        (unsigned)before->retrace_ticks, (unsigned)after->retrace_ticks,
+        (unsigned)after->queue_addr,
+        (unsigned)before->queue_head, (unsigned)after->queue_head,
+        (unsigned)before->queue_tail, (unsigned)after->queue_tail,
+        (before->count_valid && after->count_valid) ? "" : "-unavailable",
+        (unsigned)(after->count_valid ? after->count_addr : 0u),
+        (unsigned)(before->count_valid ? before->retrace_count : 0u),
+        (unsigned)(after->count_valid ? after->retrace_count : 0u),
+        (unsigned)before->runqueue_bits, (unsigned)after->runqueue_bits,
+        (unsigned)before->runqueue_hint, (unsigned)after->runqueue_hint,
+        (unsigned)before->current_context, (unsigned)after->current_context,
+        (unsigned)before->current_thread, (unsigned)after->current_thread,
+        (unsigned)before->pc, (unsigned)after->pc,
+        result,
+        out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+        out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+        (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+    bridge_v43_log(instance, message);
+}
+
+static int OPENSPM_CALL bridge_run_v43(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    openspm_m14_v43_vi_snapshot before;
+    openspm_m14_v43_vi_snapshot after;
+    int result;
+    if (instance == NULL || g_m14_v43_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    bridge_v43_snapshot(instance, &before);
+    result = g_m14_v43_underlying_run(opaque, soft_cycle_budget, out_exit);
+    bridge_v43_snapshot(instance, &after);
+    bridge_v43_log_transition(instance, &before, &after, result, out_exit);
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v43(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    uint32_t queue_addr = 0u;
+    uint32_t count_addr = 0u;
+    int queue_resolved;
+    int count_resolved;
+    int result;
+
+    if (g_m14_v43_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v43_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v43_retired_capture_hook = instance->cpu.host_call;
+    g_m14_v43_capture_hooks_bypassed = 0u;
+
+    /* dev41/dev42 were based on a now-falsified scratch-entry timeline. Bypass
+     * both wrappers while preserving v40 and every older semantic host hook. */
+    if (instance->cpu.host_call == bridge_host_call_v42 &&
+        g_m14_v41_underlying_host_call != NULL) {
+        instance->cpu.host_call = g_m14_v41_underlying_host_call;
+        g_m14_v43_capture_hooks_bypassed = 1u;
+    }
+
+    g_m14_v43_baseline_logs = 0u;
+    g_m14_v43_stage1_logs = 0u;
+    g_m14_v43_retrace_observations = 0u;
+    g_m14_v43_count_advances = 0u;
+    g_m14_v43_queue_nonempty_after = 0u;
+    g_m14_v43_queue_changes = 0u;
+    g_m14_v43_idle_with_waiter = 0u;
+
+    queue_resolved = bridge_v43_resolve_expr(
+        instance,
+        OPENSPM_LOCAL_VI_SLEEP_QUEUE_MODE,
+        OPENSPM_LOCAL_VI_SLEEP_QUEUE_VALUE,
+        &queue_addr);
+    count_resolved = bridge_v43_resolve_expr(
+        instance,
+        OPENSPM_LOCAL_VI_RETRACE_COUNT_MODE,
+        OPENSPM_LOCAL_VI_RETRACE_COUNT_VALUE,
+        &count_addr);
+
+    {
+        char message[640];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM VI wait-queue truth probe active: VIWait=0x%08X sleep_call=0x%08X OSSleepThread=0x%08X queue_expr=%u:0x%08X resolved_now=%s/0x%08X retrace_count_expr=%u:0x%08X resolved_now=%s/0x%08X; dev41/dev42 capture hooks bypassed=%s; guest state unchanged.",
+            (unsigned)OPENSPM_LOCAL_VI_WAIT_FOR_RETRACE,
+            (unsigned)OPENSPM_LOCAL_VI_SLEEP_CALL,
+            (unsigned)OPENSPM_LOCAL_OS_SLEEP_THREAD,
+            (unsigned)OPENSPM_LOCAL_VI_SLEEP_QUEUE_MODE,
+            (unsigned)OPENSPM_LOCAL_VI_SLEEP_QUEUE_VALUE,
+            queue_resolved ? "yes" : "no", (unsigned)queue_addr,
+            (unsigned)OPENSPM_LOCAL_VI_RETRACE_COUNT_MODE,
+            (unsigned)OPENSPM_LOCAL_VI_RETRACE_COUNT_VALUE,
+            count_resolved ? "yes" : "no", (unsigned)count_addr,
+            g_m14_v43_capture_hooks_bypassed ? "yes" : "no");
+        bridge_v43_log(instance, message);
+    }
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v43(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[448];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM VI wait truth stats retrace_observations=%u count_advances=%u queue_changes=%u queue_nonempty_after=%u idle_with_waiter=%u stage1_logs=%u.",
+            (unsigned)g_m14_v43_retrace_observations,
+            (unsigned)g_m14_v43_count_advances,
+            (unsigned)g_m14_v43_queue_changes,
+            (unsigned)g_m14_v43_queue_nonempty_after,
+            (unsigned)g_m14_v43_idle_with_waiter,
+            (unsigned)g_m14_v43_stage1_logs);
+        bridge_v43_log(instance, message);
+
+        /* Restore the nested wrapper chain before its destroy callbacks unwind. */
+        if (g_m14_v43_capture_hooks_bypassed &&
+            g_m14_v43_retired_capture_hook != NULL)
+            instance->cpu.host_call = g_m14_v43_retired_capture_hook;
+    }
+    if (g_m14_v43_underlying_destroy != NULL)
+        g_m14_v43_underlying_destroy(opaque);
+    g_m14_v43_retired_capture_hook = NULL;
+    g_m14_v43_capture_hooks_bypassed = 0u;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev42_vi_transfer_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v43_underlying_create = out_api->create;
+    g_m14_v43_underlying_run = out_api->run;
+    g_m14_v43_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev43-llvm-vi-wait-queue-truth";
+    out_api->create = bridge_create_v43;
+    out_api->run = bridge_run_v43;
+    out_api->destroy = bridge_destroy_v43;
+#endif
+    return OPENSPM_OK;
+}

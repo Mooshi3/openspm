@@ -1,0 +1,561 @@
+/*
+ * M14 local-module bridge v39 / dev50 production interception router.
+ *
+ * dev49 fixed the hosted GX display-list return ordering bug.  The next live
+ * profiling pass exposed a more fundamental problem: the LLVM bring-up stack
+ * still routed every ppc_native_region_available() call through years of truth
+ * probes.  The player was issuing roughly 1.3-2.4 million region queries per
+ * host second while running at ~20 spmarioMain updates/s.  Retired dev37 alone
+ * linearly scanned all 383 hosted-call seams on every query; dev18 additionally
+ * performed Windows Interlocked telemetry on every query.  Several scheduler,
+ * VI and post-frame probes then re-read guest state before the query returned.
+ *
+ * A native PC port should not retain debugger archaeology in its hot dispatch
+ * path.  This layer keeps the complete historical chain compiled and initialized
+ * for rollback/destroy correctness, but replaces the live CPUState::host_call
+ * with one production router after create().  The router preserves only proven
+ * semantics:
+ *   - base v13/v7 OpenSPM platform-host targets;
+ *   - deterministic relF + BSS allocation seams (rare path delegated to v35);
+ *   - hosted direct-call parity using v36's binary-searched 383-call table;
+ *   - RVL post-MTMSR cold-resume completion;
+ *   - first DSP task-init semantic completion;
+ *   - PC HOME/system-UI completion;
+ *   - direct-BL cold-entry rescue until the compiler entry audit is finished;
+ *   - dev48 PC-native GXBeginDisplayList/GXEndDisplayList;
+ *   - dev47 real guest PE-finish semantic completion.
+ *
+ * Region queries no longer traverse dev18 frontier telemetry, dev27 NAND truth,
+ * dev28/dev30 scheduler geometry probes, dev34/dev35 VI/post-frame probes, or
+ * dev36 main-thread transition snapshots.  Old v19 display-list return hooks and
+ * phase telemetry are intentionally not blockers: dev48 completes Begin/End
+ * synchronously and frame-phase instrumentation must never gate execution.
+ *
+ * The platform target list comes from the same m14_host_targets.inc X-macro as
+ * v7.  dev50 sorts a private copy once at create and uses binary lower-bound
+ * lookup for region classification, so millions of region queries do not even
+ * pay v7's old linear target-range scan.  Ordinary calls to a matched platform
+ * target still delegate to v8/v7, preserving partial-WPAR flush and host-service
+ * semantics.  Frame cadence telemetry is retained only at its four exact guest
+ * entries and never participates in region admission.
+ *
+ * The hostcall service function is likewise restored to the pre-dev37 semantic
+ * implementation so retired NAND/stage-1 logging wrappers do not sit on every
+ * hosted service call.  Before destroy, the exact historical top pointers are
+ * restored so nested teardown still unwinds in its original order.
+ *
+ * Historical source-contract markers retained for CMake/archaeology:
+ * m14-dev49-llvm-pc-display-list-return
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ * m14-dev50-llvm-production-router
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev48_pc_dl_base
+#include "legacy_c_adapter_v38.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_dev50_underlying_create;
+static openspm_native_run_fn g_m14_dev50_api_run;
+static openspm_native_destroy_fn g_m14_dev50_underlying_destroy;
+static PPCHostCall g_m14_dev50_historical_host_call;
+static openspm_m14_hostcall_handle_fn g_m14_dev50_historical_service_handle;
+static openspm_bridge_instance *g_m14_dev50_instance;
+
+#define OPENSPM_M14_HOST_TARGET(value) (uint32_t)(value),
+static uint32_t g_m14_dev50_host_targets[] = {
+#include "m14_host_targets.inc"
+#include "openspm_hook_targets.inc" /* OpenSPM hooks (docs/HOOKS.md); empty = none */
+};
+#undef OPENSPM_M14_HOST_TARGET
+#define OPENSPM_M14_DEV50_HOST_TARGET_COUNT \
+    ((uint32_t)(sizeof(g_m14_dev50_host_targets) / \
+                sizeof(g_m14_dev50_host_targets[0])))
+
+static uint64_t g_m14_dev50_region_queries;
+static uint64_t g_m14_dev50_base_blocks;
+static uint64_t g_m14_dev50_direct_blocks;
+static uint64_t g_m14_dev50_gx_blocks;
+static uint64_t g_m14_dev50_home_blocks;
+static uint64_t g_m14_dev50_relf_queries;
+static uint64_t g_m14_dev50_ordinary_calls;
+static uint64_t g_m14_dev50_display_calls;
+static uint64_t g_m14_dev50_obsolete_returns;
+static uint64_t g_m14_dev50_direct_redirects;
+static uint64_t g_m14_dev50_bl_rescues;
+static uint64_t g_m14_dev50_host_lookup_calls;
+static uint64_t g_m14_dev50_host_lookup_steps;
+static uint32_t g_m14_dev50_logged;
+
+/* dev78: rescue-path-only sampled heavy hitters. This executes one tiny counter
+   test only after a direct-BL rescue has already been proven necessary, avoiding
+   any added work on the billion-scale ordinary callback path. */
+#define OPENSPM_M14_DEV78_BL_SAMPLE_MASK UINT64_C(0xFFF)
+#define OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS 8u
+typedef struct openspm_m14_dev78_bl_sample {
+    uint32_t source;
+    uint32_t target;
+    uint64_t count;
+} openspm_m14_dev78_bl_sample;
+static openspm_m14_dev78_bl_sample
+    g_m14_dev78_bl_samples[OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS];
+static uint64_t g_m14_dev78_bl_sampled_rescues;
+static uint32_t g_m14_dev69_host_filter[OPENSPM_M14_PC_FILTER_WORDS];
+static uint32_t g_m14_dev69_host_filter_ready;
+static uint64_t g_m14_dev69_host_rejects;
+
+static int bridge_dev50_range_contains(uint32_t start, uint32_t end,
+                                       uint32_t address) {
+    return end > start && address >= start && address < end;
+}
+
+static void bridge_dev78_sample_bl_rescue(uint32_t source, uint32_t target) {
+    uint32_t i;
+    uint32_t empty = OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS;
+
+    ++g_m14_dev78_bl_sampled_rescues;
+    if ((g_m14_dev78_bl_sampled_rescues & OPENSPM_M14_DEV78_BL_SAMPLE_MASK) != 0u)
+        return;
+
+    for (i = 0u; i < OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS; ++i) {
+        openspm_m14_dev78_bl_sample *slot = &g_m14_dev78_bl_samples[i];
+        if (slot->count != 0u && slot->source == source && slot->target == target) {
+            ++slot->count;
+            return;
+        }
+        if (empty == OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS && slot->count == 0u)
+            empty = i;
+    }
+    if (empty != OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS) {
+        g_m14_dev78_bl_samples[empty].source = source;
+        g_m14_dev78_bl_samples[empty].target = target;
+        g_m14_dev78_bl_samples[empty].count = 1u;
+        return;
+    }
+
+    /* Misra-Gries: repeated rescue pairs survive, diffuse one-offs decay. */
+    for (i = 0u; i < OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS; ++i)
+        --g_m14_dev78_bl_samples[i].count;
+}
+
+static int bridge_dev50_relf_pc(uint32_t pc) {
+    return pc == OPENSPM_M14_RELF_ALLOC_CALL ||
+           pc == OPENSPM_M14_RELF_ALLOC_RETURN ||
+           pc == OPENSPM_LOCAL_RELF_BSS_ALLOC_CALL ||
+           pc == OPENSPM_LOCAL_RELF_BSS_ALLOC_RETURN;
+}
+
+static int bridge_dev50_obsolete_dl_return(uint32_t address) {
+    return bridge_v23_is_begin_return(address) ||
+           bridge_v23_is_end_return(address);
+}
+
+static void bridge_dev50_sort_host_targets(void) {
+    uint32_t i;
+    for (i = 1u; i < OPENSPM_M14_DEV50_HOST_TARGET_COUNT; ++i) {
+        const uint32_t key = g_m14_dev50_host_targets[i];
+        uint32_t j = i;
+        while (j != 0u && g_m14_dev50_host_targets[j - 1u] > key) {
+            g_m14_dev50_host_targets[j] = g_m14_dev50_host_targets[j - 1u];
+            --j;
+        }
+        g_m14_dev50_host_targets[j] = key;
+    }
+}
+
+static uint32_t bridge_dev50_host_lower_bound(uint32_t value) {
+    uint32_t lo = 0u;
+    uint32_t hi = OPENSPM_M14_DEV50_HOST_TARGET_COUNT;
+    ++g_m14_dev50_host_lookup_calls;
+    while (lo < hi) {
+        const uint32_t mid = lo + ((hi - lo) >> 1);
+        ++g_m14_dev50_host_lookup_steps;
+        if (g_m14_dev50_host_targets[mid] < value)
+            lo = mid + 1u;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static int bridge_dev50_host_target_exact(uint32_t address) {
+    uint32_t index;
+    if (!g_m14_dev69_host_filter_ready) {
+        uint32_t i;
+        for (i = 0u; i < OPENSPM_M14_DEV50_HOST_TARGET_COUNT; ++i)
+            openspm_m14_pc_filter_add(g_m14_dev69_host_filter,
+                                      g_m14_dev50_host_targets[i]);
+        g_m14_dev69_host_filter_ready = 1u;
+    }
+    if (!openspm_m14_pc_filter_maybe(g_m14_dev69_host_filter, address)) {
+        ++g_m14_dev69_host_rejects;
+        return 0;
+    }
+    index = bridge_dev50_host_lower_bound(address);
+    return index < OPENSPM_M14_DEV50_HOST_TARGET_COUNT &&
+           g_m14_dev50_host_targets[index] == address;
+}
+
+static int bridge_dev50_host_target_in_range(uint32_t start, uint32_t end) {
+    uint32_t index;
+    if (end <= start) return 0;
+    index = bridge_dev50_host_lower_bound(start);
+    return index < OPENSPM_M14_DEV50_HOST_TARGET_COUNT &&
+           g_m14_dev50_host_targets[index] < end;
+}
+
+static void bridge_dev50_log_once(void) {
+    openspm_bridge_instance *instance = g_m14_dev50_instance;
+    if (g_m14_dev50_logged || instance == NULL) return;
+    bridge_v44_log(instance,
+        "M14 LLVM production interception router active: retired frontier/NAND/scheduler/VI truth probes are off the native-region hot path; platform targets and 383 hosted callsites use sorted logarithmic classification; relF/BSS, DSP/HOME, GX display-list and PE-finish semantics remain authoritative.");
+    g_m14_dev50_logged = 1u;
+}
+
+static bool bridge_dev50_direct_hostcall(CPUState *cpu,
+                                         const openspm_local_llvm_hostcall_seam *seam) {
+    openspm_bridge_instance *instance = g_m14_dev50_instance;
+    if (cpu == NULL || seam == NULL || instance == NULL) return false;
+
+    bridge_v36_log_once(cpu);
+    cpu->lr = seam->return_pc;
+    cpu->pc = seam->target;
+    bridge_request_fallback(instance, seam->target, 12u);
+    ++g_m14_v36_redirects;
+    if (seam->target == UINT32_C(0x8029A500))
+        ++g_m14_v36_nand_check_redirects;
+    ++g_m14_dev50_direct_redirects;
+    return true;
+}
+
+static bool bridge_dev50_home(CPUState *cpu, uint32_t address) {
+    if (cpu == NULL ||
+        (address != OPENSPM_M14_HOMEBUTTON_CALL &&
+         address != OPENSPM_M14_HOMEBUTTON_MAIN))
+        return false;
+
+    if (!bridge_v30_home_signature_matches(cpu)) {
+        bridge_v30_log_mismatch_once(cpu);
+        return false;
+    }
+
+    cpu->gpr[3] = 0u;
+    if (address == OPENSPM_M14_HOMEBUTTON_CALL) {
+        cpu->lr = OPENSPM_M14_HOMEBUTTON_RETURN;
+        cpu->pc = OPENSPM_M14_HOMEBUTTON_RETURN;
+    } else {
+        cpu->pc = (uint32_t)cpu->lr & ~UINT32_C(3);
+    }
+    ++g_m14_v30_home_hits;
+    bridge_v30_log_active_once(cpu);
+    return true;
+}
+
+static bool bridge_dev50_region_query(CPUState *cpu) {
+    const uint32_t pc = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    const uint32_t start = cpu != NULL ? (uint32_t)cpu->external_addr : 0u;
+    const uint32_t end = cpu != NULL ? (uint32_t)cpu->external_value : 0u;
+    const openspm_local_llvm_hostcall_seam *seam;
+
+    if (cpu == NULL) return false;
+    ++g_m14_dev50_region_queries;
+    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+
+    /* The two deterministic allocator seams are cold, one-shot correctness
+       boundaries. Preserve their complete existing state machines verbatim;
+       paying the historical chain for these handful of queries is irrelevant. */
+    if (bridge_dev50_relf_pc(pc)) {
+        ++g_m14_dev50_relf_queries;
+        return bridge_host_call_v35(cpu, PPC_HOST_CALL_NATIVE_REGION_QUERY);
+    }
+
+    /* Same manifest as v7, but sorted once instead of linearly scanned millions
+       of times. Region queries are classification-only and require no WPAR flush. */
+    if (bridge_dev50_host_target_in_range(start, end)) {
+        ++g_m14_dev50_base_blocks;
+        return true;
+    }
+
+    /* Player-local map partitions make these exact entries tiny regions. */
+    if (bridge_dev50_range_contains(start, end, OPENSPM_LOCAL_V19_GX_BEGIN) ||
+        bridge_dev50_range_contains(start, end, OPENSPM_LOCAL_V19_GX_END)) {
+        ++g_m14_dev50_gx_blocks;
+        return true;
+    }
+
+    if (bridge_dev50_range_contains(start, end, OPENSPM_M14_HOMEBUTTON_CALL) ||
+        bridge_dev50_range_contains(start, end, OPENSPM_M14_HOMEBUTTON_MAIN)) {
+        ++g_m14_dev50_home_blocks;
+        return true;
+    }
+
+    /* Direct hosted calls are hard-partitioned. The generated table is sorted
+       by call_pc; v36 uses O(log N) lookup rather than the old 383-row scan. */
+    seam = bridge_v36_find_seam(pc);
+    if (seam != NULL && seam->call_pc >= start && seam->call_pc < end) {
+        ++g_m14_dev50_direct_blocks;
+        return true;
+    }
+
+    return false;
+}
+
+static bool bridge_host_call_dev50(CPUState *cpu, u32 address) {
+    const uint32_t guest = (uint32_t)address;
+    const openspm_local_llvm_hostcall_seam *seam;
+    uint32_t target = 0u;
+    uint32_t phase = 0u;
+    bool handled = false;
+
+    if (cpu == NULL) return false;
+    bridge_dev50_log_once();
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return bridge_dev50_region_query(cpu);
+
+    ++g_m14_dev50_ordinary_calls;
+
+    /* Keep cadence evidence, but only at the four exact guest entries. It is
+       measurement, never a region gate, so its cost is O(frames), not O(regions). */
+    if (bridge_v23_phase_id(guest, &phase)) {
+        openspm_m14_note_frame_phase_v20(cpu, phase);
+        if (guest == OPENSPM_M14_LLVM_PHASE_MAIN)
+            openspm_m14_note_spmario_main_v20(cpu);
+        return false;
+    }
+
+    /* dev48 is the production PC implementation of these two public GX calls.
+       It records into the caller's guest buffer and never enters Wii FIFO/WPAR
+       setup. The old v19 PC+4 hooks are therefore permanently obsolete. */
+    if (guest == OPENSPM_LOCAL_V19_GX_BEGIN ||
+        guest == OPENSPM_LOCAL_V19_GX_END) {
+        handled = bridge_dev48_host_display_list(cpu, guest);
+        if (handled) ++g_m14_dev50_display_calls;
+        return handled;
+    }
+    if (bridge_dev50_obsolete_dl_return(guest)) {
+        ++g_m14_dev50_obsolete_returns;
+        return false;
+    }
+
+    /* Rare deterministic relF/BSS state machines retain their existing code. */
+    if (bridge_dev50_relf_pc(guest))
+        return bridge_host_call_v35(cpu, guest);
+
+    /* These migration completions change architectural state and remain until
+       their compiler/device equivalents replace them. */
+    if (bridge_v27_finish_control_tail(cpu, guest))
+        return true;
+
+    bridge_v29_try_complete_dsp_init(cpu, guest);
+
+    if (bridge_dev50_home(cpu, guest))
+        return true;
+
+    seam = bridge_v36_find_seam(guest);
+    if (seam != NULL)
+        return bridge_dev50_direct_hostcall(cpu, seam);
+
+    /* Only exact platform-service targets reach v8/v7. This preserves v8's
+       required partial-WPAR flush before the semantic service without routing
+       arbitrary ordinary dispatch through the historical classifier. */
+    if (bridge_dev50_host_target_exact(guest) &&
+        g_m14_v23_underlying_host_call != NULL) {
+        handled = g_m14_v23_underlying_host_call(cpu, address);
+        if (handled) return true;
+    }
+
+    /* Last-resort migration safety net for linked branches whose continuation
+       is still missing as a native cold entry. The long-term fix is compiler
+       partitioning; keep exact PPC BL semantics until that audit is complete. */
+    if (bridge_v32_decode_direct_bl(cpu, guest, &target)) {
+        cpu->lr = guest + 4u;
+        cpu->pc = target;
+        ++g_m14_v32_bl_rescues;
+        ++g_m14_dev50_bl_rescues;
+        bridge_dev78_sample_bl_rescue(guest, target);
+        bridge_v32_log_rescue_once(cpu, guest, target);
+        return true;
+    }
+
+    return false;
+}
+
+static int OPENSPM_CALL bridge_run_dev50(void *opaque,
+                                        uint64_t soft_cycle_budget,
+                                        openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint32_t queue;
+    uint32_t waiter = 0u;
+    int result;
+
+    if (instance == NULL || g_m14_v37_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    if (!g_m14_dev47_scan_done)
+        bridge_dev47_scan_finish_handler(instance);
+
+    /* g_m14_v37_underlying_run is the semantic run path immediately below the
+       retired dev37 NAND probe. It therefore bypasses dev37/dev38/dev39 and
+       every later VI/scheduler truth wrapper in one hop. */
+    result = g_m14_v37_underlying_run(opaque, soft_cycle_budget, out_exit);
+    if (result != OPENSPM_OK || g_m14_dev47_finish_handler == 0u)
+        return result;
+
+    if ((uint32_t)instance->cpu.pc != OPENSPM_M14_SCHEDULER_IDLE_PC)
+        return result;
+    queue = bridge_dev47_finish_queue(&instance->cpu);
+    if (!bridge_dev47_finish_waiter_ready(&instance->cpu, queue, &waiter))
+        return result;
+
+    (void)bridge_dev47_deliver_finish(instance, queue, waiter);
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_dev50(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev50_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev50_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev50_instance = instance;
+    g_m14_dev50_historical_host_call = instance->cpu.host_call;
+    g_m14_dev50_historical_service_handle =
+        g_m14_have_hostcall ? g_m14_hostcall.handle : NULL;
+
+    /* The dev37 NAND probe captured the real semantic service before wrapping
+       it. Bypass dev37 and the later stage-1 service logger in production. */
+    if (g_m14_have_hostcall && g_m14_v37_underlying_service_handle != NULL)
+        g_m14_hostcall.handle = g_m14_v37_underlying_service_handle;
+
+    bridge_dev50_sort_host_targets();
+    g_m14_dev50_region_queries = 0u;
+    g_m14_dev50_base_blocks = 0u;
+    g_m14_dev50_direct_blocks = 0u;
+    g_m14_dev50_gx_blocks = 0u;
+    g_m14_dev50_home_blocks = 0u;
+    g_m14_dev50_relf_queries = 0u;
+    g_m14_dev50_ordinary_calls = 0u;
+    g_m14_dev50_display_calls = 0u;
+    g_m14_dev50_obsolete_returns = 0u;
+    g_m14_dev50_direct_redirects = 0u;
+    g_m14_dev50_bl_rescues = 0u;
+    g_m14_dev50_host_lookup_calls = 0u;
+    g_m14_dev50_host_lookup_steps = 0u;
+    g_m14_dev50_logged = 0u;
+    memset(g_m14_dev78_bl_samples, 0, sizeof(g_m14_dev78_bl_samples));
+    g_m14_dev78_bl_sampled_rescues = 0u;
+
+    instance->cpu.host_call = bridge_host_call_dev50;
+    bridge_dev50_log_once();
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev50(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[896];
+        const double seam_avg = g_m14_v36_lookup_calls != 0u
+            ? (double)g_m14_v36_lookup_steps / (double)g_m14_v36_lookup_calls
+            : 0.0;
+        const double host_avg = g_m14_dev50_host_lookup_calls != 0u
+            ? (double)g_m14_dev50_host_lookup_steps /
+              (double)g_m14_dev50_host_lookup_calls
+            : 0.0;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM production-router stats region_queries=%llu base_blocks=%llu direct_blocks=%llu gx_blocks=%llu home_blocks=%llu relf_queries=%llu ordinary=%llu display=%llu obsolete_returns=%llu direct_redirects=%llu bl_rescues=%llu seam_lookup=%llu/%llu avg=%.2f host_lookup=%llu/%llu avg=%.2f host_targets=%u.",
+            (unsigned long long)g_m14_dev50_region_queries,
+            (unsigned long long)g_m14_dev50_base_blocks,
+            (unsigned long long)g_m14_dev50_direct_blocks,
+            (unsigned long long)g_m14_dev50_gx_blocks,
+            (unsigned long long)g_m14_dev50_home_blocks,
+            (unsigned long long)g_m14_dev50_relf_queries,
+            (unsigned long long)g_m14_dev50_ordinary_calls,
+            (unsigned long long)g_m14_dev50_display_calls,
+            (unsigned long long)g_m14_dev50_obsolete_returns,
+            (unsigned long long)g_m14_dev50_direct_redirects,
+            (unsigned long long)g_m14_dev50_bl_rescues,
+            (unsigned long long)g_m14_v36_lookup_calls,
+            (unsigned long long)g_m14_v36_lookup_steps,
+            seam_avg,
+            (unsigned long long)g_m14_dev50_host_lookup_calls,
+            (unsigned long long)g_m14_dev50_host_lookup_steps,
+            host_avg,
+            (unsigned)OPENSPM_M14_DEV50_HOST_TARGET_COUNT);
+        bridge_v44_log(instance, message);
+
+        {
+            uint32_t i;
+            size_t used = 0u;
+            int wrote = snprintf(
+                message, sizeof(message),
+                "M14 LLVM dev78 direct-BL rescue sample total=%llu rate=1/4096 heavy=",
+                (unsigned long long)g_m14_dev78_bl_sampled_rescues);
+            if (wrote > 0)
+                used = (size_t)wrote < sizeof(message)
+                    ? (size_t)wrote : sizeof(message) - 1u;
+            for (i = 0u; i < OPENSPM_M14_DEV78_BL_SAMPLE_SLOTS &&
+                 used + 72u < sizeof(message); ++i) {
+                const openspm_m14_dev78_bl_sample *slot =
+                    &g_m14_dev78_bl_samples[i];
+                if (slot->count == 0u) continue;
+                wrote = snprintf(
+                    message + used, sizeof(message) - used,
+                    " [0x%08X->0x%08X ret=0x%08X:%llu]",
+                    (unsigned)slot->source, (unsigned)slot->target,
+                    (unsigned)(slot->source + 4u),
+                    (unsigned long long)slot->count);
+                if (wrote <= 0) break;
+                used += (size_t)wrote;
+            }
+            bridge_v44_log(instance, message);
+        }
+
+        /* Restore the exact historical top pointers so every nested destroy
+           callback sees the wrapper it installed and unwinds normally. */
+        instance->cpu.host_call = g_m14_dev50_historical_host_call;
+        if (g_m14_have_hostcall && g_m14_dev50_historical_service_handle != NULL)
+            g_m14_hostcall.handle = g_m14_dev50_historical_service_handle;
+    }
+
+    g_m14_dev50_instance = NULL;
+    g_m14_dev50_historical_host_call = NULL;
+    g_m14_dev50_historical_service_handle = NULL;
+    if (g_m14_dev50_underlying_destroy != NULL)
+        g_m14_dev50_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev48_pc_dl_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev50_underlying_create = out_api->create;
+    g_m14_dev50_api_run = out_api->run;
+    g_m14_dev50_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev50-llvm-production-router";
+    out_api->create = bridge_create_dev50;
+    out_api->run = bridge_run_dev50;
+    out_api->destroy = bridge_destroy_dev50;
+#endif
+    return OPENSPM_OK;
+}

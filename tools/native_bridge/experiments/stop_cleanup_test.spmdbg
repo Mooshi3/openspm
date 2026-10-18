@@ -1,0 +1,14 @@
+# OpenSPM M14 dev29 - Stop/deferred-cleanup verification
+#
+# Start this in a safe room, wait until NPCs visibly freeze, then press Stop.
+# Expected: NPC freeze is removed and the capture is auto-saved.
+
+defer npcs freeze off
+defer npcs suspend off
+defer speed 1
+
+capture start stop-cleanup
+npcs freeze on
+speed 1.5
+wait 30
+capture stop

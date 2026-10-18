@@ -1,0 +1,10 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_sample_level.dll in the mods folder. The level's map is in
+# mods\openspm_sample_level\files\map\os1_01.bin (built by
+# tools/content/sample_level.py).
+id = "openspm.sample.level"
+name = "Sample Level"
+version = "1.0"
+author = "OpenSPM samples"
+description = "A new meadow level with its own enemies and NPCs: press F3 to go there, take a pipe (or F3) back to Flipside."
+requires = ["openspm.content>=1", "openspm.guest_memory>=1", "openspm.guest_call>=1"]

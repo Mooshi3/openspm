@@ -1,0 +1,233 @@
+/*
+ * M14 local-module bridge v26 / LLVM hosted direct-call parity.
+ *
+ * Generated-C has always normalized direct BLs to OpenSPM semantic host targets
+ * back into side exits. LLVM can otherwise lower the same BL directly to a
+ * native guest function, bypassing the host service entirely. The first live
+ * relF-rebased run exposed exactly that class of bug: seq_logo remained at
+ * stage 1 forever while Revolution OS sat correctly idle in SelectThread.
+ * NANDCheckAsync is asynchronous in SPM; bypassing the hosted call means the
+ * checkCallback that clears NAND_FLAG_Waiting is never delivered.
+ *
+ * The player-local seam generator now partitions every verified direct BL to a
+ * checked-in M14 host target, from both main.dol and relF, at call and return.
+ * This overlay intercepts the materialized callsite before LLVM can execute the
+ * BL, reproduces the BL's LR/PC state, then raises the same detail-12 semantic
+ * migration exit generated-C already uses at hosted targets.
+ *
+ * Crucially, v26 does not implement a second hostcall/callback path. The proven
+ * v7 run loop receives that ordinary detail-12 exit, invokes
+ * openspm.m14.hostcall.r8pe01, and executes any async/nested guest completion
+ * through its existing event bridge. This gives LLVM the same semantic route as
+ * generated-C instead of merely an equivalent-looking implementation.
+ *
+ * This is not a NAND/logo hack: it restores the same boundary contract for all
+ * direct calls to checked-in hosted targets. Indirect/top-level entries remain
+ * protected by v7's target-range classifier.
+ *
+ * Performance note: derive_hostcall_llvm_seams.py sorts HostCallSeam rows by
+ * call_pc before emitting OPENSPM_LOCAL_LLVM_HOSTCALL_SEAMS. Native LLVM entry
+ * asks the region-interception callback extremely frequently, so a linear scan
+ * of all player seams here was catastrophically expensive (383 comparisons in
+ * the current player, potentially millions of lookups per second). Keep this
+ * lookup logarithmic; correctness is identical because call_pc values are
+ * unique and generator-sorted.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev35_relf_bss_base
+#include "legacy_c_adapter_v25.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#include "m14_static_pc_filter.h"
+static uint32_t g_m14_dev69_seam_filter[OPENSPM_M14_PC_FILTER_WORDS];
+static uint32_t g_m14_dev69_seam_filter_ready;
+static uint64_t g_m14_dev69_seam_rejects;
+static openspm_native_create_fn g_m14_v36_underlying_create;
+static openspm_native_destroy_fn g_m14_v36_underlying_destroy;
+static PPCHostCall g_m14_v36_underlying_host_call;
+static uint64_t g_m14_v36_redirects;
+static uint64_t g_m14_v36_nand_check_redirects;
+static uint64_t g_m14_v36_lookup_calls;
+static uint64_t g_m14_v36_lookup_steps;
+static uint32_t g_m14_v36_logged;
+
+static const openspm_local_llvm_hostcall_seam *bridge_v36_find_seam(uint32_t pc) {
+    uint32_t lo = 0u;
+    uint32_t hi = OPENSPM_LOCAL_LLVM_HOSTCALL_SEAM_COUNT;
+    ++g_m14_v36_lookup_calls;
+
+    /* The generated const table lives for the entire module lifetime. Build
+       before its first lookup; scratch events share this same immutable table.
+       Existing bridge/event execution is confined to the native CPU thread. */
+    if (!g_m14_dev69_seam_filter_ready) {
+        uint32_t i;
+        for (i = 0u; i < OPENSPM_LOCAL_LLVM_HOSTCALL_SEAM_COUNT; ++i)
+            openspm_m14_pc_filter_add(g_m14_dev69_seam_filter,
+                OPENSPM_LOCAL_LLVM_HOSTCALL_SEAMS[i].call_pc);
+        g_m14_dev69_seam_filter_ready = 1u;
+    }
+    if (!openspm_m14_pc_filter_maybe(g_m14_dev69_seam_filter, pc)) {
+        ++g_m14_dev69_seam_rejects;
+        return NULL;
+    }
+
+    /* derive_hostcall_llvm_seams.py emits rows from seams.sort(); HostCallSeam
+       ordering begins with call_pc and duplicate callsites are rejected. */
+    while (lo < hi) {
+        const uint32_t mid = lo + ((hi - lo) >> 1);
+        const openspm_local_llvm_hostcall_seam *seam =
+            &OPENSPM_LOCAL_LLVM_HOSTCALL_SEAMS[mid];
+        ++g_m14_v36_lookup_steps;
+        if (pc < seam->call_pc) {
+            hi = mid;
+        } else if (pc > seam->call_pc) {
+            lo = mid + 1u;
+        } else {
+            return seam;
+        }
+    }
+    return NULL;
+}
+
+static void bridge_v36_log_once(CPUState *cpu) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    char message[256];
+    if (g_m14_v36_logged || cpu == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM hosted direct-call parity active: %u verified callsites use generator-sorted logarithmic lookup and are converted to the proven detail-12 OpenSPM hostcall path.",
+        (unsigned)OPENSPM_LOCAL_LLVM_HOSTCALL_SEAM_COUNT);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+    g_m14_v36_logged = 1u;
+}
+
+static bool bridge_host_call_v36(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance;
+    const openspm_local_llvm_hostcall_seam *seam;
+
+    if (cpu == NULL) return false;
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        bool underlying = false;
+        if (g_m14_v36_underlying_host_call != NULL)
+            underlying = g_m14_v36_underlying_host_call(cpu, address);
+        else
+            cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        if (underlying) return true;
+
+        /* The generated map places a hard partition at every callsite. Block
+           only when the materialized PC itself is that verified callsite; this
+           prevents an earlier region from being rejected merely because its
+           range happens to include a later semantic call. */
+        seam = bridge_v36_find_seam((uint32_t)cpu->pc);
+        if (seam != NULL && seam->call_pc >= start && seam->call_pc < end)
+            return true;
+        return false;
+    }
+
+    seam = bridge_v36_find_seam((uint32_t)address);
+    if (seam == NULL)
+        return g_m14_v36_underlying_host_call != NULL
+                   ? g_m14_v36_underlying_host_call(cpu, address)
+                   : false;
+
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) return false;
+    bridge_v36_log_once(cpu);
+
+    /* The native region ended immediately before the guest BL. Reproduce that
+       BL's architectural effect, then request the exact fallback v7 already
+       knows how to marshal. The ordinary v7 run/event loops remain the sole
+       owners of host-service execution and callback delivery. */
+    cpu->lr = seam->return_pc;
+    cpu->pc = seam->target;
+    bridge_request_fallback(instance, seam->target, 12u);
+    ++g_m14_v36_redirects;
+    if (seam->target == UINT32_C(0x8029A500))
+        ++g_m14_v36_nand_check_redirects;
+    return true;
+}
+
+static int OPENSPM_CALL bridge_create_v36(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v36_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v36_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v36_underlying_host_call = instance->cpu.host_call;
+    g_m14_v36_redirects = 0u;
+    g_m14_v36_nand_check_redirects = 0u;
+    g_m14_v36_lookup_calls = 0u;
+    g_m14_v36_lookup_steps = 0u;
+    g_m14_v36_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v36;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v36(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL && instance->runtime->host->log != NULL &&
+        (g_m14_v36_redirects != 0u || g_m14_v36_logged ||
+         g_m14_v36_lookup_calls != 0u)) {
+        char message[384];
+        const uint64_t avg_x1000 = g_m14_v36_lookup_calls != 0u
+            ? (g_m14_v36_lookup_steps * UINT64_C(1000)) / g_m14_v36_lookup_calls
+            : 0u;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM hosted direct-call stats redirects=%llu nand_check=%llu seams=%u lookup_calls=%llu lookup_steps=%llu avg_steps=%llu.%03llu.",
+            (unsigned long long)g_m14_v36_redirects,
+            (unsigned long long)g_m14_v36_nand_check_redirects,
+            (unsigned)OPENSPM_LOCAL_LLVM_HOSTCALL_SEAM_COUNT,
+            (unsigned long long)g_m14_v36_lookup_calls,
+            (unsigned long long)g_m14_v36_lookup_steps,
+            (unsigned long long)(avg_x1000 / UINT64_C(1000)),
+            (unsigned long long)(avg_x1000 % UINT64_C(1000)));
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v36_underlying_host_call;
+    if (g_m14_v36_underlying_destroy != NULL)
+        g_m14_v36_underlying_destroy(opaque);
+    g_m14_v36_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev35_relf_bss_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v36_underlying_create = out_api->create;
+    g_m14_v36_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev36-llvm-hostcall-direct-parity";
+    out_api->create = bridge_create_v36;
+    out_api->destroy = bridge_destroy_v36;
+#endif
+    return OPENSPM_OK;
+}

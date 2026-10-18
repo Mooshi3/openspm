@@ -1,0 +1,131 @@
+name: Build OpenSPM M13 platform shell
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [m13-platform, m13-phase3-gui]
+    paths:
+      - CMakeLists.txt
+      - include/openspm/**
+      - core/**
+      - launcher/**
+      - backend/**
+      - mods/**
+      - tests/m13_*.c
+      - ci/RUN-M13.cmd
+      - ci/RUN-M13-M12-FALLBACK.cmd
+      - docs/M13-ARCHITECTURE.md
+      - .github/workflows/build-m13-platform.yml
+
+concurrency:
+  group: m13-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-platform:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Ensure Ninja is available
+        shell: pwsh
+        run: |
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y
+            if ($LASTEXITCODE) { throw 'Ninja installation failed' }
+          }
+      - name: Configure, build and test M13 platform
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build-m13 -G Ninja -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE) { throw 'M13 configure failed' }
+          cmake --build build-m13 -j2
+          if ($LASTEXITCODE) { throw 'M13 build failed' }
+          ctest --test-dir build-m13 --output-on-failure
+          if ($LASTEXITCODE) { throw 'M13 tests failed' }
+          & (Get-ChildItem build-m13 -Recurse -Filter OpenSPM.exe | Select-Object -First 1).FullName --version
+          if ($LASTEXITCODE) { throw 'M13 launcher smoke test failed' }
+      - name: Download exact proven M12 Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spm-m12-native-display-windows-runtime
+          path: m12
+          github-token: ${{ github.token }}
+          run-id: 34176078842
+      - name: Verify M12 identity and package modular shell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedExe = 'c953b63a436b1259797ca07a907d0b905b2459c339796e5e308354358f6722ba'
+          $expectedDll = 'f50dea152b0fff11c6ffdc30555ef33b8cb92828363a863f45a14d0f4a6ec4ce'
+          $m12Exe = Get-ChildItem m12 -Recurse -Filter moderngekko-run.exe | Select-Object -First 1
+          $m12Dll = Get-ChildItem m12 -Recurse -Filter gR8PE01_recomp.dll | Select-Object -First 1
+          if (!$m12Exe -or !$m12Dll) { throw 'M12 payload missing required binary' }
+          if ((Get-FileHash $m12Exe.FullName -Algorithm SHA256).Hash.ToLower() -ne $expectedExe) { throw 'M12 EXE identity changed' }
+          if ((Get-FileHash $m12Dll.FullName -Algorithm SHA256).Hash.ToLower() -ne $expectedDll) { throw 'M12 game DLL identity changed' }
+
+          $launcher = Get-ChildItem build-m13 -Recurse -Filter OpenSPM.exe | Select-Object -First 1
+          $backend = Get-ChildItem build-m13 -Recurse -Filter moderngekko_backend.dll | Select-Object -First 1
+          $debugMod = Get-ChildItem build-m13 -Recurse -Filter openspm_debug.dll | Select-Object -First 1
+          if (!$launcher -or !$backend -or !$debugMod) { throw 'M13 launcher/backend/debug mod missing' }
+          $exports = & dumpbin /exports $backend.FullName
+          if (-not ($exports -match 'openspm_backend_query')) { throw 'Backend query export missing' }
+          $modExports = & dumpbin /exports $debugMod.FullName
+          if (-not ($modExports -match 'openspm_mod_query')) { throw 'Debug mod query export missing' }
+
+          New-Item -ItemType Directory -Force dist/runtime/legacy,dist/mods,dist/patches,dist/profiles,dist/sdk/include | Out-Null
+          Copy-Item $launcher.FullName dist/OpenSPM.exe
+          Copy-Item $backend.FullName dist/runtime/moderngekko_backend.dll
+          Copy-Item $debugMod.FullName dist/mods/openspm_debug.dll
+          Copy-Item $m12Exe.FullName dist/runtime/legacy/moderngekko-run.exe
+          Copy-Item $m12Dll.FullName dist/runtime/legacy/gR8PE01_recomp.dll
+          $sys = Get-ChildItem m12 -Directory -Recurse -Filter Sys | Select-Object -First 1
+          if (!$sys) { throw 'M12 Sys directory missing' }
+          Copy-Item $sys.FullName dist/runtime/legacy/Sys -Recurse
+          Copy-Item ci/RUN-M13.cmd dist/RUN-OPENSPM.cmd
+          Copy-Item ci/RUN-M13-M12-FALLBACK.cmd dist/RUN-DIRECT-M12-FALLBACK.cmd
+          Copy-Item docs/M13-ARCHITECTURE.md dist/README-M13.md
+          Copy-Item include/openspm dist/sdk/include/openspm -Recurse
+          'OpenSPM ABI v1 headers. Drop ABI-compatible DLL mods into mods/. Startup launch-profile fields are active; live gameplay hooks arrive with the in-process game service.' | Set-Content dist/sdk/README.txt
+          'DLL mods in this directory can be enabled/disabled from the OpenSPM launcher. openspm_debug.dll is the first-party debug harness.' | Set-Content dist/mods/README.txt
+          'Startup/debug profiles will live here. M13 phase 3 persists the selected boot target in OpenSPM.ini.' | Set-Content dist/profiles/README.txt
+          'Presentation/config patches will live here; M13 phase 3 does not consume this directory yet.' | Set-Content dist/patches/README.txt
+          @"
+          milestone=M13-platform-phase3-gui
+          source_commit=${{ github.sha }}
+          openspm_abi=1
+          launcher=OpenSPM.exe-native-win32-gui-default
+          direct_launch=OpenSPM.exe--launch
+          backend=runtime/moderngekko_backend.dll
+          backend_mode=legacy-process-transition
+          m12_source_run=34176078842
+          m12_artifact=10037372383
+          m12_exe_sha256=$expectedExe
+          m12_game_dll_sha256=$expectedDll
+          m12_payload=byte-identical-proven-candidate
+          mods=dll-discovery-per-mod-toggle-startup-shutdown-events
+          debug_mod=mods/openspm_debug.dll
+          launch_profiles=profile-id-and-boot-target-plumbed
+          debug_scene_redirect=pending-in-process-game-service
+          gameplay_mod_events=tick-present-pending-in-process-backend
+          config=OpenSPM.ini-portable-persistence
+          renderer=unchanged-M12
+          "@ | Set-Content dist/BUILD-PROVENANCE.txt
+          Get-ChildItem dist -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $relative = $_.FullName.Substring((Resolve-Path dist).Path.Length + 1).Replace('\','/')
+            "$h  $relative"
+          } | Set-Content dist/SHA256SUMS.txt
+      - name: Upload M13 phase-3 Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspm-m13-platform-phase3-gui-windows
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

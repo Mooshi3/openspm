@@ -1,0 +1,102 @@
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index d084fea634..9ad50e3cd9 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -129,7 +129,7 @@ private:
+   bool ResolveNativeAddress(u32 runtime_address, u32* linked_address, u32* rel_section_index);
+   bool ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const;
+   u32 TranslateRelAddress(u32 linked_address);
+-  void RefreshRelSections();
++  void RefreshRelSections(u32 runtime_hint);
+ 
+   static void SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc);
+ 
+@@ -211,6 +211,9 @@ private:
+ 
+   bool m_collect_dispatch_samples = false;
+   bool m_has_rel_modules = false;
++  // A failed discovery scan is expensive.  Retry only after guest code has
++  // been invalidated, which is the signal that a REL may have been linked.
++  bool m_rel_discovery_dirty = true;
+   u32 m_idle_pc = 0;
+ };
+ 
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+index 491c57ef3a..6a9d704f21 100644
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_SMC.cpp
+@@ -18,10 +18,12 @@ u32 ReadGuestBE32(const u8* bytes)
+ }
+ }
+ 
+-void StaticRecompCore::RefreshRelSections()
++void StaticRecompCore::RefreshRelSections(u32 runtime_hint)
+ {
+   if (!m_module || m_module->num_rel_modules == 0 || !m_guest.ram || m_guest.ram_size < 0x40)
+     return;
++  if (!m_rel_discovery_dirty)
++    return;
+ 
+   std::vector<ActiveRelSection> discovered;
+   for (u32 module_index = 0; module_index < m_module->num_rel_modules; ++module_index)
+@@ -31,13 +33,24 @@ void StaticRecompCore::RefreshRelSections()
+                           static_cast<u64>(module.section_count) * 8;
+     if (table_end > m_guest.ram_size)
+       continue;
+-    for (u32 candidate = 0; static_cast<u64>(candidate) + table_end <= m_guest.ram_size;
++    // The unresolved PC is already a strong discovery hint: a file-backed executable REL
++    // section cannot be more than module.file_size bytes after the module header.  Scan only
++    // that bounded allocation window instead of sweeping all of MEM1 on every unresolved PC.
++    if (runtime_hint < 0x80000000u || runtime_hint >= 0x80000000u + m_guest.ram_size)
++      continue;
++    const u32 hint_offset = runtime_hint - 0x80000000u;
++    const u32 candidate_begin = hint_offset > module.file_size ? hint_offset - module.file_size : 0;
++    const u32 max_candidate = m_guest.ram_size - static_cast<u32>(table_end);
++    const u32 candidate_end = std::min(hint_offset, max_candidate);
++    for (u32 candidate = (candidate_begin + 3u) & ~3u; candidate <= candidate_end;
+          candidate += 4)
+     {
+       const u8* header = m_guest.ram + candidate;
++      const u32 section_info = ReadGuestBE32(header + 0x10);
++      const u32 linked_section_info = 0x80000000u + candidate + module.section_info_offset;
+       if (ReadGuestBE32(header) != module.module_id ||
+           ReadGuestBE32(header + 0x0c) != module.section_count ||
+-          ReadGuestBE32(header + 0x10) != module.section_info_offset ||
++          (section_info != module.section_info_offset && section_info != linked_section_info) ||
+           ReadGuestBE32(header + 0x1c) != module.version)
+         continue;
+ 
+@@ -74,6 +87,7 @@ void StaticRecompCore::RefreshRelSections()
+       }
+     }
+   }
++  m_rel_discovery_dirty = false;
+ 
+   const bool changed = discovered.size() != m_active_rel_sections.size() ||
+                        !std::equal(discovered.begin(), discovered.end(),
+@@ -132,7 +146,7 @@ bool StaticRecompCore::ResolveNativeAddress(u32 runtime_address, u32* linked_add
+       return true;
+     }
+   }
+-  RefreshRelSections();
++  RefreshRelSections(runtime_address);
+   return resolve_active();
+ }
+ 
+@@ -339,8 +353,16 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
+ 
+   if (!m_module_active || length == 0)
+     return;
++  // An invalidation itself is not a discovery point. Suppress the scan while
++  // resolving its old mapping, then arm discovery for the next execution.
++  m_rel_discovery_dirty = false;
+   u32 linked_address = address;
+   ResolveNativeAddress(address, &linked_address, nullptr);
++  // Defer the next scan until after this invalidation has completed.  That
++  // avoids searching repeatedly while ordinary DOL code is being loaded, but
++  // retries immediately after a newly-linked REL invalidates its executable
++  // section.
++  m_rel_discovery_dirty = true;
+   address = linked_address;
+   const u32 last = address + (length - 1u);
+ 

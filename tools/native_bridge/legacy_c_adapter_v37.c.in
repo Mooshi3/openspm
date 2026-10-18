@@ -1,0 +1,366 @@
+/*
+ * M14 local-module bridge v37 / dev47 GX finish semantic completion.
+ *
+ * dev46 proved the stage-1 main thread is not lost or corrupted: it moves from
+ * RUNNING to WAITING on OSThreadQueue 0x8056D990 immediately after the first
+ * parsed GXDrawDone host fence. dev45 separately proved VI wake/sleep is healthy.
+ * Public Revolution/Dolphin SDK behavior for GXDrawDone is: emit BP finish,
+ * clear DrawDone, sleep on FinishQueue; the PE-finish interrupt handler then
+ * sets DrawDone, runs the optional callback, and OSWakeupThread(FinishQueue).
+ *
+ * OpenSPM already recognizes BP 0x45=2 and synchronously fences Aurora, but no
+ * guest PE-finish interrupt was being delivered. v37 closes that semantic gap
+ * without editing Nintendo scheduler state or fabricating RunQueueBits.
+ *
+ * Player verification is fail-closed and runtime-local. We scan player-owned
+ * main-DOL text for exactly one direct BL to the proven US2 OSWakeupThread
+ * (0x802761CC) immediately preceded by `addi r3,r13,-0x6F70`, the exact queue
+ * dev46 observed. The nearest ordinary non-leaf PPC prologue is treated as the
+ * retail GXFinishInterruptHandler entry. If the signature is absent/ambiguous,
+ * no completion is synthesized.
+ *
+ * Once the persistent CPU returns to Nintendo's scheduler idle and the verified
+ * FinishQueue contains a WAITING thread whose OSThread::queue field points back
+ * to that queue, we execute the real guest finish handler on the established
+ * scratch-event machinery with OS_INTR_PI_PE_FINISH=19 and the live idle
+ * OSContext. Nintendo's handler therefore owns its DrawDone flag, callback, and
+ * OSWakeupThread behavior. Aurora's host fence remains the source of completion;
+ * no proprietary code or assets are added to OpenSPM.
+ *
+ * Historical source-contract ancestry:
+ * m14-dev46-llvm-main-thread-transition-truth
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev46_main_thread_base
+#include "legacy_c_adapter_v36.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_DEV47_TEXT_START UINT32_C(0x80004000)
+#define OPENSPM_M14_DEV47_TEXT_END UINT32_C(0x80350000)
+#define OPENSPM_M14_DEV47_OS_WAKEUP_THREAD UINT32_C(0x802761CC)
+#define OPENSPM_M14_DEV47_FINISH_QUEUE_DELTA (-INT32_C(0x6F70))
+#define OPENSPM_M14_DEV47_THREAD_STATE_OFF UINT32_C(0x2C8)
+#define OPENSPM_M14_DEV47_THREAD_QUEUE_OFF UINT32_C(0x2DC)
+#define OPENSPM_M14_DEV47_THREAD_WAITING UINT32_C(4)
+#define OPENSPM_M14_DEV47_OS_INTR_PI_PE_FINISH UINT32_C(19)
+#define OPENSPM_M14_DEV47_PROLOGUE_SCAN UINT32_C(0x200)
+#define OPENSPM_M14_DEV47_MAX_COMPLETIONS UINT32_C(1000000)
+
+static openspm_native_create_fn g_m14_dev47_underlying_create;
+static openspm_native_run_fn g_m14_dev47_underlying_run;
+static openspm_native_destroy_fn g_m14_dev47_underlying_destroy;
+static uint32_t g_m14_dev47_finish_handler;
+static uint32_t g_m14_dev47_wake_call;
+static uint32_t g_m14_dev47_scan_done;
+static uint32_t g_m14_dev47_scan_candidates;
+static uint32_t g_m14_dev47_completions;
+static uint32_t g_m14_dev47_failures;
+
+static int bridge_dev47_decode_bl(uint32_t raw, uint32_t pc,
+                                  uint32_t *out_target) {
+    int32_t disp;
+    if (out_target == NULL || (raw >> 26) != 18u || (raw & 1u) == 0u)
+        return 0;
+    disp = (int32_t)(raw & UINT32_C(0x03FFFFFC));
+    if ((disp & INT32_C(0x02000000)) != 0)
+        disp |= (int32_t)UINT32_C(0xFC000000);
+    *out_target = (raw & 2u) != 0u ? (uint32_t)disp
+                                   : pc + (uint32_t)disp;
+    return 1;
+}
+
+static int bridge_dev47_is_finish_queue_addi(uint32_t raw) {
+    return (raw >> 26) == 14u &&
+           ((raw >> 21) & 31u) == 3u &&
+           ((raw >> 16) & 31u) == 13u &&
+           (int16_t)(raw & UINT32_C(0xFFFF)) == (int16_t)-0x6F70;
+}
+
+static int bridge_dev47_is_nonleaf_prologue(CPUState *cpu, uint32_t pc) {
+    uint32_t raw;
+    int16_t imm;
+    uint32_t off;
+    if (cpu == NULL ||
+        !bridge_m14_context_address_valid(cpu, pc, UINT32_C(0x18)))
+        return 0;
+    raw = mem_read32(cpu, pc);
+    if ((raw & UINT32_C(0xFFFF0000)) != UINT32_C(0x94210000))
+        return 0;
+    imm = (int16_t)(raw & UINT32_C(0xFFFF));
+    if (imm >= 0) return 0;
+    for (off = 4u; off <= UINT32_C(0x14); off += 4u) {
+        if (mem_read32(cpu, pc + off) == UINT32_C(0x7C0802A6))
+            return 1;
+    }
+    return 0;
+}
+
+static uint32_t bridge_dev47_find_function_start(CPUState *cpu,
+                                                  uint32_t call_pc) {
+    uint32_t floor;
+    uint32_t pc;
+    if (cpu == NULL || call_pc < OPENSPM_M14_DEV47_PROLOGUE_SCAN)
+        return 0u;
+    floor = (call_pc - OPENSPM_M14_DEV47_PROLOGUE_SCAN) & ~UINT32_C(3);
+    pc = call_pc & ~UINT32_C(3);
+    for (;;) {
+        if (pc < floor) break;
+        if (bridge_dev47_is_nonleaf_prologue(cpu, pc)) return pc;
+        if (pc <= floor) break;
+        pc -= 4u;
+    }
+    return 0u;
+}
+
+static void bridge_dev47_scan_finish_handler(openspm_bridge_instance *instance) {
+    CPUState *cpu;
+    uint32_t pc;
+    uint32_t candidate_call = 0u;
+    uint32_t candidate_handler = 0u;
+    uint32_t candidates = 0u;
+    char message[512];
+
+    if (instance == NULL || g_m14_dev47_scan_done) return;
+    g_m14_dev47_scan_done = 1u;
+    cpu = &instance->cpu;
+    if (!bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV47_TEXT_START,
+            OPENSPM_M14_DEV47_TEXT_END - OPENSPM_M14_DEV47_TEXT_START)) {
+        bridge_v44_log(instance,
+            "M14 LLVM GX finish completion REFUSED: player text scan range is not mapped.");
+        return;
+    }
+
+    for (pc = OPENSPM_M14_DEV47_TEXT_START + 4u;
+         pc + 4u <= OPENSPM_M14_DEV47_TEXT_END; pc += 4u) {
+        uint32_t target = 0u;
+        const uint32_t raw = mem_read32(cpu, pc);
+        if (!bridge_dev47_decode_bl(raw, pc, &target) ||
+            target != OPENSPM_M14_DEV47_OS_WAKEUP_THREAD ||
+            !bridge_dev47_is_finish_queue_addi(mem_read32(cpu, pc - 4u)))
+            continue;
+        ++candidates;
+        candidate_call = pc;
+        candidate_handler = bridge_dev47_find_function_start(cpu, pc);
+    }
+
+    g_m14_dev47_scan_candidates = candidates;
+    if (candidates != 1u || candidate_handler == 0u) {
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM GX finish completion REFUSED: expected one player OSWakeupThread call with r3=r13-0x6F70 and a nearby non-leaf prologue; candidates=%u call=0x%08X handler=0x%08X.",
+            (unsigned)candidates, (unsigned)candidate_call,
+            (unsigned)candidate_handler);
+        bridge_v44_log(instance, message);
+        return;
+    }
+
+    g_m14_dev47_wake_call = candidate_call;
+    g_m14_dev47_finish_handler = candidate_handler;
+    (void)snprintf(message, sizeof(message),
+        "M14 LLVM GX finish semantic completion ARMED: verified player FinishQueue=r13-0x6F70, wake_call=0x%08X -> OSWakeupThread=0x%08X, derived_handler=0x%08X; completion executes the real guest handler only after a waiter appears at scheduler idle.",
+        (unsigned)candidate_call,
+        (unsigned)OPENSPM_M14_DEV47_OS_WAKEUP_THREAD,
+        (unsigned)candidate_handler);
+    bridge_v44_log(instance, message);
+}
+
+static uint32_t bridge_dev47_finish_queue(CPUState *cpu) {
+    if (cpu == NULL) return 0u;
+    return (uint32_t)((int64_t)(uint32_t)cpu->gpr[13] +
+                      (int64_t)OPENSPM_M14_DEV47_FINISH_QUEUE_DELTA);
+}
+
+static int bridge_dev47_finish_waiter_ready(CPUState *cpu,
+                                            uint32_t queue,
+                                            uint32_t *out_thread) {
+    uint32_t head;
+    uint32_t state_attr;
+    uint32_t owner;
+    if (out_thread != NULL) *out_thread = 0u;
+    if (cpu == NULL || queue == 0u ||
+        !bridge_m14_context_address_valid(cpu, queue, 8u))
+        return 0;
+    head = mem_read32(cpu, queue);
+    if (head == 0u ||
+        !bridge_m14_context_address_valid(
+            cpu, head, OPENSPM_M14_DEV47_THREAD_QUEUE_OFF + 4u))
+        return 0;
+    state_attr = mem_read32(cpu, head + OPENSPM_M14_DEV47_THREAD_STATE_OFF);
+    owner = mem_read32(cpu, head + OPENSPM_M14_DEV47_THREAD_QUEUE_OFF);
+    if ((state_attr >> 16) != OPENSPM_M14_DEV47_THREAD_WAITING ||
+        owner != queue)
+        return 0;
+    if (out_thread != NULL) *out_thread = head;
+    return 1;
+}
+
+static int bridge_dev47_deliver_finish(openspm_bridge_instance *instance,
+                                       uint32_t queue,
+                                       uint32_t waiter) {
+    uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS] = {0};
+    uint32_t context;
+    int result;
+    char message[640];
+
+    if (instance == NULL || g_m14_dev47_finish_handler == 0u ||
+        g_m14_dev47_completions >= OPENSPM_M14_DEV47_MAX_COMPLETIONS)
+        return OPENSPM_ERROR_RUNTIME;
+    context = mem_read32(&instance->cpu, OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (context == 0u ||
+        !bridge_m14_context_address_valid(&instance->cpu, context,
+                                          OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET + 4u))
+        return OPENSPM_ERROR_RUNTIME;
+
+    args[0] = OPENSPM_M14_DEV47_OS_INTR_PI_PE_FINISH;
+    args[1] = context;
+    result = bridge_run_m14_event_from_cpu(
+        instance, &instance->cpu, g_m14_dev47_finish_handler, 2u, args);
+    if (result != OPENSPM_OK) {
+        ++g_m14_dev47_failures;
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM GX finish semantic completion FAILED #%u handler=0x%08X queue=0x%08X waiter=0x%08X context=0x%08X result=%d; no scheduler state was fabricated.",
+            (unsigned)g_m14_dev47_failures,
+            (unsigned)g_m14_dev47_finish_handler,
+            (unsigned)queue, (unsigned)waiter,
+            (unsigned)context, result);
+        bridge_v44_log(instance, message);
+        return result;
+    }
+
+    ++g_m14_dev47_completions;
+    if (g_m14_finish_since_retrace == 0u) g_m14_finish_since_retrace = 1u;
+    /* Successful completion is a per-frame event, not a per-frame log. Keep
+       first/power-of-two proofs plus teardown totals without formatting and
+       flushing thousands of redundant scheduler snapshots. */
+    if (!bridge_m14_should_log_tick(g_m14_dev47_completions))
+        return OPENSPM_OK;
+    (void)snprintf(message, sizeof(message),
+        "M14 LLVM GX finish semantic completion #%u handler=0x%08X irq=%u queue=0x%08X waiter=0x%08X after_head=0x%08X runq=0x%08X; Nintendo handler owned flag/callback/wakeup.",
+        (unsigned)g_m14_dev47_completions,
+        (unsigned)g_m14_dev47_finish_handler,
+        (unsigned)OPENSPM_M14_DEV47_OS_INTR_PI_PE_FINISH,
+        (unsigned)queue, (unsigned)waiter,
+        (unsigned)mem_read32(&instance->cpu, queue),
+        (unsigned)mem_read32(&instance->cpu,
+            (uint32_t)instance->cpu.gpr[13] - OPENSPM_M14_V39_RUNQUEUE_BITS_DELTA));
+    bridge_v44_log(instance, message);
+    return OPENSPM_OK;
+}
+
+/* Called by the inner retrace service at a due VI deadline (see v7). Uses the
+   exact verified FinishQueue/handler contract dev47 already relies on; it only
+   moves an already-completed finish ahead of the retrace. */
+static int bridge_dev47_pre_retrace_finish(openspm_bridge_instance *instance) {
+    uint32_t queue;
+    uint32_t waiter = 0u;
+    if (instance == NULL || g_m14_dev47_finish_handler == 0u) return 0;
+    queue = bridge_dev47_finish_queue(&instance->cpu);
+    if (!bridge_dev47_finish_waiter_ready(&instance->cpu, queue, &waiter)) return 0;
+    return bridge_dev47_deliver_finish(instance, queue, waiter) == OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_run_dev47(void *opaque,
+                                        uint64_t soft_cycle_budget,
+                                        openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint32_t queue;
+    uint32_t waiter = 0u;
+    int result;
+
+    if (instance == NULL || g_m14_dev47_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    if (!g_m14_dev47_scan_done)
+        bridge_dev47_scan_finish_handler(instance);
+
+    result = g_m14_dev47_underlying_run(opaque, soft_cycle_budget, out_exit);
+    if (result != OPENSPM_OK || g_m14_dev47_finish_handler == 0u)
+        return result;
+
+    if ((uint32_t)instance->cpu.pc != OPENSPM_M14_SCHEDULER_IDLE_PC)
+        return result;
+    queue = bridge_dev47_finish_queue(&instance->cpu);
+    if (!bridge_dev47_finish_waiter_ready(&instance->cpu, queue, &waiter))
+        return result;
+
+    (void)bridge_dev47_deliver_finish(instance, queue, waiter);
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_dev47(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_dev47_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev47_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev47_finish_handler = 0u;
+    g_m14_dev47_wake_call = 0u;
+    g_m14_dev47_scan_done = 0u;
+    g_m14_dev47_scan_candidates = 0u;
+    g_m14_dev47_completions = 0u;
+    g_m14_dev47_failures = 0u;
+    g_m14_finish_before_retrace = 0u;
+    g_m14_finish_since_retrace = 0u;
+    g_m14_finish_holds = 0u;
+    g_m14_finish_hold_expired = 0u;
+    g_m14_finish_hold_max_ns = 0u;
+    g_m14_pre_retrace_finish_hook = bridge_dev47_pre_retrace_finish;
+    bridge_v44_log(instance,
+        "M14 LLVM GX finish semantic completion probe/fix active: player FinishQueue and real GX finish-handler signature are verified before any event delivery; no scheduler state is fabricated.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev47(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[512];
+        (void)snprintf(message, sizeof(message),
+            "M14 LLVM GX finish semantic completion stats scan_candidates=%u handler=0x%08X wake_call=0x%08X completions=%u failures=%u finish_before_retrace=%llu finish_holds=%llu hold_expired=%llu hold_max_us=%llu.",
+            (unsigned)g_m14_dev47_scan_candidates,
+            (unsigned)g_m14_dev47_finish_handler,
+            (unsigned)g_m14_dev47_wake_call,
+            (unsigned)g_m14_dev47_completions,
+            (unsigned)g_m14_dev47_failures,
+            (unsigned long long)g_m14_finish_before_retrace,
+            (unsigned long long)g_m14_finish_holds,
+            (unsigned long long)g_m14_finish_hold_expired,
+            (unsigned long long)(g_m14_finish_hold_max_ns / UINT64_C(1000)));
+        bridge_v44_log(instance, message);
+    }
+    g_m14_pre_retrace_finish_hook = NULL;
+    if (g_m14_dev47_underlying_destroy != NULL)
+        g_m14_dev47_underlying_destroy(opaque);
+}
+#endif
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev46_main_thread_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev47_underlying_create = out_api->create;
+    g_m14_dev47_underlying_run = out_api->run;
+    g_m14_dev47_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev47-llvm-gx-finish-semantic-completion";
+    out_api->create = bridge_create_dev47;
+    out_api->run = bridge_run_dev47;
+    out_api->destroy = bridge_destroy_dev47;
+#endif
+    return OPENSPM_OK;
+}

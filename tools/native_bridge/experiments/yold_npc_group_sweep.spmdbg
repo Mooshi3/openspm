@@ -1,0 +1,80 @@
+# OpenSPM M14 - Yold Town active-NPC group/threshold sweep
+#
+# No native rebuild is required. npc_group_pulse is implemented entirely by
+# the Python cockpit using existing safe-frame read32/write32 commands.
+#
+# We reload he2_03 between groups because reactivating an NPC can make some
+# actors re-enter placement/pathing logic (player observed the purple woman
+# walking back home after the one-NPC sweep). Reloading prevents that side
+# effect from contaminating the next group-size measurement.
+
+defer resetdebug
+
+resetdebug
+speed 1
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 1.0 0.15
+
+capture start yold-group-baseline
+mark YOLD-GROUP-SWEEP off=0
+wait 2.1
+capture stop
+
+# Two off.
+reloadroom
+wait 1.5
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 0.6 0.15
+capture start yold-group-off2
+mark YOLD-GROUP-SWEEP off=2 names=mura_1,mura_2
+npc_group_pulse 1.85 mura_1,mura_2
+capture stop
+
+# Four off.
+reloadroom
+wait 1.5
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 0.6 0.15
+capture start yold-group-off4
+mark YOLD-GROUP-SWEEP off=4 names=mura_1,mura_2,mura_3,mura_4
+npc_group_pulse 1.85 mura_1,mura_2,mura_3,mura_4
+capture stop
+
+# Six off, leaving only mise active.
+reloadroom
+wait 1.5
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 0.6 0.15
+capture start yold-group-off6
+mark YOLD-GROUP-SWEEP off=6 names=mura_1,mura_2,mura_3,mura_4,mura_5,son
+npc_group_pulse 1.85 mura_1,mura_2,mura_3,mura_4,mura_5,son
+capture stop
+
+# All seven off. Keep this shorter than the partial groups: historical
+# all-active suppression becomes smooth immediately but becomes unsafe after a
+# few seconds. 1.25 s is enough for a phase window while remaining bounded.
+reloadroom
+wait 1.5
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 0.6 0.15
+capture start yold-group-off7
+mark YOLD-GROUP-SWEEP off=7 names=mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+npc_group_pulse 1.25 mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+capture stop
+
+reloadroom
+wait 1.5
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 0.6 0.15

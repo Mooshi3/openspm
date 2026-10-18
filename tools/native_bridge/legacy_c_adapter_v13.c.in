@@ -1,0 +1,200 @@
+/*
+ * M14 generated-C bridge v13 / diagnostic main-loop phase wrapper.
+ *
+ * Runtime 165002 finally measured SPM's real top-level loop directly. In the
+ * heavy Chapter 1 gameplay window, spmarioMain falls to ~30-31 entries/s while
+ * VI/retrace remains ~59-60 Hz. Raising the backend native slice budget 8x did
+ * not improve gameplay, so the next question is where one real game frame is
+ * spending its wall time.
+ *
+ * Keep the complete proven v20 scheduler/GX/input/timebase stack byte-for-byte
+ * underneath this file. Player-local generated source marks only the four real
+ * R8PE01 revision-2 loop entries:
+ *   DEMOBeforeRender 0x801A8A9C
+ *   spmarioDisp      0x801A7D1C
+ *   spmarioMain      0x801A7AAC
+ *   DEMODoneRender   0x801A8B64
+ *
+ * Four monotonic-clock reads per produced game frame measure wall time between
+ * those durable guest entries. A phase can yield/resume through any number of
+ * native slices and the measurement remains correct. No renderer callback,
+ * GX synchronization, guest-memory snapshot, scheduler decision, or game state
+ * is changed.
+ *
+ * CMake's active-bridge guard intentionally looks for the existing fixed-phase
+ * contract marker, which remains inherited from v20:
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev20_phase_base
+#include "legacy_c_adapter_v12.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_M14_FRAME_PHASE_COUNT 4u
+#define OPENSPM_M14_FRAME_PHASE_SAMPLE_NS UINT64_C(1000000000)
+
+static uint64_t g_m14_v21_phase_last_ns;
+static uint32_t g_m14_v21_phase_last_id;
+static uint32_t g_m14_v21_phase_have_last;
+static uint64_t g_m14_v21_phase_sample_ns;
+static uint64_t g_m14_v21_phase_total_ns[OPENSPM_M14_FRAME_PHASE_COUNT];
+static uint64_t g_m14_v21_phase_max_ns[OPENSPM_M14_FRAME_PHASE_COUNT];
+static uint64_t g_m14_v21_phase_calls[OPENSPM_M14_FRAME_PHASE_COUNT];
+
+/* dev122 tail-only frame attribution. Reuse the already-paid four phase clocks:
+   no additional timestamp is taken. A complete 0->1->2->3->0 cycle over 20 ms
+   is marked for the active LLVM bridge to attach camera state, and logged here
+   with exact phase ownership. */
+#define OPENSPM_M14_DEV122_FRAME_TAIL_NS UINT64_C(20000000)
+static uint64_t g_m14_v21_last_phase_ns[OPENSPM_M14_FRAME_PHASE_COUNT];
+static uint64_t g_m14_v21_tail_count;
+static uint64_t g_m14_v21_tail_pending_id;
+
+static uint64_t bridge_v21_avg_us(uint32_t phase) {
+    if (phase >= OPENSPM_M14_FRAME_PHASE_COUNT ||
+        g_m14_v21_phase_calls[phase] == 0u) return 0u;
+    return (g_m14_v21_phase_total_ns[phase] /
+            g_m14_v21_phase_calls[phase]) / UINT64_C(1000);
+}
+
+static uint64_t bridge_v21_max_us(uint32_t phase) {
+    if (phase >= OPENSPM_M14_FRAME_PHASE_COUNT) return 0u;
+    return g_m14_v21_phase_max_ns[phase] / UINT64_C(1000);
+}
+
+static void bridge_v21_reset_phase_window(uint64_t now) {
+    memset(g_m14_v21_phase_total_ns, 0, sizeof(g_m14_v21_phase_total_ns));
+    memset(g_m14_v21_phase_max_ns, 0, sizeof(g_m14_v21_phase_max_ns));
+    memset(g_m14_v21_phase_calls, 0, sizeof(g_m14_v21_phase_calls));
+    g_m14_v21_phase_sample_ns = now;
+}
+
+/* External linkage is intentional: the player-local generated chunks call this
+ * helper at exact durable guest entry labels. phase names describe the work
+ * that begins at that entry; the elapsed interval is charged to the previous
+ * phase, so spmarioDisp->spmarioMain is reported as disp_us, etc. */
+void openspm_m14_note_frame_phase_v20(CPUState *cpu, u32 phase) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const openspm_host_api *host;
+    uint64_t now;
+
+    if (phase >= OPENSPM_M14_FRAME_PHASE_COUNT ||
+        instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->monotonic_ns == NULL || host->log == NULL) return;
+    now = host->monotonic_ns(host->context);
+    if (now == 0u) return;
+
+    /* dev128 reuses this already-paid phase timestamp so a later busy-due VI
+       can identify which top-level frame segment was still active. */
+    g_m14_dev128_phase_id = (uint32_t)phase;
+    g_m14_dev128_phase_enter_ns = now;
+
+    if (g_m14_v21_phase_sample_ns == 0u)
+        g_m14_v21_phase_sample_ns = now;
+
+    if (g_m14_v21_phase_have_last) {
+        const uint32_t expected =
+            (g_m14_v21_phase_last_id + 1u) % OPENSPM_M14_FRAME_PHASE_COUNT;
+        if (phase == expected && now >= g_m14_v21_phase_last_ns) {
+            const uint64_t delta = now - g_m14_v21_phase_last_ns;
+            const uint32_t completed = g_m14_v21_phase_last_id;
+            g_m14_v21_phase_total_ns[completed] += delta;
+            ++g_m14_v21_phase_calls[completed];
+            g_m14_v21_last_phase_ns[completed] = delta;
+            if (delta > g_m14_v21_phase_max_ns[completed])
+                g_m14_v21_phase_max_ns[completed] = delta;
+
+            if (phase == 0u && completed == 3u &&
+                g_m14_v21_last_phase_ns[0] != 0u &&
+                g_m14_v21_last_phase_ns[1] != 0u &&
+                g_m14_v21_last_phase_ns[2] != 0u) {
+                const uint64_t frame_ns =
+                    g_m14_v21_last_phase_ns[0] +
+                    g_m14_v21_last_phase_ns[1] +
+                    g_m14_v21_last_phase_ns[2] +
+                    g_m14_v21_last_phase_ns[3];
+                if (frame_ns > OPENSPM_M14_DEV122_FRAME_TAIL_NS) {
+                    char tail_message[512];
+                    const uint64_t tail_id = ++g_m14_v21_tail_count;
+                    g_m14_v21_tail_pending_id = tail_id;
+                    (void)snprintf(
+                        tail_message, sizeof(tail_message),
+                        "M14 dev122 frame tail n=%llu total_us=%llu before_us=%llu disp_us=%llu main_us=%llu done_us=%llu retraces=%u.",
+                        (unsigned long long)tail_id,
+                        (unsigned long long)(frame_ns / UINT64_C(1000)),
+                        (unsigned long long)(g_m14_v21_last_phase_ns[0] / UINT64_C(1000)),
+                        (unsigned long long)(g_m14_v21_last_phase_ns[1] / UINT64_C(1000)),
+                        (unsigned long long)(g_m14_v21_last_phase_ns[2] / UINT64_C(1000)),
+                        (unsigned long long)(g_m14_v21_last_phase_ns[3] / UINT64_C(1000)),
+                        (unsigned)g_m14_retrace_ticks);
+                    host->log(host->context, OPENSPM_LOG_INFO, tail_message);
+                }
+            }
+        }
+    }
+
+    g_m14_v21_phase_last_ns = now;
+    g_m14_v21_phase_last_id = (uint32_t)phase;
+    g_m14_v21_phase_have_last = 1u;
+
+    /* Report only at the natural start-of-frame boundary so a window never
+       slices one phase in half. Four clock reads per frame are the only steady
+       state diagnostic cost. */
+    if (phase == 0u &&
+        now - g_m14_v21_phase_sample_ns >= OPENSPM_M14_FRAME_PHASE_SAMPLE_NS &&
+        g_m14_v21_phase_calls[0] != 0u &&
+        g_m14_v21_phase_calls[1] != 0u &&
+        g_m14_v21_phase_calls[2] != 0u &&
+        g_m14_v21_phase_calls[3] != 0u) {
+        char message[640];
+        const uint64_t host_ms =
+            (now - g_m14_v21_phase_sample_ns) / UINT64_C(1000000);
+        const uint64_t frames = g_m14_v21_phase_calls[1];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 main-loop phases host_ms=%llu frames=%llu "
+            "before_avg_us=%llu before_max_us=%llu "
+            "disp_avg_us=%llu disp_max_us=%llu "
+            "main_avg_us=%llu main_max_us=%llu "
+            "done_avg_us=%llu done_max_us=%llu retraces=%u.",
+            (unsigned long long)host_ms,
+            (unsigned long long)frames,
+            (unsigned long long)bridge_v21_avg_us(0u),
+            (unsigned long long)bridge_v21_max_us(0u),
+            (unsigned long long)bridge_v21_avg_us(1u),
+            (unsigned long long)bridge_v21_max_us(1u),
+            (unsigned long long)bridge_v21_avg_us(2u),
+            (unsigned long long)bridge_v21_max_us(2u),
+            (unsigned long long)bridge_v21_avg_us(3u),
+            (unsigned long long)bridge_v21_max_us(3u),
+            (unsigned)g_m14_retrace_ticks);
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+        bridge_v21_reset_phase_window(now);
+    }
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev20_phase_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+
+    g_m14_v21_phase_last_ns = 0u;
+    g_m14_v21_phase_last_id = 0u;
+    g_m14_v21_phase_have_last = 0u;
+    g_m14_v21_phase_sample_ns = 0u;
+    memset(g_m14_v21_last_phase_ns, 0, sizeof(g_m14_v21_last_phase_ns));
+    g_m14_v21_tail_count = 0u;
+    g_m14_v21_tail_pending_id = 0u;
+    memset(g_m14_v21_phase_total_ns, 0, sizeof(g_m14_v21_phase_total_ns));
+    memset(g_m14_v21_phase_max_ns, 0, sizeof(g_m14_v21_phase_max_ns));
+    memset(g_m14_v21_phase_calls, 0, sizeof(g_m14_v21_phase_calls));
+
+    /* Diagnostic wrapper only. Preserve the public module provenance string so
+       no player/cache/ABI contract changes for this measurement. */
+    return OPENSPM_OK;
+}

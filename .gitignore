@@ -1,0 +1,20 @@
+m10/
+build/
+*.log
+__pycache__/
+
+# Player-owned/game-derived M14 inputs and generated caches.
+.openspm/
+*.wbfs
+*.iso
+*.wia
+*.rvz
+
+# Optional external lab cache if a developer chooses it inside the checkout.
+m14-lab-runs/
+
+# Player settings (template: OpenSPM.ini.example).
+/OpenSPM.ini
+
+# Test launcher reports and kept logs (tools/test_launcher).
+/test-results/

@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_shell_crouch.dll in the mods folder.
+id = "openspm.sample.shell_crouch"
+name = "Shell Crouch"
+version = "1.1"
+author = "OpenSPM samples"
+description = "Crouch (or F6) to drop a kickable Koopa shell."
+requires = ["openspm.guest_memory>=1", "openspm.guest_call>=1"]

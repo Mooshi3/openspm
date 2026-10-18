@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "Aurora",
+  "repository": "https://github.com/encounter/aurora",
+  "commit": "749d6ee7a22bdfab78c8ece9047bca5d79aa72ca",
+  "license": "MIT",
+  "usage": "optional OpenSPM Stage-A native GX renderer foundation",
+  "vendor_source": false,
+  "notes": [
+    "Use upstream encounter/aurora directly; do not copy WiiCompiled GPL runtime code.",
+    "OpenSPM must supply original-console guest-memory translation and display-list handling.",
+    "Upstream Aurora does not currently implement GXClearBoundingBox/GXReadBoundingBox.",
+    "Upstream Aurora raw display-copy handling is not sufficient as OpenSPM's frame presentation contract."
+  ]
+}

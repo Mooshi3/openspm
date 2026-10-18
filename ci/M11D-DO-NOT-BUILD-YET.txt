@@ -1,0 +1,2 @@
+Measure M11C on Windows before triggering any M11D build.
+M11D should isolate only the SelectThread idle-PC optimization first.

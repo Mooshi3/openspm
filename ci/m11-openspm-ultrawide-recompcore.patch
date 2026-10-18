@@ -1,0 +1,228 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -39,6 +39,8 @@ add_library(core
+   Config/MainSettings.h
+   Config/NetplaySettings.cpp
+   Config/NetplaySettings.h
++  Config/OpenSPMSettings.cpp
++  Config/OpenSPMSettings.h
+   Config/SessionSettings.cpp
+   Config/SessionSettings.h
+   Config/StaticRecompSettings.cpp
+diff --git a/Source/Core/Core/Config/OpenSPMSettings.h b/Source/Core/Core/Config/OpenSPMSettings.h
+new file mode 100644
+--- /dev/null
++++ b/Source/Core/Core/Config/OpenSPMSettings.h
+@@ -0,0 +1,21 @@
++// OpenSPM native frontend settings.
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++namespace OpenSPM
++{
++enum class AspectRatio : u32
++{
++  Auto = 0,
++  Standard4_3 = 1,
++  Wide16_9 = 2,
++  Ultra21_9 = 3,
++  Ultra32_9 = 4,
++};
++
++AspectRatio GetAspectRatio();
++void SetAspectRatio(AspectRatio mode);
++}  // namespace OpenSPM
+diff --git a/Source/Core/Core/Config/OpenSPMSettings.cpp b/Source/Core/Core/Config/OpenSPMSettings.cpp
+new file mode 100644
+--- /dev/null
++++ b/Source/Core/Core/Config/OpenSPMSettings.cpp
+@@ -0,0 +1,72 @@
++// OpenSPM native frontend settings.
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/Config/OpenSPMSettings.h"
++
++#include "Common/Config/Config.h"
++#include "Core/Config/GraphicsSettings.h"
++#include "Core/Core.h"
++#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include "Core/System.h"
++#include "VideoCommon/VideoConfig.h"
++
++namespace Config
++{
++const Info<u32> MAIN_OPENSPM_ASPECT_RATIO{{System::Main, "OpenSPM", "AspectRatio"}, 0u};
++}  // namespace Config
++
++namespace OpenSPM
++{
++namespace
++{
++AspectRatio NormalizeAspectRatio(u32 raw)
++{
++  if (raw > static_cast<u32>(AspectRatio::Ultra32_9))
++    return AspectRatio::Auto;
++  return static_cast<AspectRatio>(raw);
++}
++}  // namespace
++
++AspectRatio GetAspectRatio()
++{
++  return NormalizeAspectRatio(Config::Get(Config::MAIN_OPENSPM_ASPECT_RATIO));
++}
++
++void SetAspectRatio(AspectRatio requested_mode)
++{
++  const AspectRatio mode = NormalizeAspectRatio(static_cast<u32>(requested_mode));
++  Config::SetBaseOrCurrent(Config::MAIN_OPENSPM_ASPECT_RATIO, static_cast<u32>(mode));
++
++  switch (mode)
++  {
++  case AspectRatio::Auto:
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::Auto);
++    break;
++  case AspectRatio::Standard4_3:
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::ForceStandard);
++    break;
++  case AspectRatio::Wide16_9:
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::ForceWide);
++    break;
++  case AspectRatio::Ultra21_9:
++    Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, 21);
++    Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, 9);
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
++    break;
++  case AspectRatio::Ultra32_9:
++    Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_WIDTH, 32);
++    Config::SetBaseOrCurrent(Config::GFX_CUSTOM_ASPECT_RATIO_HEIGHT, 9);
++    Config::SetBaseOrCurrent(Config::GFX_ASPECT_RATIO, AspectMode::CustomStretch);
++    break;
++  }
++
++  auto& system = Core::System::GetInstance();
++  if (!Core::IsUninitialized(system))
++  {
++    Core::RunOnCPUThread(system, [mode] {
++      if (g_static_recomp_core)
++        g_static_recomp_core->SetOpenSPMAspectRatio(static_cast<u32>(mode));
++    });
++  }
++}
++}  // namespace OpenSPM
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -48,6 +48,7 @@ public:
+   void Run() override;
+   void SingleStep() override;
+   bool IsModuleActive() const;
++  void SetOpenSPMAspectRatio(u32 mode);
+   bool DispatchableAt(u32 address);
+   bool FastDispatchableAt(u32 address);
+   bool IsHostCallAddress(u32 address) const;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -14,6 +14,7 @@
+ #include "Common/FileUtil.h"
+ #include "Common/Logging/Log.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/OpenSPMSettings.h"
+ #include "Core/Config/StaticRecompSettings.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+@@ -104,6 +105,14 @@ bool StaticRecompCore::IsModuleActive() const
+   return m_module_active;
+ }
+ 
++void StaticRecompCore::SetOpenSPMAspectRatio(u32 mode)
++{
++  using SetAspectRatioFn = void (*)(u32);
++  SetAspectRatioFn setter = nullptr;
++  if (m_library.IsOpen() && m_library.GetSymbol("openspm_set_aspect_ratio", &setter))
++    setter(mode);
++}
++
+ bool StaticRecompCore::IsHostCallAddress(u32 address) const
+ {
+   if (!m_module_source.host_call_contains)
+@@ -337,6 +347,8 @@ void StaticRecompCore::LoadModule()
+       ChunkContainsHostCall(i);
+   }
+ 
++  SetOpenSPMAspectRatio(static_cast<u32>(OpenSPM::GetAspectRatio()));
++
+   std::fprintf(stderr, "[staticrecomp] module loaded: %s entry=0x%08X\n", path.c_str(),
+                desc->entry_point);
+   NOTICE_LOG_FMT(POWERPC,
+diff --git a/Source/Core/DolphinQt/MenuBar.h b/Source/Core/DolphinQt/MenuBar.h
+--- a/Source/Core/DolphinQt/MenuBar.h
++++ b/Source/Core/DolphinQt/MenuBar.h
+@@ -137,6 +137,7 @@ private:
+   void AddStateSlotMenu(QMenu* emu_menu);
+ 
+   void AddViewMenu();
++  void AddOpenSPMMenu();
+   void AddGameListTypeSection(QMenu* view_menu);
+   void AddListColumnsMenu(QMenu* view_menu);
+   void AddShowPlatformsMenu(QMenu* view_menu);
+diff --git a/Source/Core/DolphinQt/MenuBar.cpp b/Source/Core/DolphinQt/MenuBar.cpp
+--- a/Source/Core/DolphinQt/MenuBar.cpp
++++ b/Source/Core/DolphinQt/MenuBar.cpp
+@@ -24,6 +24,7 @@
+ #include "Core/Achievements/AchievementManager.h"
+ #include "Core/CommonTitles.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/OpenSPMSettings.h"
+ #include "Core/Config/ConfigManager.h"
+ #include "Core/Core.h"
+ #include "Core/Debugger/RSO.h"
+@@ -91,6 +92,7 @@ MenuBar::MenuBar(QWidget* parent) : QMenuBar(parent)
+   AddOptionsMenu();
+   AddToolsMenu();
+   AddViewMenu();
++  AddOpenSPMMenu();
+   AddJITMenu();
+   AddSymbolsMenu();
+   AddHelpMenu();
+@@ -620,6 +622,36 @@ void MenuBar::AddViewMenu()
+ #endif
+ }
+ 
++void MenuBar::AddOpenSPMMenu()
++{
++  auto* const openspm_menu = addMenu(tr("OpenSPM"));
++  auto* const aspect_menu = openspm_menu->addMenu(tr("Aspect Ratio"));
++  auto* const group = new QActionGroup(aspect_menu);
++  group->setExclusive(true);
++
++  // Re-apply the persisted OpenSPM choice so the host presenter and game module share one backend.
++  const OpenSPM::AspectRatio current = OpenSPM::GetAspectRatio();
++  OpenSPM::SetAspectRatio(current);
++
++  const auto add_aspect = [this, aspect_menu, group, current](const QString& label,
++                                                              OpenSPM::AspectRatio mode) {
++    QAction* const action = aspect_menu->addAction(label);
++    action->setCheckable(true);
++    action->setChecked(current == mode);
++    group->addAction(action);
++    connect(action, &QAction::triggered, this, [mode](bool checked) {
++      if (checked)
++        OpenSPM::SetAspectRatio(mode);
++    });
++  };
++
++  add_aspect(tr("Auto"), OpenSPM::AspectRatio::Auto);
++  add_aspect(tr("4:3"), OpenSPM::AspectRatio::Standard4_3);
++  add_aspect(tr("16:9"), OpenSPM::AspectRatio::Wide16_9);
++  add_aspect(tr("21:9"), OpenSPM::AspectRatio::Ultra21_9);
++  add_aspect(tr("32:9"), OpenSPM::AspectRatio::Ultra32_9);
++}
++
+ void MenuBar::AddOptionsMenu()
+ {
+   auto* const options_menu{new QtUtils::NonAutodismissibleMenu(tr("&Options"), this)};

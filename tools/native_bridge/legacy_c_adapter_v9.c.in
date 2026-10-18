@@ -1,0 +1,290 @@
+/*
+ * M14 generated-C bridge v9 / module dev17.
+ *
+ * The first measured strict-native opening/file-select run proved that the
+ * migration CPU timebase was not an elapsed-time clock. The base bridge charges
+ * cpu.timebase from translated execution work, while v7 schedules VI retraces
+ * from host monotonic time and deliberately yields while Nintendo's scheduler is
+ * idle. Consequently MFTB advanced by only ~0.176 guest seconds per real second
+ * in the opening and ~0.020 guest seconds per real second in stable SEQ_LOAD.
+ *
+ * Keep every proven dev16 execution/input/GX/retrace semantic underneath, but
+ * make the architecturally observable Wii timebase derive from one monotonic
+ * host clock. Broadway's timebase is one quarter of the boot-declared bus clock
+ * (243 MHz -> 60.75 MHz for R8PE01). The older execution-derived increments may
+ * still occur privately inside a bridge slice, but they are overwritten before
+ * and after every native run and immediately before every MFTB observation, so
+ * guest code never observes work-dependent elapsed time.
+ *
+ * Scratch event CPUs inherit the same instruction-fallback pointer and therefore
+ * synchronize against this same anchor before MFTB. Development state snapshots
+ * synchronize before get_state and rebase the host clock after set_state so a
+ * restored timebase remains continuous instead of snapping back to an old host
+ * origin.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev16_internal
+#include "legacy_c_adapter_v8.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_M14_V9_BUS_CLOCK_WORD UINT32_C(0x800000F8)
+#define OPENSPM_M14_V9_DEFAULT_TIMEBASE_HZ UINT32_C(60750000)
+#define OPENSPM_M14_V9_NS_PER_SECOND UINT64_C(1000000000)
+#define OPENSPM_M14_V9_SAMPLE_NS UINT64_C(1000000000)
+
+static uint32_t g_m14_v9_clock_active;
+static uint32_t g_m14_v9_timebase_hz;
+static uint64_t g_m14_v9_anchor_host_ns;
+static uint64_t g_m14_v9_anchor_ticks;
+static uint32_t g_m14_v9_sample_started;
+static uint64_t g_m14_v9_sample_host_ns;
+static uint64_t g_m14_v9_sample_ticks;
+static uint32_t g_m14_v9_sample_retraces;
+
+static uint64_t bridge_v9_elapsed_ticks(uint64_t elapsed_ns, uint32_t hz) {
+    const uint64_t whole_seconds = elapsed_ns / OPENSPM_M14_V9_NS_PER_SECOND;
+    const uint64_t fractional_ns = elapsed_ns % OPENSPM_M14_V9_NS_PER_SECOND;
+
+    /* Split the conversion so even a long suspended host process cannot
+       overflow fractional_ns * hz. whole_seconds * hz remains safe for any
+       realistic process lifetime. */
+    return whole_seconds * (uint64_t)hz +
+           (fractional_ns * (uint64_t)hz) / OPENSPM_M14_V9_NS_PER_SECOND;
+}
+
+static uint64_t bridge_sync_timebase_v9(openspm_bridge_instance *instance,
+                                        CPUState *cpu) {
+    uint64_t now;
+    uint64_t ticks;
+
+    if (instance == NULL) return cpu != NULL ? cpu->timebase : 0u;
+    if (!g_m14_v9_clock_active || g_m14_v9_timebase_hz == 0u)
+        return cpu != NULL ? cpu->timebase : instance->cpu.timebase;
+
+    now = bridge_m14_now_ns(instance);
+    if (now == 0u || now < g_m14_v9_anchor_host_ns)
+        return cpu != NULL ? cpu->timebase : instance->cpu.timebase;
+
+    ticks = g_m14_v9_anchor_ticks +
+            bridge_v9_elapsed_ticks(now - g_m14_v9_anchor_host_ns,
+                                    g_m14_v9_timebase_hz);
+    instance->cpu.timebase = ticks;
+    if (cpu != NULL) cpu->timebase = ticks;
+    return ticks;
+}
+
+static int bridge_rebase_timebase_v9(openspm_bridge_instance *instance,
+                                     uint64_t ticks) {
+    uint64_t now;
+    if (instance == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+    now = bridge_m14_now_ns(instance);
+    if (now == 0u) {
+        g_m14_v9_clock_active = 0u;
+        return OPENSPM_ERROR_UNSUPPORTED;
+    }
+    g_m14_v9_anchor_host_ns = now;
+    g_m14_v9_anchor_ticks = ticks;
+    instance->cpu.timebase = ticks;
+    g_m14_v9_clock_active = 1u;
+    return OPENSPM_OK;
+}
+
+static void bridge_log_clock_v9(openspm_bridge_instance *instance,
+                                uint32_t bus_hz) {
+    const openspm_host_api *host;
+    char message[256];
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(message, sizeof(message),
+                   "M14 authoritative Wii timebase active: host monotonic -> %u Hz (boot bus=%u Hz); MFTB is independent of translated execution charge.",
+                   (unsigned)g_m14_v9_timebase_hz,
+                   (unsigned)bus_hz);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static void bridge_timing_sample_v9(openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    uint64_t now;
+    uint64_t host_delta;
+    uint64_t tb_delta;
+    uint32_t retrace_delta;
+    uint32_t seq;
+    uint32_t stage;
+    double guest_ms;
+    char message[320];
+
+    if (instance == NULL || instance->runtime == NULL ||
+        !g_m14_v9_clock_active || !g_m14_retrace_armed) {
+        return;
+    }
+    host = instance->runtime->host;
+    if (host == NULL || host->monotonic_ns == NULL || host->log == NULL) return;
+    now = host->monotonic_ns(host->context);
+    if (now == 0u) return;
+
+    if (!g_m14_v9_sample_started) {
+        g_m14_v9_sample_started = 1u;
+        g_m14_v9_sample_host_ns = now;
+        g_m14_v9_sample_ticks = instance->cpu.timebase;
+        g_m14_v9_sample_retraces = g_m14_retrace_ticks;
+        return;
+    }
+    if (now - g_m14_v9_sample_host_ns < OPENSPM_M14_V9_SAMPLE_NS) return;
+
+    host_delta = now - g_m14_v9_sample_host_ns;
+    tb_delta = instance->cpu.timebase - g_m14_v9_sample_ticks;
+    retrace_delta = g_m14_retrace_ticks - g_m14_v9_sample_retraces;
+    seq = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+    stage = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+    guest_ms = g_m14_v9_timebase_hz != 0u
+                   ? ((double)tb_delta * 1000.0) / (double)g_m14_v9_timebase_hz
+                   : 0.0;
+
+    (void)snprintf(message, sizeof(message),
+                   "M14 authoritative timing host_ms=%llu retraces=%u timebase_ticks=%llu tb_hz=%u guest_ms=%.3f seq=%u stage=%u pc=0x%08X.",
+                   (unsigned long long)(host_delta / UINT64_C(1000000)),
+                   (unsigned)retrace_delta,
+                   (unsigned long long)tb_delta,
+                   (unsigned)g_m14_v9_timebase_hz,
+                   guest_ms,
+                   (unsigned)seq,
+                   (unsigned)stage,
+                   (unsigned)instance->cpu.pc);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+
+    g_m14_v9_sample_host_ns = now;
+    g_m14_v9_sample_ticks = instance->cpu.timebase;
+    g_m14_v9_sample_retraces = g_m14_retrace_ticks;
+}
+
+static void bridge_instruction_fallback_v9(CPUState *cpu,
+                                            u32 raw,
+                                            u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const uint32_t opcode = raw >> 26;
+    const uint32_t xo = (raw >> 1) & UINT32_C(0x3FF);
+
+    if (cpu != NULL && opcode == OPENSPM_PPC_OPCODE_X &&
+        xo == OPENSPM_PPC_XO_MFTB) {
+        (void)bridge_sync_timebase_v9(instance, cpu);
+    }
+    bridge_instruction_fallback_v8(cpu, raw, source_address);
+}
+
+static int OPENSPM_CALL bridge_get_state_v9(void *opaque,
+                                             openspm_legacy_dev_state *out_state) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) (void)bridge_sync_timebase_v9(instance, &instance->cpu);
+    return bridge_get_state(opaque, out_state);
+}
+
+static int OPENSPM_CALL bridge_set_state_v9(void *opaque,
+                                             const openspm_legacy_dev_state *state) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    int result = bridge_set_state(opaque, state);
+    if (result != OPENSPM_OK) return result;
+    if (instance != NULL && state != NULL) {
+        (void)bridge_rebase_timebase_v9(instance, state->timebase);
+        g_m14_v9_sample_started = 0u;
+    }
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_query_service_v9(void *opaque,
+                                                 const char *service_id,
+                                                 uint32_t requested_version,
+                                                 void *out_service) {
+    int result = bridge_query_service(opaque, service_id, requested_version, out_service);
+    if (result != OPENSPM_OK) return result;
+
+    if (service_id != NULL &&
+        strcmp(service_id, OPENSPM_LEGACY_DEV_SERVICE_ID) == 0) {
+        openspm_legacy_dev_service *service = (openspm_legacy_dev_service *)out_service;
+        service->get_state = bridge_get_state_v9;
+        service->set_state = bridge_set_state_v9;
+    }
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_create_v9(const openspm_native_runtime_api *runtime,
+                                         const openspm_launch_desc *launch,
+                                         void **out_instance) {
+    openspm_bridge_instance *instance;
+    uint32_t bus_hz;
+    int result = bridge_create_v8(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    bus_hz = mem_read32(&instance->cpu, OPENSPM_M14_V9_BUS_CLOCK_WORD);
+    g_m14_v9_timebase_hz = bus_hz >= 4u
+                               ? bus_hz / 4u
+                               : OPENSPM_M14_V9_DEFAULT_TIMEBASE_HZ;
+    g_m14_v9_clock_active = 0u;
+    g_m14_v9_anchor_host_ns = 0u;
+    g_m14_v9_anchor_ticks = instance->cpu.timebase;
+    g_m14_v9_sample_started = 0u;
+    g_m14_v9_sample_host_ns = 0u;
+    g_m14_v9_sample_ticks = 0u;
+    g_m14_v9_sample_retraces = 0u;
+
+    if (bridge_rebase_timebase_v9(instance, instance->cpu.timebase) != OPENSPM_OK) {
+        bridge_destroy_v8(instance);
+        *out_instance = NULL;
+        return OPENSPM_ERROR_UNSUPPORTED;
+    }
+
+    /* Install independently of the optional GX bulk service. Every CPU context,
+       including v7 scratch callbacks copied from instance->cpu, now observes the
+       same host-derived MFTB source. */
+    instance->cpu.instruction_fallback = bridge_instruction_fallback_v9;
+    bridge_log_clock_v9(instance, bus_hz);
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_run_v9(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    int result;
+
+    if (instance != NULL) {
+        (void)bridge_sync_timebase_v9(instance, &instance->cpu);
+        /* dev16's old sampler measures the execution-derived private field at
+           the end of its slice. Restart it every slice so it never emits a
+           misleading pre-dev17 sample; dev17 reports the authoritative clock
+           immediately after resynchronizing below. */
+        g_m14_v8_timing_started = 0u;
+    }
+
+    result = bridge_run_v8(opaque, soft_cycle_budget, out_exit);
+    if (result != OPENSPM_OK) return result;
+
+    if (instance != NULL) {
+        (void)bridge_sync_timebase_v9(instance, &instance->cpu);
+        bridge_timing_sample_v9(instance);
+    }
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v9(void *opaque) {
+    g_m14_v9_clock_active = 0u;
+    bridge_destroy_v8(opaque);
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev16_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev17";
+    out_api->create = bridge_create_v9;
+    out_api->run = bridge_run_v9;
+    out_api->destroy = bridge_destroy_v9;
+    out_api->query_service = bridge_query_service_v9;
+    return OPENSPM_OK;
+}

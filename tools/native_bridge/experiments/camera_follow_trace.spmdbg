@@ -1,0 +1,11 @@
+# OpenSPM M14 - read-only Mario/camera follow trace
+#
+# Canonical use: Yold Town / he2_03. Hold Mario steadily to the right for the
+# full trace. The client samples Mario plus both public US2 camera structs:
+#   camera 11 = normal 2D camera
+#   camera 5  = 3D camera
+#
+# No guest state is modified and no native rebuild is required.
+
+require_map he2_03
+camera_trace 8.0 0.05

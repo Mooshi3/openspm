@@ -1,0 +1,2995 @@
+{
+  "schema_version": 103,
+  "branch": "m14-native-execution",
+  "date": "2026-09-22",
+  "game_id": "R8PE01 revision 2 / US2 exact working binary",
+  "entry_point": "0x80006124",
+  "native_execution": true,
+  "emulator_fallback": false,
+  "current_frontier": "visible-interpolation-implemented-player-validation-pending",
+  "latest_tested_player_runs": [
+    {
+      "log": "launch(20260922-004449).log",
+      "repo_revision": "9a62bbb3d619",
+      "module": "dev138 sampled geometry/material identity probe; 60 Hz authoritative output + FIFO/vsync",
+      "result": "PASS: runs at old jittery baseline; dev137 slowdown/corruption gone; identity evidence sufficient to advance",
+      "display": {
+        "mode": "2560x1080",
+        "refresh_hz": 99.94,
+        "present_mode": "Fifo"
+      },
+      "performance": {
+        "sustained_completed_fps": "mostly 58-61/s in heavy gameplay",
+        "representative_heavy_windows": [
+          "60/1000ms: disp 5.909ms, main 5.678ms, done 5.073ms",
+          "61/1016ms: disp 5.880ms, main 5.709ms, done 5.059ms",
+          "60/1000ms: disp 5.744ms, main 5.747ms, done 5.168ms"
+        ],
+        "shutdown_present_pacing": "3574 presents; p50 17.0ms, p95 18.5ms, p99 31.5ms"
+      },
+      "identity": {
+        "startup_transition": "sample2 6/35 exact (17.1%), 29 unmatched; desired fallback behavior",
+        "sustained": "samples4-12 ~2956-3024 candidates, 99.9-100% accepted/exact",
+        "ambiguous": 0,
+        "fallback_unique": 0,
+        "hash_failures": 0,
+        "indexed": 0,
+        "caveat": "exact identities can still have huge transform-distance outliers; interpolation requires motion/discontinuity gating"
+      },
+      "player_visible": "old jittery baseline",
+      "conclusion": "dev138 accepted; advance to retained presentation/replay"
+    },
+    {
+      "log": "launch(20260921-224620).log",
+      "repo_revision": "9a009718036d",
+      "module": "dev137 live midpoint transform substitution; 60 Hz sim + FIFO/vsync",
+      "result": "REJECTED: severe producer slowdown plus cross-instance geometry corruption",
+      "performance": {
+        "representative_disp_us": "~5500-7100",
+        "representative_main_us": "~5200-6000",
+        "representative_done_us": "~55000-105000+",
+        "late_window_completed_frames_per_second": 10,
+        "late_window_done_avg_us": 88037,
+        "present_p50_us": 66000,
+        "present_p95_us": 92500,
+        "present_p99_us": 102500
+      },
+      "player_visible": [
+        "slideshow-like presentation",
+        "camera falls behind Mario",
+        "black texture flicker",
+        "house geometry cracks/separates for a frame",
+        "doors detach for several frames"
+      ],
+      "correspondence_conclusion": "old material+nearest-transform matcher can report 100% safe while visibly cross-matching objects; safe metric invalidated",
+      "root_cause": "second full build_uniform per matched draw on ~3000-draw scenes, plus insufficient draw identity",
+      "next_candidate": {
+        "name": "dev138 geometry identity probe",
+        "launcher": "M14-LLVM-INTERP-IDENTITY-RUN.cmd",
+        "behavior": "authoritative 60 Hz pixels; no second uniform build; incremental final geometry/material fingerprints; ambiguous duplicates rejected",
+        "next_after_success": "retained-scene replay with transform-only uniform patching off the producer critical path"
+      }
+    },
+    {
+      "log": "launch(20260921-215342).log",
+      "repo_revision": "4d770941dcf1",
+      "module": "dev136 transform-history pairing probe; 60 Hz simulation + FIFO/vsync",
+      "result": "broad movement/room/flip run validates high steady-state rigid-draw pairing; discontinuities naturally fall back",
+      "interpolation_probe": {
+        "periodic_samples_total": 91,
+        "post_startup_candidate_draws": 217123,
+        "post_startup_matches": 212388,
+        "weighted_match_percent": 97.82,
+        "post_startup_safe_matches": 209560,
+        "weighted_safe_percent_of_matches": 98.67,
+        "median_sample_match_percent": 100,
+        "median_sample_safe_percent": 100,
+        "indexed_matches_sampled": 0,
+        "notable_discontinuities": [
+          "frame 720: 2387 candidates vs 1 previous; effectively no cross-scene match",
+          "frame 6840: 3285 candidates, 92.8% match, 65.2% safe"
+        ]
+      },
+      "next_candidate": {
+        "name": "dev137 configurable visual midpoint transform proof",
+        "launcher": "M14-LLVM-INTERP-MIDPOINT-RUN.cmd",
+        "behavior": "still 60 Hz presentation; nearest-prior rigid draw matching; alpha=0.5 interpolated uniforms; unsafe/unmatched/indexed draws snap current",
+        "next_after_success": "retained-scene replay and display-rate presenter using configurable target FPS"
+      }
+    },
+    {
+      "log": "launch(20260921-212735).log",
+      "repo_revision": "6fb81ac17cc3",
+      "module": "dev135 half-99.943Hz cadence + FIFO/vsync",
+      "result": "player reports tearing gone and only tiny residual judder; cadence diagnostic mostly smooth",
+      "display": {
+        "mode": "2560x1080",
+        "refresh_hz": 99.94,
+        "present_mode": "Fifo",
+        "vsync": true
+      },
+      "timing": {
+        "diagnostic_vi_hz": 49.9715,
+        "conclusion": "half-display cadence materially reduces residual camera/world judder; production must restore 60 Hz simulation and interpolate presentation"
+      },
+      "next_candidate": {
+        "name": "dev136 renderer-visible transform pairing scaffold",
+        "launcher": "M14-LLVM-INTERP-PROBE-RUN.cmd",
+        "change": "60 Hz authoritative simulation + FIFO/vsync; record projection and full PN matrix palettes per draw and pair at GXCopyDisp; no synthetic frames yet",
+        "next_after_evidence": "dev137 retained-scene replay with interpolated uniform slots"
+      }
+    },
+    {
+      "log": "launch(20260920-205858).log",
+      "repo_revision": "1e9385dca860 (log-short revision)",
+      "module": "dev116 chunk512 state_mem=1 heavy_diag=0 + Mailbox presentation A/B",
+      "result": "player reports chunk512 feels maybe worse; runtime shows no callback-walk reduction and slightly worse produced-frame cadence than chunk256, so chunk512 is rejected",
+      "correctness": {
+        "state_mem": 1,
+        "chunk": 512,
+        "heavy_diagnostics": 0,
+        "renderer": "D3D12 Mailbox",
+        "conclusion": "no new guest correctness failure identified; one 1.84 s update-events stall follows a host window resize event and is not steady-state guest CPU cost"
+      },
+      "performance": {
+        "chunk512": "late seq=2/stage=1 windows roughly ~53 produced fps; typical disp+main about ~12.1 ms",
+        "chunk256_reference": "preceding comparable Mailbox run roughly ~56 produced fps; typical disp+main about ~11.6 ms",
+        "dev105_shutdown": "attempts=1499211 handled=1492747 nested_steps=34131209 step_limit_yields=62394 no_progress_yields=17740 budget_yields=61441",
+        "interpretation": "generic 256->512 LLVM chunks do not reduce the ~23 generated-step callback walk; explicit partitions/function exits dominate"
+      },
+      "next_candidate": {
+        "name": "dev117 progress-aware CPUState dispDraw nesting",
+        "launcher": "M14-LLVM-DEV117-RUN.cmd",
+        "change": "chunk256/state_mem=1/Mailbox baseline; same-PC counts as progress only when downcount becomes more negative; max nested steps 64->128; cycle quantum remains 32768",
+        "preserve": "all semantic routing/fallback/exception/miss/recursion safeguards; no callback skip/reorder"
+      }
+    },
+    {
+      "log": "20260920-120954-yold-group-baseline.log + off2/off4/off6/off7 group sweep",
+      "repo_revision": "fafb3cb1c529f082fe9dbae13ae4fd10364c427a",
+      "module": "dev113 chunk256 state_mem=0 + dev105 nesting + dev111/dev112 diagnostics",
+      "result": "Yold active-NPC cost scales progressively; no single bad townsfolk and no all-off-only threshold. Removing six clears direct NPC-owned disp callbacks and raises completed cadence into roughly 40-44/s, but fixed map/display work still prevents 60.",
+      "correctness": {
+        "benchmark": "he2_03, num=80, active=7, entries=0x8077A0A0; actors mise,mura_1,mura_2,mura_3,mura_4,mura_5,son",
+        "restore_side_effect": "player observed one reactivated purple townsfolk respawn away from home and walk back; active-bit restore can re-enter placement/pathing, so later group tests reload the room between windows"
+      },
+      "performance": {
+        "baseline": "~30 fps; median disp+main ~=16.68 ms; direct NPCEntry-owned callbacks 256/16; 0x8008533C=4800/16; nested steps/attempt ~=22.88",
+        "off2": "settled direct NPCEntry-owned callbacks 128/16; representative disp+main 14.29-15.04 ms; cadence ~30-32/s",
+        "off4": "settled direct NPCEntry-owned callbacks 64/16; disp+main ~14.48-14.94 ms; cadence ~32-33/s",
+        "off6": "direct NPCEntry-owned callbacks 0/16; disp+main ~13.24-13.87 ms; completed frames ~40-44/s; 0x8008533C remains 4800/16",
+        "off7": "direct NPCEntry-owned callbacks 0/16; representative active-window disp+main ~13.48 ms; 0x8008533C remains 4800/16",
+        "conclusion": "distributed active-NPC work costs roughly 3 ms/frame, but dominant 0x8008533C is fixed at 300 callbacks/frame and lies in the public US2 mapdrv address envelope; chunk256 did not materially reduce dev105 step count"
+      },
+      "next_candidate": {
+        "name": "dev114 chunk256 state-in-memory=1 Yold A/B + dev115 hot map callback shape census",
+        "rationale": "pinned DolRecomp state-in-memory aliases most CPUState-ABI state directly to CPUState and skips dirty materialization/reload; exact dispDraw hot site is CPUState ABI and currently walks ~23 generated blocks/callback. dev115 simultaneously classifies camera IDs and callbackParam cardinality for exact 0x8008533C without clocks or guest mutation.",
+        "test": "capture canonical yold-perf under state_mem=0 if needed; run M14-LLVM-STATE-MEM-RUN.cmd; capture M14-DEBUG-YOLD-BENCH.cmd; compare with M14-PERF-STATE-MEM.cmd"
+      }
+    },
+    {
+      "log": "20260919-235316-01-stable-baseline.log + 20260919-235323-02-stable-npc-logic-frozen.log",
+      "repo_revision": "7c4a313bcef9",
+      "module": "dev108 partition layout + dev105 dispDraw nesting + dev111/dev112 stable Yold diagnostics",
+      "result": "Yold Town he2_03 is a stable 7-NPC benchmark; NPC logic freeze does not materially change ~30-31 Hz cadence, callback counts, or phase cost",
+      "correctness": {
+        "npc_population": "num=80 active=7 entries=0x8077A0A0 stable across both 5 s windows",
+        "actors": "mise, mura_1, mura_2, mura_3, mura_4, mura_5, son",
+        "mario_motion": "while held in one direction, guest X steps are typically ~6 units/produced-frame with zero reversals; visible jitter is primarily delivery/cadence"
+      },
+      "performance": {
+        "baseline": "about 30-31 completed frames/s; disp ~6.9-7.7 ms, main ~7.7-8.5 ms",
+        "npc_logic_frozen": "about 30-31 completed frames/s; disp ~6.8-7.1 ms, main ~7.8-8.2 ms",
+        "drawdone": "producer sync sample ~2.31 ms baseline and ~2.25 ms frozen",
+        "done_bucket_interpretation": "17.5-18.7 ms includes authentic VI wait; not pure CPU",
+        "deadline_model": "disp+main ~15 ms plus DrawDone ~2.3 ms narrowly misses 16.667 ms and quantizes presentation to ~30 Hz",
+        "dev111_top_callback": "0x8008533C = 4880/16 frames = 305 per produced frame",
+        "dev112_npc_owned": "0x801B43CC=192/16 + 0x801B49A0=64/16 = 16 direct NPCEntry-owned callbacks per frame"
+      },
+      "next_candidate": {
+        "name": "dev113 chunk256 Yold deadline-recovery A/B",
+        "change": "DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS 128 -> 256 only",
+        "rationale": "dev105 still walks ~20 generated chunks/callback; Yold has ~370 dispDraw callbacks/frame and only ~1-2 ms needs recovering before first VI deadline",
+        "codegen_identity": "llvm-inline-wpar-indirect-budget-v20-dev113-chunk256-yold",
+        "module_identity": "m14-dev113-chunk256-sim0-yold",
+        "preserve": "dev107 broad native-first disabled; dev103/dev90/dev97/dev105 semantics unchanged"
+      }
+    },
+    {
+      "log": "launch(20260919-173529).log",
+      "repo_revision": "1622b99ace4c",
+      "module": "dev104 CPUState charge-aware dispDraw nesting + dev103 host filter",
+      "result": "user still reports lag; jump-into-pit repro softlocks at HP0/MOT_24 while sequence stays 2",
+      "correctness": {
+        "hp_zero": "motion=24 pos=(-1053.780,-150.000,12.500)",
+        "gameover": "no next_seq=4 observation; final_seq=2 final_next_seq=2",
+        "user_route_clarification": "successful Game Overs were walking-off deaths; failed repros were jump-into-pit deaths",
+        "conclusion": "must compare both routes in one build and observe native death-entry execution directly"
+      },
+      "dispatch": {
+        "dev104_attempts": 2961408,
+        "dev104_handled": 2961408,
+        "dev104_normal_returns": 376344,
+        "dev104_abnormal_returns": 2585064,
+        "ordinary_hostcall_sample_total": 3509371,
+        "dev87_bypassed": 1049465839,
+        "dev90_hits": 18929685,
+        "dev90_fallbacks": 0
+      },
+      "performance": {
+        "heavy_examples": [
+          "32/1017ms disp 7.175ms main 7.335ms done 17.281ms",
+          "33/1033ms disp 7.165ms main 7.305ms done 16.841ms",
+          "30/1000ms disp 8.200ms main 7.942ms done 17.197ms"
+        ],
+        "shutdown_present_pacing": "avg 20.731ms p50 17.5ms p95 34.5ms p99 35.5ms",
+        "conclusion": "dev104 one-dispatch nesting did not eliminate the heavy deadline miss"
+      }
+    },
+    {
+      "log": "launch(20260919-162912).log",
+      "repo_revision": "d9ae710d0513",
+      "module": "dev103 entry-only host filter + dev102 CPUState dispDraw nesting + retired dev100 CFG markers",
+      "result": "host-router traffic collapses and walking-off Game Over completes; jump-into-pit correctness remained unproven in this run",
+      "correctness": {
+        "hp_zero": "motion=24 at hp=0",
+        "gameover_request": "next_seq=4 observed at seqWork=2 stage=1",
+        "gameover_progression": "SEQ_GAMEOVER stages 1 through 6 observed",
+        "exit": "final_seq=1 final_next_seq=1",
+        "conclusion": "retiring dev100 may have affected correctness, but this run cannot close the jump-in softlock because it exercised a different bottomless-death route",
+        "repro_clarification": "the observed Game Over came from walking off the edge; it is not evidence that jumping into the pit works"
+      },
+      "dispatch": {
+        "dev87_bypassed": 2139203694,
+        "dev90_native_first_hits": 38294988,
+        "dev90_fallbacks": 0,
+        "ordinary_hostcall_sample_total": 7488744,
+        "production_router_ordinary": 7474560,
+        "dev102_attempts": 6338293,
+        "dev102_handled": 0,
+        "dev102_normal_returns": 0,
+        "dev102_budget_yields": 6338293,
+        "conclusion": "dev103 is a major structural win; dev102 exact-site matching also works, but its budget guard rejects 100% of CPUState callbacks before dispatch"
+      },
+      "performance": {
+        "present_interval_avg_us": 17358,
+        "present_interval_p50_us": 17000,
+        "present_interval_p95_us": 20000,
+        "present_interval_p99_us": 34000,
+        "prior_dev101_p95_us": 33000,
+        "ordinary_callback_cadence": "typically low tens of thousands/s in later heavy play; prior dev101 heavy stretches were commonly ~0.30-0.48M/s",
+        "remaining_frontier": "heavy disp/main samples still approach the VI deadline; dev104 targets the 6.34M exact dispDraw outer escapes left by dev102"
+      }
+    },
+    {
+      "log": "launch(20260919-145908).log",
+      "repo_revision": "74e6f822a570",
+      "module": "dev101 partition restore + CPUState-ABI scene attribution",
+      "result": "pit death still softlocks and heavy NPC/enemy scenes still lag; dev101 disproves partition rollback as death fix but finally identifies real callback owners",
+      "correctness": {
+        "gameover": "no request/observation; final_hp=0 final_seq=2 final_stage=1 final_next_seq=2",
+        "conclusion": "dev98 partition exclusion was not the current Game Over regression cause; dev100 generated call-owner instrumentation is retired in the next candidate"
+      },
+      "performance": {
+        "disp_hot_site": "0x8005B29C",
+        "heavy_disp_example": "target 0x8008533C intervals=450 total_us=4467 over 2 sampled frames",
+        "main_owner": "spmarioMain site 0x801A7AC8 -> seqMain 0x8017B72C",
+        "heavy_main_example": "intervals=2 total_us=21312 max_us=16447",
+        "interpretation": "display cost scales through one linked indirect callback walker; main interval is complete seq_gameMain work, not seqMain helper overhead"
+      },
+      "dispatch": {
+        "dev99_attempts": 0,
+        "dev99_interpretation": "native-ABI-only transform cannot reach measured CPUState-ABI dispDraw site",
+        "dev87_bypassed": 1126419049,
+        "dev90_native_first_hits": 23569341,
+        "dev90_fallbacks": 0,
+        "ordinary_hostcall_sample_total": 88347855,
+        "ordinary_heavy_hitter": "0x800361F0:829 (Misra-Gries sampled count; dominates residual sketch)"
+      }
+    },
+    {
+      "log": "launch(20260919-031628).log",
+      "repo_revision": "d4239388f54f",
+      "module": "dev98 entry-only synthetic cold entries + retained dev97/dev94/dev90/dev87",
+      "result": "heavy enemy/NPC scenes remain visibly laggy; Game Over still completes normally; dev98 is a performance miss",
+      "correctness": {
+        "gameover": "next_seq_gameover_observations=1; final_seq=1 final_next_seq=1",
+        "dev90_fallbacks": 0,
+        "conclusion": "dev97 correctness survives dev98"
+      },
+      "performance": {
+        "heavy_phase_examples": [
+          "31/1032ms disp 8.786ms main 7.627ms done 16.898ms",
+          "31/1032ms disp 9.078ms main 8.295ms done 15.927ms",
+          "36/1032ms disp 6.706ms main 7.120ms done 14.848ms",
+          "33/1032ms disp 7.615ms main 8.269ms done 15.392ms"
+        ],
+        "drawdone": "ordinary gameplay windows commonly ~1.8-2.0ms; old dev91 regression remains retired",
+        "conclusion": "dev98 did not materially move the heavy-scene cliff; disp+main remains the primary producer-side owner"
+      },
+      "dispatch": {
+        "dev87_bypassed": 1820840291,
+        "dev90_native_first_hits": 31221756,
+        "dev90_fallbacks": 0,
+        "ordinary_hostcall_sample_total": 128623216
+      }
+    },
+    {
+      "log": "launch(20260919-020359).log",
+      "repo_revision": "9ce180b52d98",
+      "module": "dev97 motion-bounded HP-zero cold-entry repair + dev96 observation + dev94 renderer baseline",
+      "result": "pit death now transitions to and completes Game Over; heavy-area lag remains",
+      "correctness": {
+        "hp_zero": "motion=24 at hp=0",
+        "gameover_request": "next_seq=4 observed at seqWork=2 stage=1",
+        "gameover_progression": "SEQ_GAMEOVER stages 1 through 6 observed",
+        "exit": "final_seq=1 final_next_seq=1",
+        "conclusion": "dev97 fixed a real LLVM legal-entry hole; retain"
+      },
+      "performance": {
+        "drawdone": "gameplay windows generally ~2ms after dev94",
+        "heavy_phase_examples": [
+          "35/1016ms disp 10.247ms main 6.730ms done 12.057ms",
+          "42/1016ms disp 7.174ms main 6.097ms done 10.925ms",
+          "49/1016ms disp 8.978ms main 5.767ms done 5.985ms",
+          "36/1017ms disp 7.357ms main 6.954ms done 13.929ms"
+        ],
+        "conclusion": "remaining lag is primarily native disp/main plus VI deadline misses; DrawDone regression remains fixed"
+      },
+      "dispatch": {
+        "dev87_bypassed": 1407810823,
+        "dev90_native_first_hits": 28181109,
+        "dev90_fallbacks": 0
+      }
+    },
+    {
+      "log": "launch(20260918-224450).log",
+      "repo_revision": "2d36d0c35d47",
+      "module": "dev94 CPU-cached exact snapshots + exact duplicate CP pipeline reuse + dev90/dev87 + dev95 sequence watch",
+      "result": "first area subjectively smoother; later heavy rooms still lag; pit HP reached 0 but no Mario return/game-over while process/retraces/main loop remained alive",
+      "wedding": {
+        "hang_80065128_max": 0
+      },
+      "performance": {
+        "dev94_marker": true,
+        "drawdone_examples": [
+          "avg 1.652ms p95 2.25ms at total_calls=2816",
+          "avg 2.895ms p95 3.75ms at total_calls=5376",
+          "avg 2.094ms p95 3.00ms at total_calls=6912",
+          "avg 1.947ms p95 2.75ms at total_calls=8448"
+        ],
+        "deepest_phase_examples": [
+          "31/1032ms disp 7.431ms main 7.375ms done 18.491ms",
+          "30/1000ms disp 8.506ms main 6.444ms done 18.379ms",
+          "32/1033ms disp 7.258ms main 7.416ms done 17.612ms",
+          "32/1032ms disp 7.334ms main 7.953ms done 16.973ms"
+        ],
+        "conclusion": "dev91 CPU-read regression is gone; remaining deepest cliff is primarily native disp/main workload plus ~2ms DrawDone, not mapped-staging snapshots"
+      },
+      "sequence": {
+        "host_seqset_calls": 1,
+        "host_gameover_requests": 0,
+        "only_observed_host_request": "request=3 pre_seq=5 pre_stage=0 lr=0x8017BA10",
+        "final_committed": "SEQ_GAME(2) stage 1",
+        "limitation": "host callback cannot observe direct native-to-native seqSetSeq calls; dev96 samples next_seq instead"
+      },
+      "bbox": {
+        "observed_guest_bbox_reads": true,
+        "observed_empty_sentinel": "1023,0,1023,0",
+        "conclusion": "offscreen/render-derived state is plausible enough to trace, but generic culling is not yet implicated"
+      }
+    },
+    {
+      "log": "launch(20260918-215622).log",
+      "repo_revision": "7de3e6307969",
+      "module": "dev89+dev90+dev91+dev92+dev93 player run before dev94 rollback/dev95 sequence watch",
+      "result": "still visibly laggy; heavy completed cadence ~30-31 fps against ~60 retraces; pit death/map transition softlocked while process/retraces/main loop stayed alive",
+      "wedding": {
+        "hang_80065128_max": 0
+      },
+      "performance": {
+        "completed_heavy_examples": [
+          "30/1000ms disp 7.316ms main 7.579ms done 18.446ms",
+          "31/1033ms disp 7.269ms main 7.438ms done 18.622ms",
+          "30/1000ms disp 6.605ms main 5.670ms done 21.050ms"
+        ],
+        "drawdone_heavy_examples": [
+          "avg 7.590ms p95 8.500ms",
+          "avg 8.023ms p95 9.500ms",
+          "avg 8.151ms p95 9.500ms",
+          "avg 7.799ms p95 9.250ms"
+        ],
+        "dev88_reference": "deepest DrawDone windows were roughly 3.8-4.4ms before dev91",
+        "conclusion": "dev91 mapped staging bytes are safe but are a CPU-read regression on this Windows/D3D12 path; retire dev91 and restore CPU-cached exact snapshots"
+      },
+      "dispatch": {
+        "dev87_bypassed": 942443445,
+        "dev90_native_first_hits": 23089362,
+        "dev90_fallbacks": 0,
+        "conclusion": "dispatch fast paths are mechanically healthy; do not broaden native-first to internal sampled PCs without independent restart-entry proof"
+      },
+      "gameover_softlock": {
+        "observed_sequence_path": "SEQ_MAPCHANGE(3) stage 13 -> SEQ_GAME(2) stage 1; no observed SEQ_GAMEOVER(4)",
+        "liveness": "~60 Hz retraces and spmarioMain continue; not a GPU or scheduler deadlock",
+        "dev95_next_probe": "exact US2 seqSetSeq 0x8017B834 requests + seqWork 0x804D0D60 committed seq/stage transitions"
+      }
+    },
+    {
+      "log": "launch(20260918-180757).log",
+      "repo_revision": "dev88 player run before dev89/dev90",
+      "module": "dev88 over dev87/dev85/dev82",
+      "result": "player reports definite improvement; light/medium gameplay frequently recovers to ~59-61 completed fps, deepest heavy segment still falls to ~30-33",
+      "wedding": {
+        "hang_80065128_max": 0
+      },
+      "dev88": {
+        "profiler_retired": true,
+        "drawdone_profile_lines_present": false,
+        "dev87_bypassed_host_callbacks": 514897575,
+        "production_ordinary_callbacks": 52797464,
+        "ordinary_heavy_sample": [
+          "0x8027551C:996",
+          "0x800361F0:528",
+          "0x801BBF80:7",
+          "0x80132730:4"
+        ],
+        "conclusion": "diagnostic clock retirement is a real performance win but the heaviest producer path still crosses the VI deadline"
+      },
+      "phases": {
+        "light_examples": [
+          "58/1007ms disp 0.339ms main 2.165ms done 14.444ms",
+          "61/1016ms disp 0.305ms main 1.720ms done 14.631ms",
+          "60/1000ms disp 0.631ms main 1.697ms done 14.331ms"
+        ],
+        "medium_examples": [
+          "59/1015ms disp 5.751ms main 4.913ms done 6.539ms",
+          "61/1015ms disp 5.172ms main 4.644ms done 6.825ms"
+        ],
+        "deepest_examples": [
+          "30/1000ms disp 7.991ms main 6.972ms done 18.383ms",
+          "30/1001ms disp 9.117ms main 7.425ms done 16.821ms",
+          "30/1000ms disp 9.046ms main 8.077ms done 16.202ms",
+          "31/1016ms disp 6.125ms main 6.816ms done 19.843ms"
+        ],
+        "interpretation": "deepest disp+main is roughly 13-17ms before synchronous renderer work, so a few real milliseconds decide whether the frame catches the current 16.667ms VI"
+      },
+      "drawdone_after_profiler_retirement": {
+        "medium_heavy_avg_us": "~2500-2900",
+        "deepest_avg_us": "~3800-4400",
+        "examples": [
+          "256-frame window avg 2692us",
+          "256-frame window avg 2847us",
+          "256-frame window avg 4066us",
+          "256-frame window avg 4396us"
+        ]
+      }
+    },
+    {
+      "log": "launch(20260918-170925).log",
+      "repo_revision": "498351e0e53b",
+      "module": "dev87 over dev85/dev82",
+      "result": "dev87 mechanically successful and correctness-stable, but heavy scene still misses 60 Hz deadline",
+      "wedding": {
+        "hang_80065128_max": 0
+      },
+      "dev87": {
+        "bypassed_host_callbacks": 468889861,
+        "production_ordinary_callbacks": 48393282,
+        "late_ordinary_rate_per_second": "~0.34M-0.46M/s",
+        "prior_dev86_late_rate_per_second": "~2.1M-2.9M/s",
+        "exact_budget_exit_rate_per_second": 0,
+        "conclusion": "remaining heavy-frame cliff is not primarily the ordinary LLVM->C callback crossing"
+      },
+      "phases": {
+        "light_window": "58 frames / 1015ms; disp 0.343ms; main 2.162ms; done 14.577ms",
+        "heavy_examples": [
+          "35/1016ms disp 5.886ms main 6.517ms done 16.621ms",
+          "32/1016ms disp 6.194ms main 6.519ms done 19.048ms",
+          "30/1000ms disp 8.187ms main 5.501ms done 19.649ms",
+          "31/1033ms disp 10.055ms main 6.486ms done 16.797ms"
+        ],
+        "interpretation": "disp+main grows to roughly 12-16ms and synchronous DrawDone adds roughly 3-4ms, enough to cross the 16.667ms VI deadline and wait for the following retrace"
+      },
+      "drawdone_profile": {
+        "window_frames": 256,
+        "draws": 943268,
+        "draws_per_frame": "~3684",
+        "avg_frame_draw_us": 3490,
+        "producer_sync_avg_us": 3830,
+        "guest_scan_us_total": 213274,
+        "guest_scan_us_per_frame": "~833",
+        "array_stage_us_total": 376552,
+        "array_stage_us_per_frame": "~1471",
+        "note": "temporary profile itself performs multiple steady_clock reads per draw/substage and is now a potential 1-3ms contaminant"
+      },
+      "present_call_avg_us": 211
+    },
+    {
+      "log": "launch(20260918-163035).log",
+      "repo_revision": "8896170eee29",
+      "module": "dev86 over dev85/dev84/dev82",
+      "result": "dev86 mechanically removed the two strcmp heavy hitters; user still reports visible lag; wedding remains fixed",
+      "wedding": {
+        "passed": true,
+        "hang_80065128_max": 0
+      },
+      "dev86_result": {
+        "mechanical_success": "0x8025CABC and 0x8025CAD4 no longer survive final 1/4096 ordinary heavy-hitter sample",
+        "final_ordinary_heavy": [
+          "0x8019F360",
+          "0x802750A4",
+          "0x8027551C",
+          "0x800710A0"
+        ],
+        "conclusion": "two-PC optimization is too narrow; remaining public callback traffic is diffuse"
+      },
+      "heavy_gameplay": {
+        "completed_frames_per_second": "typically ~30-32 in late heavy windows",
+        "retraces_per_second": "~60",
+        "ordinary_callback_rate_per_second": "~2.1M-2.9M late heavy gameplay",
+        "budget_exit_rate_per_second": 0,
+        "typical_phase_us": {
+          "disp": "~8-10ms",
+          "main": "~7-9ms",
+          "done": "~16ms"
+        },
+        "interpretation": "disp+main approaches/exceeds the 16.7ms VI deadline in heavy work, consistent with alternate-retrace ~30 FPS collapse"
+      },
+      "shutdown": {
+        "ordinary_callbacks": 2816258463,
+        "seam_negative_rejects": 2761324023,
+        "host_target_negative_rejects": 2810490694,
+        "direct_redirects": 1633238,
+        "direct_bl_rescues": 27142100,
+        "present_call_avg_us": 215,
+        "interpretation": "dev69 proves most ordinary callbacks cannot match immutable semantic tables, but only after LLVM has already crossed into C; dev87 targets that crossing"
+      }
+    },
+    {
+      "log": "launch(20260918-152140).log",
+      "repo_revision": "45d4595b60e6",
+      "module": "dev85 over dev84/dev82",
+      "result": "AFK repeated wedding remained live; user played at end and still reported visible lag",
+      "wedding": {
+        "passed_repeatedly": true,
+        "hang_80065128_max": 0
+      },
+      "dev85_causal_result": {
+        "exact_budget_exit_rate_per_second": 0,
+        "ordinary_callback_rate_end_gameplay": "~2.0M-4.1M/s; last-60-window mean ~2.99M/s",
+        "direct_bl_rescue_rate_end_gameplay": "last-60-window mean ~12.1k/s",
+        "conclusion": "voluntary LLVM budget exits are not manufacturing the ordinary callback storm; dev83/dev84 causal model falsified"
+      },
+      "phase_result": {
+        "completed_main_loop_frames_end_gameplay": "last-60-window weighted ~33.0/s",
+        "typical_end_gameplay_us": {
+          "disp": "~7.4ms",
+          "main": "~8.0ms",
+          "done": "~15.8ms"
+        },
+        "telemetry_note": "dev81 phase-2 native hook plus dev50 host-first callback both advance the legacy spmarioMain cadence counter, so ~60 spmarioMain hits/s is approximately double-counted and must not be read as 60 completed game frames"
+      },
+      "dispatch_totals": {
+        "ordinary_callbacks": 7800734436,
+        "direct_bl_rescues": 72294205,
+        "region_queries": 3108611,
+        "hot_ordinary_sample_rate": 4096,
+        "hot_ordinary_survivors": [
+          "0x8025CABC",
+          "0x8025CAD4"
+        ]
+      },
+      "renderer": {
+        "final_present_interval_cumulative_p50_us": 32500,
+        "present_call_avg_us": 203,
+        "interpretation": "host Present() call itself remains cheap; completed frame cadence tracks the ~30-33 Hz main-loop frontier rather than a blocking ~30ms Present() call"
+      }
+    },
+    {
+      "log": "launch(20260918-020807).log",
+      "repo_revision": "27741ce34475",
+      "module": "dev79",
+      "result": "wedding remains fixed; BL rescue storm mostly collapsed; heavy gameplay still visibly laggy",
+      "wedding": {
+        "passed": true,
+        "hang_80065128_max": 0
+      },
+      "heavy_cadence": {
+        "typical_spmarioMain_updates_per_second": "28-31 in worst heavy segment; later 34-58 depending scene",
+        "typical_retraces_per_second": "60-62"
+      },
+      "renderer": {
+        "draw_done_avg_us_heavy": "~2000-3500",
+        "present_call_avg_us": 214
+      },
+      "dispatch": {
+        "ordinary_callbacks": 691331701,
+        "direct_redirects": 209046,
+        "region_queries": 298948,
+        "direct_bl_rescues": 3374898,
+        "post_mtmsr_tails": 837238
+      },
+      "conclusion": "dev79 BL source repair is not the missing 2x; stop source-by-source rescue optimization"
+    },
+    {
+      "log": "launch(20260918-005733).log",
+      "repo_revision": "b25484ad1818",
+      "module": "dev78 over dev77",
+      "result": "wedding passed repeatedly; later gameplay still visibly laggy and Mario jittery; spinner invisibility did not reproduce and is now understood as temporary frozen-sprite/offscreen renderer behavior",
+      "wedding": {
+        "passed": true,
+        "hang_80065128_max": 0
+      },
+      "heavy_cadence": {
+        "typical_spmarioMain_updates_per_second": "30-33 with transitions through 40-50 and occasional 60",
+        "typical_retraces_per_second": "60-62",
+        "interpretation": "simulation still misses alternate VI deadlines in heavier work"
+      },
+      "renderer": {
+        "draw_done_avg_us_heavy": "~4000-4500",
+        "draw_done_p95_us_heavy": "~4750-5250",
+        "present_call_avg_us": 208,
+        "interpretation": "renderer contributes but remains far too small to explain the full 2x simulation loss"
+      },
+      "dispatch": {
+        "ordinary_callbacks": 8302861214,
+        "direct_bl_rescues": 71814647,
+        "post_mtmsr_tails": 10272863,
+        "rescue_sample_rate": 4096,
+        "rescue_heavy": [
+          {
+            "source": "0x80D1F414",
+            "target": "0x802543F4",
+            "sample_count": 6687,
+            "note": "long AFK wedding-heavy aggregate"
+          },
+          {
+            "source": "0x80086848",
+            "target": "0x8012191C",
+            "sample_count": 1704,
+            "note": "main-DOL source"
+          }
+        ]
+      }
+    },
+    {
+      "log": "launch(20260916-234042).log",
+      "repo_revision": "d0e77177b78a",
+      "module": "dev68",
+      "result": "much better per user; ~60 Hz opening but heavy scenes ~30 with jitter/slow enemies",
+      "weighted_updates_per_second": 37.0921,
+      "cadence_windows": 141,
+      "runnable_resumes": 3087,
+      "idle_sleep_us": 57554913,
+      "slice_wall_us": 144387423,
+      "seam_comparisons": 4044271426,
+      "host_comparisons": 2554914909,
+      "hang_80065128_max": 0
+    },
+    {
+      "log": "launch(20260916-232035).log",
+      "repo_revision": "451c2bf77c48",
+      "module": "dev67",
+      "result": "playable but laggy; no stationary 0x80065128 samples in this run",
+      "cadence": {
+        "windows": 152,
+        "weighted_updates_per_second": 27.5166,
+        "weighted_retraces_per_second": 59.8993,
+        "common_updates_per_second": "30, later 20"
+      },
+      "finish_completions": 4260,
+      "finish_snapshots_with_runqueue_0x8000": 4260,
+      "present_count": 4261,
+      "present_interval_avg_us": 36448,
+      "present_call_avg_us": 217,
+      "slice_wall_us": 155644000,
+      "slice_calls": 110468,
+      "hang_80065128_max": 0,
+      "interpretation": "All finish completions make real guest work runnable, but the old pre-deadline wait checks only persistent idle PC. Windows clock() data includes sleeping; old heavy-pair estimates have unreported inherited error."
+    },
+    {
+      "log": "launch(20260916-225937).log",
+      "repo_revision": "a7211f167194",
+      "path": "wedding cutscene AFK",
+      "result": "normal ~30/60 simulation/retrace cadence until update ~3404, then guest liveness stalled indefinitely at exact PC 0x80065128 while VI remained healthy",
+      "stationary_frontier": {
+        "pc": "0x80065128",
+        "lr": "0x80064E34",
+        "ctr": "0x80064E00",
+        "msr": "0x0000A032",
+        "seq": 2,
+        "stage": 1,
+        "exception": 0,
+        "program_exception": 0,
+        "write_gather_bytes_fixed": 98191937,
+        "steady_slice_guest_cycles": 65536,
+        "retrace_behavior": "about 60 Hz throughout stationary period",
+        "native_fault_capture": "no WinDbg second-chance/native exception captured",
+        "interpretation": "guest/native execution liveness loop, not an Aurora/D3D crash; do not patch over the PC without decoding local instructions/state"
+      }
+    },
+    {
+      "log": "launch(20260916-230527).log",
+      "repo_revision": "a7211f167194",
+      "path": "long gameplay run with Binding of Isaac closed",
+      "result": "playable and broadly correct but still visibly laggy; dev66 router cache mechanically effective without meaningful simulation-rate recovery",
+      "cadence": {
+        "typical_spmarioMain_updates_per_second": "30-31",
+        "typical_retraces_per_second": "60-62",
+        "interpretation": "still roughly half desired simulation cadence in common gameplay despite router collapse"
+      },
+      "dev66_decision_stats": {
+        "callbacks": 528935935,
+        "bypass_hits": 526080775,
+        "delegate_hits": 2599704,
+        "misses": 255456,
+        "bypass_inserts": 238744,
+        "delegate_inserts": 16712,
+        "collisions": 246393,
+        "changed_false": 0,
+        "forced_dynamic": 4036
+      },
+      "dev58_admission_stats": {
+        "queries": 191120,
+        "cache_hits": 0,
+        "misses": 108834,
+        "inserts": 108583,
+        "collisions": 104122,
+        "bypasses": 68166,
+        "v19_blocks": 0,
+        "permits": 14120,
+        "begin_pre_post": "3530/3530",
+        "end_pre_post": "3530/3530"
+      },
+      "production_router_stats": {
+        "region_queries": 177000,
+        "ordinary": 2841040,
+        "direct_redirects": 118741,
+        "bl_rescues": 2024012,
+        "seam_lookup_calls": 2656285,
+        "seam_lookup_comparisons": 21583617,
+        "host_lookup_calls": 2674132,
+        "host_lookup_comparisons": 15948450,
+        "host_targets": 40,
+        "hosted_callsites": 383
+      },
+      "ordinary_hostcall_sample": {
+        "total_underlying_dev58_callbacks": 2855160,
+        "sample_rate": 4096,
+        "interpretation": "underlying router fell from ~503M dev65 ordinary callbacks to ~2.85M, proving dev66 removed almost all router work"
+      },
+      "renderer_observation": {
+        "present_call_avg_us": 211,
+        "draw_done_producer_typical_us": "roughly 2.8-3.2 ms in heavy windows",
+        "interpretation": "renderer/present work remains too small to explain the missing ~16 ms simulation budget by itself"
+      }
+    }
+  ],
+  "dev63_result": {
+    "status": "retain",
+    "effect": "generated LLVM inline positive admission cache removed the previous billion-scale native-region callback storm",
+    "performance_conclusion": "important optimization but insufficient by itself"
+  },
+  "dev64_result": {
+    "status": "retired",
+    "implementation_commit": "47e2873c36c014389ae6b37bd524701d4d462713",
+    "strcmp_entry": "0x8025C9C8",
+    "effect": "exact bounded host strcmp specialization executed tens of millions of calls but simulation remained ~30 Hz",
+    "retain_host_specialization": false
+  },
+  "dev65_result": {
+    "status": "retain exact chunk128/indexed objects for current measurement, but chunk change alone was insufficient",
+    "chunk_instructions": 128,
+    "dispatch_lookup": "indexed",
+    "resume": true,
+    "runtime_module_version": "m14-dev65-llvm-chunk128-dispatch-ab",
+    "architectural_discovery": "pinned DolRecomp public dispatcher invokes ppc_host_call before dolrecomp_call_original on materialized public dispatch addresses"
+  },
+  "dev66_result": {
+    "status": "RETIRED",
+    "implementation_commit": "eb3d34c65a9104bc6230222a4dcbe46bf329462f",
+    "runtime_module_version": "m14-dev66-llvm-ordinary-decision-cache",
+    "mechanical_success": "526080775 of 528935935 callbacks bypassed; underlying production ordinary callbacks collapsed from ~503M to 2841040",
+    "performance_result": "typical isolated gameplay still ~30-31 spmarioMain/s vs 60-62 retraces/s; no meaningful move toward 60 Hz simulation",
+    "correctness_risk": "false/no-immediate-state-change is not proof of permanent non-semantic behavior; wedding AFK build later entered long stationary 0x80065128 liveness loop",
+    "causality_note": "current log does not prove dev66 caused the wedding loop; dev67 safe-semantics A/B will distinguish regression from pre-existing path",
+    "policy": "do not restore or add exclusions to speculative ordinary-PC decision cache; router cleanup may be revisited later with a compiler/static semantic-priority design"
+  },
+  "dev67": {
+    "implementation_commit": "454317db0fc16260914c36ef0681a9a33f5f97eb",
+    "handoff_commit": "7007c184f71820082eaec35696db4d45f92d6e22",
+    "runtime_module_version": "m14-dev67-llvm-safe-slice-profiler",
+    "bridge_file": "tools/native_bridge/legacy_c_adapter_v42.c.in",
+    "ordinary_hostcall_cache": false,
+    "semantics": "exact v41/dev58/dev50 ordinary host routing restored; dev63 generated positive native-region cache retained",
+    "llvm_objects_changed": false,
+    "chunk_instructions": 128,
+    "run_profiler": {
+      "frequency": "once per public native run slice",
+      "clock": "Historical C clock(): Windows wall time with 1 ms granularity, NOT CPU time. Replaced by host monotonic clock in dev68.",
+      "metrics": [
+        "slice calls",
+        "aggregate/average/max elapsed microseconds",
+        "duration bins <=250/500/1000/2000/4000/>4000 us",
+        "8-slot weighted heavy sketch keyed by exact start_pc/end_pc"
+      ]
+    },
+    "stationary_diagnostic": {
+      "target_pc": "0x80065128",
+      "thresholds_consecutive_slices": [
+        64,
+        1024
+      ],
+      "captures": [
+        "PC/LR/CTR/CR/XER/MSR/downcount",
+        "nine runtime player PPC words centered on target PC",
+        "GPR3-GPR12 and GPR29-GPR31"
+      ],
+      "mutation": false,
+      "proprietary_data_policy": "runtime local log only; no Nintendo instruction bytes committed"
+    },
+    "success_criteria": [
+      "wedding cutscene no longer stalls under restored exact host semantics",
+      "normal close emits dev67 slice stats",
+      "heavy slice pairs identify a concrete native execution target or show broadly distributed cost",
+      "no regression in input/v19 GX/hosted services/scheduler/game-over"
+    ],
+    "if_wedding_still_hangs": "decode emitted local instruction/register snapshot around 0x80065128; do not synthesize sequence state or arbitrary PC skip",
+    "if_wedding_fixed_but_cadence_30": "Superseded by dev68 live RunQueueBits idle-wake diagnosis; retest repaired scheduler before selecting CPU optimization targets.",
+    "if_slice_cost_broad": "move to host CPU profiler/PGO and protected generated-C vs corrected LLVM apples-to-apples benchmark"
+  },
+  "performance_gate": {
+    "accepted_baseline": "dev139 player-tested retained-XFB presenter; reported 58-61 completed Wii frames/s gameplay envelope",
+    "current_question": "Does cacheable preparation plus visible copy-boundary replay preserve source throughput and produce correct smoother scrolling?",
+    "runtime_test_pending": [
+      "dev140b (blocked by dev140a regression)"
+    ],
+    "required_next_steps": [
+      "Run M14-LLVM-INTERPOLATED-RUN.cmd in the same normal scene",
+      "Check source FPS, prep stage costs, accepted/fallback and fractional-selected counts",
+      "Use identity third argument if image corruption occurs",
+      "Compare async-presenter baseline and test flips/transitions/resize"
+    ]
+  },
+  "graphics_frontier": {
+    "protected_v19_begin_hook_proven_under_llvm": true,
+    "protected_v19_end_hook_proven_under_llvm": true,
+    "known_good_milestone": "a928d97de420c23600c5cdc72013c159670cca7f",
+    "spinner_sprite_behavior": "temporary only: spinner intentionally freezes Mario sprite; renderer may show nothing if frozen representation was offscreen at transition entry; did not reproduce in dev78 run",
+    "spinner_priority": "low; renderer transition/capture semantics, not guest actor deletion or permanent visibility state",
+    "do_not_revert": "protected v19 GXData/CPU-shadow semantics"
+  },
+  "preserve": [
+    "no emulator/general PPC interpreter fallback",
+    "player-owned Nintendo code/assets only",
+    "dev68 live runnable-idle wake; dev67 safe host semantics; dev66 speculative ordinary-PC cache stays retired",
+    "current LLVM candidate: chunk256, state_mem=1, heavy_diag=0; retain dev103 filtering and later scheduler/input fixes",
+    "dev63 inline positive native-region admission cache",
+    "dev62 bounded display-list caller continuation policy",
+    "dev61 bounded GX continuation policy",
+    "dev58 positive admission cache semantics",
+    "dev57 address-taken native entry census",
+    "dev53 HOME admission correction",
+    "dev50 lean semantic router",
+    "dev55 indirect budget guard",
+    "deterministic relF/BSS",
+    "real GX finish handler completion",
+    "exact guest-array snapshot coherency",
+    "dev27 pressed-edge-until-consumed input semantics",
+    "frame-latched KPAD/WPAD",
+    "fixed-phase 60 Hz retrace",
+    "v19 graphics milestone"
+  ],
+  "next_player_test": {
+    "order": [
+      "M14-LLVM-INTERP-REPLAY-PREP-RUN.cmd",
+      "M14-LLVM-INTERP-REPLAY-ENCODE-RUN.cmd"
+    ],
+    "rule": "run dev140a first; only move to dev140b if prep contracts/build/runtime are stable and producer cost is acceptable",
+    "no_actions": true,
+    "cache_wipe": false,
+    "audit": "docs/archive/M14-DEV140-AUDIT-2026-09-22.md"
+  },
+  "ci_status": {
+    "github_actions": "minutes exhausted",
+    "authoritative_gate": "local M14-LLVM-UPDATE-RUN.cmd"
+  },
+  "dev68": {
+    "runtime_module_version": "m14-dev68-llvm-runnable-idle-wake",
+    "handoff": "docs/archive/M14-LLVM-DEV68-RUNNABLE-IDLE-WAKE-2026-09-16.md",
+    "status": "player-confirmed major improvement and ~60 Hz opening; heavy-scene lag remains",
+    "root_cause": "v7 treated idle PC as proof of no runnable threads after the PE finish handler set RunQueueBits, parking runnable work until VI",
+    "repair": "LLVM-only live mapped/aligned RunQueueBits read at r13-29552; skip idle sleep if nonzero and run native scheduler without guest-state mutation",
+    "generated_c_changed": false,
+    "llvm_objects_changed": false,
+    "ordinary_hostcall_cache": false,
+    "vi_deadlines_changed": false,
+    "guest_state_fabricated": false,
+    "validation": {
+      "production_c_idle_regression": "PASS: old 120 vs repaired 239 frames over 4 synthetic seconds; empty/mapped/runnable/non-idle/EE/deadline/first-arm cases",
+      "llvm_pipeline_contracts": "PASS",
+      "bridge_syntax": "PASS: full LLVM v42 and generated-C v13, pinned DolRecomp CPU header plus synthetic generated metadata; GCC C11",
+      "existing_event_contract": "pre-existing FAIL: historical dev26 version assertion against untouched dev27 backend",
+      "windows_dll_link": "not performed here",
+      "gameplay_fps": "~60 Hz opening, heavy scenes ~30; aggregate 37.09 Hz across mixed scenes"
+    },
+    "profiler": "host monotonic wall time; separate sleep/resume counts; weighted PC sketch prints estimate and error, not fake exact attribution",
+    "finish_logging": "first eight and powers of two, plus failures/totals"
+  },
+  "dev69": {
+    "status": "implemented and synthetic tests passed; player runtime untested",
+    "runtime_module_version": "m14-dev69-llvm-static-address-filters",
+    "mechanism": "two 2 KiB conservative filters of immutable address-table membership; collisions use exact lookup",
+    "dynamic_callback_bypass": false,
+    "llvm_objects_changed": false,
+    "guest_state_changed": false,
+    "validation": "production lookup functions vs reference on >1M addresses, all targets, forced collisions and boundary cases; dev68 scheduler regression; full LLVM bridge syntax check",
+    "next": "measure same heavy scene; if insufficient use host CPU/frame-phase profiling, not further speculative router optimization"
+  },
+  "dev77": {
+    "status": "CONFIRMED",
+    "repair": "promote proven external resume PC 0x80065128 to a real LLVM partition entry after verifying wedding loop shape/backedge",
+    "result": "complete wedding passes; latest dev78 long run repeated wedding multiple times with hang_80065128_max=0"
+  },
+  "dev78": {
+    "status": "retain",
+    "repair": "active compiler base restored to pre-dev72/dev76 state-spill experiments while preserving dev77 structural entry",
+    "performance_result": "no material heavy-scene improvement; gameplay still ~30-33 updates/s in heavy windows",
+    "diagnostic": "1/4096 direct-BL rescue source->target Misra-Gries sampler identified two dominant exact PCs"
+  },
+  "dev79": {
+    "status": "TESTED / RETAIN FOR CORRECTNESS, NOT PRIMARY PERF PATH",
+    "policy": "measured-hot-source-plus-bounded-continuation",
+    "hot_sources": [
+      {
+        "source": "0x80D1F414",
+        "target": "0x802543F4",
+        "name": "openspm_dev79_hot_bl_source_80d1f414"
+      },
+      {
+        "source": "0x80086848",
+        "target": "0x8012191C",
+        "name": "openspm_dev79_hot_bl_source_80086848"
+      }
+    ],
+    "verification": "generation reads private combined main-DOL+relF image and fails closed unless each source is executable direct BL and decodes to the sampled executable target",
+    "semantics": "real BL executes natively; no HLE, skipped call, guest-state mutation or blanket call partitioning",
+    "expected_marker": "LLVM dev79 direct-BL native-entry repair",
+    "rescue_correlation": "~1 host-second deltas of g_m14_dev50_bl_rescues emitted from the run-slice wrapper, outside host-call hot path; compare with nearby simulation cadence",
+    "result": "rescues 71.8M -> 3.37M but worst heavy gameplay remains ~28-31 updates/s vs 60-62 retraces/s"
+  },
+  "dev80": {
+    "status": "RETIRED FROM ACTIVE BUILD AFTER TWO EARLY-BOOT ZERO-PROGRESS REGRESSIONS",
+    "goal": "remove LLVM->C public host callback only for exact PCs statically proven legal native entries and not host-priority semantic boundaries",
+    "policy": "exact packed 2-bit per-instruction policy; bit0 proven legal native entry, bit1 semantic host priority; structural map entries are not automatically host semantic",
+    "learned_cache": false,
+    "fail_closed": "native-first only for proven legal entry without host-priority; native lookup failure immediately retries unchanged host callback/rescue",
+    "final_architecture_note": "if effective, upstream/refactor into first-class DolRecomp/OpenSPM dispatch policy rather than permanent generated-manifest rewriting",
+    "semantic_host_priority": [
+      "platform/service targets",
+      "hosted direct-call seams",
+      "relF allocation/BSS state-machine boundaries",
+      "GXBeginDisplayList/GXEndDisplayList",
+      "HOME call/callee",
+      "DSP first-task wait completion",
+      "post-MTMSR interrupt helper tails"
+    ],
+    "structural_native_entries": [
+      "dev77 wedding/restart partition",
+      "scheduler/context reentries",
+      "return continuations",
+      "dev79 measured direct-BL source partitions",
+      "frame-phase entries under dev81"
+    ],
+    "validation": "generation + module builder + CMake require openspm_local_llvm_dispatch_priority.h and patched generated.c policy markers; synthetic policy and generated-tree tests wired into pipeline preflight",
+    "build_preflight_correction": {
+      "observed_error": "generated manifest address host/native pair count 0, expected 1",
+      "root_cause": "DolRecomp LLVM emit_dispatch_helpers writes dolrecomp_call into generated.h; generated.c only lists native objects",
+      "correction": "patch_dispatch_header(generated.h); validate policy markers in generated.h and object list in generated.c",
+      "runtime_semantics_changed": false
+    },
+    "boot_freeze_correction": {
+      "tested_revision": "e347626e8025309db4762c774ee1104385925842",
+      "log": "launch(20260918-040831).log",
+      "stationary_pc": "0x8026CA60",
+      "signature": "PC/LR stationary, no exception, no hostcall, no region query, 65,536 zero-progress top-level dispatches per slice",
+      "root_cause": "static dev80 legal-entry reconstruction included compiler FALLBACK region leaders; LLVM emitColdEntry excludes fallback terminators even when containing chunk lookup succeeds",
+      "correction": "parse player-generated <game>_fallbacks.csv after DolRecomp generation and subtract compiler-reported fallback PCs from native-first legal set",
+      "address_specific": false,
+      "synthetic_regression": "native-looking mapped fallback PC must not retain FLAG_NATIVE_ENTRY",
+      "expected_generation_fields": [
+        "legal_before_fallbacks",
+        "fallback_blocks",
+        "fallback_removed",
+        "legal_entries"
+      ]
+    },
+    "retirement_reason": "native-first top-level dispatch bypassed proven host-first migration semantics; repeated PC=LR=0x8026CA60 with last_hostcall=0 and no region query"
+  },
+  "dev81": {
+    "status": "PLAYER-PROFILED / retain",
+    "codegen_provenance": "llvm-inline-wpar-indirect-budget-v8-dev85-budgetcounter",
+    "phase_entries": {
+      "before": "0x801A8A9C",
+      "disp": "0x801A7D1C",
+      "main": "0x801A7AAC",
+      "done": "0x801A8B64"
+    },
+    "semantics": "host-only phase-id call at exact LLVM block entry; persistent bridge instance used only for host clock/log plumbing; no guest CPUState materialization requested; phase 2 also advances existing spmarioMain cadence counter",
+    "expected_log": "M14 main-loop phases host_ms=... frames=... before_avg_us=... disp_avg_us=... main_avg_us=... done_avg_us=...",
+    "telemetry_correction": "Under active host-first dispatch, the legacy public callback at phase 2 and the dev81 native phase-2 helper both call openspm_m14_note_spmario_main_v20. Therefore the standalone simulation-cadence spmarioMain count is roughly double-counted. Use M14 main-loop phases frames/host_ms for completed-frame cadence."
+  },
+  "dev82": {
+    "status": "PLAYER-CONFIRMED host-first correctness path; retain",
+    "active_dispatch": "exact dev79 host-first generated dispatcher",
+    "restored_files": [
+      "tools/native_bridge/generate_local_llvm.py",
+      "tools/native_bridge/build_local_llvm_module.py",
+      "tools/native_bridge/validate_llvm_generated.py",
+      "tools/native_bridge/CMakeLists.txt"
+    ],
+    "retained": "dev81 native frame-phase profiler; dev84 changes only legacy x86 SJLJ yield quantum, not dispatch order",
+    "dev80_active_imports_or_requirements": false,
+    "expected_boot_gate": "progress past 0x8026CA60 with historical host-first router semantics"
+  },
+  "dev83": {
+    "status": "CAUSAL HYPOTHESIS FALSIFIED BY DEV85; 4096 waypoint superseded",
+    "handoff": "docs/archive/M14-LLVM-DEV83-GUARD-QUANTUM-HANDOFF-2026-09-18.md",
+    "evidence": {
+      "dev79_log": "launch(20260918-020807).log",
+      "ordinary_callbacks": 691331701,
+      "input_frames": 14303,
+      "estimated_seconds_at_60hz": 238.383,
+      "estimated_ordinary_callbacks_per_second": 2900084,
+      "upstream_legacy_guard_cycles": 256,
+      "implied_guest_cycles_per_second": 742421515,
+      "interpretation": "Historical correlation only. dev85 directly measured zero voluntary budget exits while ordinary callbacks remained in the millions/s, so the 256-cycle guard was not the callback source.",
+      "hot_pcs": [
+        "0x8025CABC",
+        "0x8025CAD4"
+      ],
+      "symbol_context": "R8PE01 US2 strcmp=0x8025C9C8, strncmp=0x8025CAE4; both hot PCs lie inside strcmp"
+    },
+    "change": {
+      "old_guard_cycles": 256,
+      "new_guard_cycles": 4096,
+      "scope": "native_abi_ && cold_escapes_ && intrinsic_escapes_ only",
+      "scalar_guard": true,
+      "dynamic_indirect_guard": true,
+      "dispatch_order_changed": false,
+      "semantic_host_callbacks_bypassed": false,
+      "outer_bridge_soft_budget_changed": false
+    },
+    "expected": "~16x fewer voluntary budget-exit/public-dispatch crossings; old ~2.9M/s -> ~181k/s if guard exits dominate",
+    "provenance": "llvm-inline-wpar-indirect-budget-v6-dev83-guard4096"
+  },
+  "dev84": {
+    "status": "player-tested indirectly under dev85; 32768-cycle guard remains active but is not the observed ordinary-callback source",
+    "handoff": "docs/archive/M14-LLVM-DEV84-GUARD-QUANTUM-HANDOFF-2026-09-18.md",
+    "basis": "dev79 measured ~2.9M ordinary callbacks/s; 256-cycle guard implies ~742M guest cycles/s, essentially Broadway scale",
+    "change": {
+      "old_guard_cycles": 256,
+      "new_guard_cycles": 32768,
+      "scope": "native_abi_ && cold_escapes_ && intrinsic_escapes_ only",
+      "scalar_guard": true,
+      "dynamic_indirect_guard": true,
+      "dispatch_order_changed": false,
+      "semantic_host_callbacks_bypassed": false,
+      "outer_bridge_soft_budget_cycles": 200000
+    },
+    "rationale": "4096 would still predict ~181k voluntary dispatcher crossings/s; 32768 predicts ~22.7k/s while retaining roughly six inner yields per 200k outer run and ~45us guest-time quantum at 729MHz",
+    "expected": "Falsified as a callback-collapse mechanism by dev85 exact counter; keep only until a later cleanup/reversion A/B because it is not driving the current frontier.",
+    "provenance": "superseded provenance only by dev85 telemetry; guard remains 32768"
+  },
+  "dev85": {
+    "status": "PLAYER-TESTED / causal model resolved",
+    "handoff": "docs/archive/M14-LLVM-DEV85-BUDGET-EXIT-TELEMETRY-2026-09-18.md",
+    "semantics": "observation only; generated legacy x86 SJLJ budget-exit edge increments player-local uint64 through exported pointer; no guest state/control input",
+    "guard_cycles": 32768,
+    "outer_bridge_budget_cycles": 200000,
+    "cadence_fields": [
+      "ordinary_rate_per_s",
+      "budget_exit_rate_per_s"
+    ],
+    "interpretation": {
+      "budget~=ordinary": "voluntary guard exits dominate public dispatch",
+      "budget<<ordinary": "another native escape path dominates public dispatch",
+      "both_low_cadence_low": "dispatch churn is not the remaining frame owner; use dev81 phase timings"
+    },
+    "provenance": "llvm-inline-wpar-indirect-budget-v8-dev85-budgetcounter",
+    "result": {
+      "log": "launch(20260918-152140).log",
+      "budget_exit_rate_per_s": 0,
+      "ordinary_rate_per_s": "~2-4M/s in end gameplay",
+      "conclusion": "budget guard exits are not the ordinary callback storm; move to exact measured dispatcher fast path"
+    }
+  },
+  "dev86": {
+    "status": "implemented / player test pending",
+    "tool": "tools/native_bridge/apply_llvm_hot_ordinary_fastpath.py",
+    "hot_pcs": [
+      "0x8025CABC",
+      "0x8025CAD4"
+    ],
+    "motivation": "dev85 1/4096 ordinary heavy-hitter sample retained these two strcmp-internal PCs while exact budget exits stayed zero",
+    "scope": "only these two exact public-dispatch addresses attempt dolrecomp_call_original before ppc_host_call",
+    "fail_closed": "if native lookup returns false, the unchanged historical host-first call then runs, followed by the unchanged native retry",
+    "generation_proofs": [
+      "both PCs executable in the player-owned combined codegen DOL",
+      "neither PC is an LR-writing linked transfer",
+      "neither PC collides with platform host targets, semantic map rows, GX/HOME/DSP/post-MTMSR/frame-phase exact coordinates"
+    ],
+    "broad_native_first": false,
+    "dev80_policy_reactivated": false,
+    "proprietary_bytes_persisted": false
+  },
+  "dev89": {
+    "status": "implemented / player A-B pending",
+    "tool": "renderer/aurora/apply_guest_array_hotpath_v2_patch.py",
+    "cmake_integration": true,
+    "motivation": "dev87 profiler measured guest-array staging/cache ~1.47ms/frame and guest-index scan ~0.83ms/frame; dev88 proved only a narrow deadline margin remains",
+    "changes": [
+      "replace per-stage unordered_multimap nodes with 2048 fixed frame-local bucket heads and stage-vector index chains",
+      "retain exact source pointer/stride/snapshot-size/byte memcmp validation before reuse",
+      "derive vertex record layout once per draw",
+      "ordinary one-index guest attributes track min/max index then compute interval once",
+      "NBT3 retains exact per-slice interval computation"
+    ],
+    "semantic_nonchanges": [
+      "no visibility-epoch shortcut",
+      "no snapshot hash substitution for memcmp",
+      "no GXInvalidateVtxCache change",
+      "no CP base change",
+      "no draw merge/FIFO/presentation/retrace change"
+    ],
+    "rollback_rule": "any visual/door/spinner regression means remove only dev89; do not accept graphics changes as a performance tradeoff"
+  },
+  "dev90": {
+    "status": "implemented / player A-B pending",
+    "tool": "tools/native_bridge/apply_llvm_hostcall_prefilter.py",
+    "exact_native_first_entries": [
+      "0x8027551C openspm_scheduler_idle_reentry",
+      "0x80D1F414 openspm_dev79_hot_bl_source_80d1f414",
+      "0x80086848 openspm_dev79_hot_bl_source_80086848"
+    ],
+    "broad_native_first": false,
+    "dev80_reactivated": false,
+    "fail_closed": "dolrecomp_call_original gets first attempt only for exact three entries; lookup refusal increments fallback counter then runs unchanged dev87 host-first route",
+    "generation_proofs": [
+      "exact expected map row exists",
+      "entry is executable",
+      "entry does not collide with semantic map rows/platform host targets/retained exact host semantics",
+      "two BL sources still decode to measured executable targets",
+      "scheduler-idle entry is not an LR-writing transfer"
+    ],
+    "telemetry": {
+      "startup": "M14 LLVM dev90 exact structural native-first active:",
+      "shutdown": "M14 LLVM dev90 structural native-first stats hits=... fallbacks=..."
+    },
+    "note": "0x800361F0 remains host-routed despite being sampled hot; no independent proof exists yet"
+  },
+  "latest_blocked_attempt": {
+    "repo_revision": "95ca96e4e50296c9300a35fe3d61ff875d24f8bd",
+    "stage": "LLVM 2/7 source-only native-pipeline contracts",
+    "error": "test_dev94_cpu_snapshot_restore_transform synthetic fixture retained an extra fake dev91 alias signature comment after the real alias log block was removed, so the production fail-closed residue check correctly rejected the fixture",
+    "interpretation": "test-fixture bug only; no CMake configure, Aurora cache mutation, renderer compile, LLVM generation or gameplay launch occurred",
+    "repair_commit": "4c4246416ebb9155d6e6f50dbd8ff0f026cfeacf",
+    "repair": "remove the unrealistic duplicate top-of-file alias marker; assert the dev91 fixture contains the alias signature exactly once before rollback; keep production residue detection strict",
+    "rerun": "M14-LLVM-UPDATE-RUN.cmd",
+    "cache_wipe": false
+  },
+  "dev91_result": {
+    "status": "RETIRED_FROM_ACTIVE_CANDIDATE",
+    "reason": "player A/B on 7de3e630 Windows/D3D12 increased sustained DrawDone producer work from dev88 ~3.8-4.4ms deepest to commonly ~6-8ms, consistent with expensive CPU reads from mapped upload/staging memory",
+    "replacement": "dev94 exact CPU-cached snapshot restore"
+  },
+  "dev94_result": {
+    "status": "ACTIVE TEST CANDIDATE",
+    "effect": "restores frame-local CPU-cached exact guest-array snapshots while retaining dev89 fixed buckets/scan plan and dev92 timing retirement",
+    "semantics": "exact pointer/stride/size/byte memcmp reuse; no epoch/hash shortcut; guest mutation visibility unchanged"
+  },
+  "exact_cp_pipeline_reuse": {
+    "status": "ACTIVE TEST CANDIDATE",
+    "patch": "renderer/aurora/apply_cp_duplicate_pipeline_patch.py",
+    "effect": "exactly unchanged raw CP array-base mapping restores pre-command dirty mask instead of injecting redundant DirtyPipeline; all nonduplicate paths retain historical dirtiness",
+    "validation": "actual Aurora sources compiled; 2304 decoder dirty/mapping cases passed; LLVM pre-launch proof now requires regs.cpp marker/table/restore shape",
+    "gameplay_result": "pending"
+  },
+  "dev95_sequence_watch": {
+    "status": "SUPERSEDED AS SOLE DIAGNOSTIC / retained as secondary host-callback observation",
+    "revision": "US2 exact player layout",
+    "seq_set_seq": "0x8017B834",
+    "seq_work": "0x804D0D60",
+    "mutation": false,
+    "purpose": "distinguish missing SEQ_GAMEOVER request from requested-but-lost transition after pit death",
+    "limitation": "player run 20260918-224450 proved only one host-routed seqSetSeq call; direct native-to-native calls can bypass this observation path",
+    "successor": "dev96 native sequence truth via next_seq"
+  },
+  "dev96_offscreen_death_truth": {
+    "status": "ACTIVE TEST DIAGNOSTIC",
+    "bridge": "tools/native_bridge/legacy_c_adapter_v42_dev69.c.in",
+    "mutation": false,
+    "sequence_globals": {
+      "seq_work": "0x804D0D60",
+      "now_seq": "0x8056CAB8",
+      "next_seq": "0x8056CABC",
+      "prev_seq": "0x8056CAC0"
+    },
+    "derivation": "Seeky EU0 seqWork/now/next/prev translated by independently proven -0x41600 US2 data relocation; seqWork lands on already runtime-proven 0x804D0D60",
+    "bbox_mmio": [
+      "0xCC001010 left",
+      "0xCC001012 right",
+      "0xCC001014 top",
+      "0xCC001016 bottom"
+    ],
+    "empty_bbox": "1023,0,1023,0",
+    "behavior": [
+      "sample seqWork + now/next/prev at exact native spmarioMain entry",
+      "count next_seq transitions to SEQ_GAMEOVER(4)",
+      "wrap existing external read callback and return underlying values unchanged",
+      "for complete empty bbox reads log bounded caller PC/LR + sequence state",
+      "restore original external read callback on destroy"
+    ],
+    "next_test": "M14-LLVM-UPDATE-RUN.cmd; reproduce same pit, confirm dev96 player-state line reaches hp=0, wait 5-10s, close, then inspect next_seq=4 and empty PE-bbox caller correlation",
+    "interpretation": {
+      "next_seq_4": "Game Over requested; trace seqMain commit/exit/game-over init",
+      "no_4_with_bbox_cluster": "symbolize stable bbox caller and fix offscreen/PE semantic mismatch",
+      "no_4_no_bbox_cluster": "instrument Mario HP==0/death motion/event gate directly"
+    },
+    "player_state": {
+      "mario_work": "0x804CEE58",
+      "pouch_work": "0x804D0428",
+      "hp_offset": "0x0C",
+      "mario_offsets": {
+        "flags": "0x0000",
+        "disp_flags": "0x0008",
+        "motion_id": "0x002C",
+        "position_xyz": "0x005C"
+      },
+      "derivation": "same independently validated -0x41600 EU0->US2 BSS relocation as seqWork",
+      "cadence": "one HP read/compare per exact native spmarioMain entry; full Mario snapshot/log only when HP changes",
+      "empty_bbox_correlation": "bounded empty-bbox lines include HP + Mario flags/display flags/motion/XYZ"
+    }
+  },
+  "latest_build_attempt": {
+    "repo_revision": "8fb49e1b556ee6126d67cb4b97ff2972ad39f9b8",
+    "stage": "LLVM 2/7 source-only native-pipeline contracts",
+    "result": "blocked before candidate generation by stale dev107 contract names",
+    "cause": "test expected nonexistent augment_all_direct_bl_sources helper and old measured-hot-source direct_bl_partition_policy string; implementation uses augment_direct_bl_source_entries and dev107 all-source legal-entry/no-partition policy",
+    "fix_commit": "717f16dd5e6253a4f0ce6f900afd00ae88fcdafe",
+    "stale_contract_scan": "no remaining old helper/policy, dev101 partition-policy, dev106 codegen identity, or dev106 module identity literals in active source-contract test",
+    "cache_wipe": false,
+    "next": "rerun M14-LLVM-UPDATE-RUN.cmd"
+  },
+  "dev97_result": {
+    "status": "PLAYER-PROVEN CORRECTNESS KEEPER",
+    "evidence": "launch(20260919-020359).log: hp=0 motion=24 -> next_seq=4 -> seqWork=4 stages 1-6 -> exits to seq 1",
+    "mutation": false,
+    "policy": "player-derived [MOT_24,MOT_30) legal native entries; Nintendo HP/motion/sequence logic remains authoritative"
+  },
+  "dev98_entry_only_cold_entries": {
+    "status": "ACTIVE PERFORMANCE TEST CANDIDATE",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v9-dev98-entryonly",
+    "problem": "generic dev57 address-taken and dev97 interval MAP rows were consumed by both collect_llvm_entry_points and collect_llvm_partition_points, turning conservative legal-entry coverage into thousands of artificial LLVM chunk boundaries",
+    "entry_only_prefixes": [
+      "openspm_dev57_addr_taken_",
+      "openspm_dev97_hp0_motion24_interval_"
+    ],
+    "preserved_partition_classes": [
+      "openspm_dev57_measured_indirect_target_800332a8",
+      "dev54/dev56 measured indirect targets",
+      "dev77 wedding restart",
+      "dev79 measured hot BL sources/continuations",
+      "scheduler/context entries",
+      "semantic host seams",
+      "all other nonmatching symbols"
+    ],
+    "backend_proof": "pinned DolRecomp passes entry_points separately and FunctionEmitter::scanRegionLeaders marks interior entry PCs inside the containing chunk",
+    "expected_build_marker": "OpenSPM entry-only synthetic symbols: N legal cold entries excluded from chunk partitions",
+    "next_test": {
+      "command": "M14-LLVM-UPDATE-RUN.cmd",
+      "cache_wipe": false,
+      "correctness": [
+        "wedding live",
+        "Game Over still works",
+        "ordinary rendering/input correct"
+      ],
+      "performance": [
+        "same heavy enemy/NPC rooms",
+        "completed frames/host_ms",
+        "disp_avg_us",
+        "main_avg_us",
+        "dev87 bypass rate",
+        "dev90 hits/fallbacks"
+      ]
+    }
+  },
+  "dev98_result": {
+    "status": "CORRECTNESS-NEUTRAL / PERFORMANCE MISS",
+    "conclusion": "generic dev57/dev97 synthetic MAP rows should remain entry-only for structural cleanliness, but removing their partition-boundary effect did not materially improve the tested heavy rooms",
+    "latest_test": "launch(20260919-031628).log"
+  },
+  "dev99_dispdraw_nested_indirect": {
+    "status": "MECHANICALLY VALID BUT WRONG ABI FOR REAL HOT SITE",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v10-dev99-dispdraw-nested",
+    "module_version": "m14-dev99-llvm-dispdraw-nested",
+    "us2_dispdraw": {
+      "start": "0x8005B028",
+      "end": "0x8005B2F4"
+    },
+    "problem": "legacy native-ABI cold-escape handling materializes and exits on linked computed callback targets; dispDraw is a per-frame render callback walker",
+    "eligibility": [
+      "cold_escapes_",
+      "term.linked",
+      "guest PC inside [0x8005B028,0x8005B2F4)",
+      "PC+4 continuation local to current LLVM body"
+    ],
+    "nested_semantics": [
+      "materialize target before nested call",
+      "bounded dolrecomp_call_enter/leave recursion",
+      "reuse generated dolrecomp_call with replacements/dev90/dev87/host semantics/indexed native lookup",
+      "inline resume only when handled && !fallback && !exception && pc==continuation",
+      "otherwise escape to historical outer dispatcher",
+      "reloadUsedState before local continuation"
+    ],
+    "counters": [
+      "attempts",
+      "handled",
+      "normal_returns",
+      "abnormal_returns",
+      "depth_fallbacks",
+      "lookup_misses"
+    ],
+    "next_test": {
+      "command": "M14-LLVM-UPDATE-RUN.cmd",
+      "cache_wipe": false,
+      "scenes": "same enemy/NPC-heavy rooms",
+      "correctness": [
+        "Game Over completes",
+        "wedding remains live",
+        "render/input normal",
+        "dev90 fallback behavior healthy"
+      ],
+      "performance": [
+        "completed frames/host_ms",
+        "disp_avg_us",
+        "main_avg_us",
+        "dev99 normal-return ratio",
+        "dev87/dev90 counters"
+      ]
+    },
+    "player_result": "dev101 log: attempts=0; measured dispDraw site 0x8005B29C is CPUState ABI"
+  },
+  "dev100_scene_owners": {
+    "handoff": "docs/archive/M14-LLVM-DEV100-SCENE-OWNERS-2026-09-19.md",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v11-dev100-scene-profile",
+    "runtime_label": "m14-dev100-llvm-scene-profile",
+    "sample_every_frames": 64,
+    "interval_semantics": "inclusive of caller traversal and native escapes; not exclusive function CPU time",
+    "player_verified": true,
+    "validation": [
+      "existing Python pipeline suite PASS",
+      "compiled actual C accounting/nested helper/phase bridge behavioral tests PASS",
+      "full transform applied/idempotent on pinned DolRecomp"
+    ],
+    "not_validated": [
+      "LLVM compiler build",
+      "MSVC game build",
+      "gameplay/FPS"
+    ],
+    "result": {
+      "log": "launch(20260919-145908).log",
+      "success": "real nonzero owner attribution",
+      "key_disp_site": "0x8005B29C",
+      "key_main_site": "0x801A7AC8",
+      "retirement": "retire generated per-call CFG markers after attribution; keep older phase timer"
+    }
+  },
+  "dev101": {
+    "log": "launch(20260919-141853).log",
+    "tested_repo": "b4d85fe28e2f",
+    "hp_zero_gameover": "regressed; final_seq=2 final_hp=0",
+    "dev99_attempts": 0,
+    "dev100_nonzero_owner_records": 0,
+    "dev100_total_owner_records": 222,
+    "action": "retire dev98 partition exclusion and fix profiler ABI coverage",
+    "handoff": "docs/archive/M14-LLVM-DEV101-PARTITION-RESTORE-2026-09-19.md",
+    "player_verified": true,
+    "second_player_test": {
+      "log": "launch(20260919-145908).log",
+      "tested_repo": "74e6f822a570",
+      "hp_zero_gameover": "still regressed; final_hp=0 final_seq=2 final_stage=1 final_next_seq=2",
+      "dev99_attempts": 0,
+      "profiler": "working; nonzero CPUState-ABI owner site/target records exposed",
+      "key_disp_site": "0x8005B29C",
+      "key_main_call": "0x801A7AC8 -> 0x8017B72C",
+      "conclusion": "partition restore did not fix death; real dispDraw site is CPUState ABI"
+    }
+  },
+  "dev102": {
+    "status": "PLAYER-TESTED / exact site proven, budget semantics failed",
+    "problem": "dev99 nesting was unreachable because the measured dispDraw bctrl is CPUState ABI, not native-register ABI",
+    "exact_site": "0x8005B29C",
+    "changes": [
+      "retire dev100 generated call-owner CFG instrumentation",
+      "materialize exact CPUState architectural boundary at measured linked indirect site",
+      "reuse bounded openspm_m14_dev99_nested_dispatch",
+      "resume only on handled + no fallback/exception + exact PC+4; otherwise historical outer escape"
+    ],
+    "semantic_nonchanges": [
+      "no callback skipped or rate-limited",
+      "no callback order change",
+      "no guest sequence/HP mutation",
+      "older frame-phase timing remains"
+    ],
+    "telemetry": "M14 LLVM dev102 dispDraw nested stats attempts/handled/normal_returns/abnormal_returns/depth_fallbacks/lookup_misses/budget_yields",
+    "player_log": "launch(20260919-162912).log",
+    "result": {
+      "attempts": 6338293,
+      "handled": 0,
+      "normal_returns": 0,
+      "abnormal_returns": 0,
+      "depth_fallbacks": 0,
+      "lookup_misses": 0,
+      "budget_yields": 6338293
+    },
+    "diagnosis": "CPUState/RecompCore bridge_run resets downcount=0 and interprets negative downcount as accumulated cycle charge. materialize(target) subtracts local cycles, so dev102's downcount<=0 precheck rejects every attempt by construction."
+  },
+  "dev103": {
+    "status": "PLAYER-PROVEN / retain",
+    "handoff": "docs/archive/M14-LLVM-DEV103-CALLBACK-DISPATCH-HANDOFF-2026-09-19.md",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v14-dev103-entryonly-hostprefilter",
+    "module_version": "m14-dev103-entryonly-hostprefilter",
+    "diagnosis": "dev87 treated all compiler-map rows as may-host, including thousands of dev57 address-taken rows that exist only as legal dynamic callback entries; this imposes a C semantic-router round trip per callback and naturally scales with NPC/display count",
+    "filter": {
+      "excluded_map_prefixes": [
+        "openspm_dev57_addr_taken_"
+      ],
+      "deliberately_not_excluded": [
+        "openspm_dev97_hp0_motion24_interval_"
+      ],
+      "readd_rules": [
+        "platform host targets",
+        "direct BL sources",
+        "EXTRA_MAY_HOST exact semantics"
+      ],
+      "fail_closed": "all other map rows and unknown/out-of-image PCs remain host-first"
+    },
+    "evidence": {
+      "dev101_disp_site": "0x8005B29C",
+      "dev101_hot_target": "0x8008533C 450 intervals / 4467us over two sampled frames",
+      "residual_host_hitter": "0x800361F0 dominates shutdown sampled ordinary-hostcall sketch",
+      "public_layout": "0x800361F0 lies in shadowdrv text region"
+    },
+    "validation": {
+      "source_contracts": "passed local player build pipeline",
+      "github_actions": "not usable as gate; project state records Actions minutes exhausted",
+      "player_test": true,
+      "player_log": "launch(20260919-162912).log"
+    },
+    "player_result": {
+      "ordinary_hostcall_sample_total": 7488744,
+      "production_router_ordinary": 7474560,
+      "dev87_bypassed": 2139203694,
+      "prior_dev101_ordinary_total": 88347855,
+      "conclusion": "generic dev57 address-taken rows were imposing a real per-callback C-router tax; keep dev103 filtering"
+    }
+  },
+  "dev104": {
+    "status": "PLAYER-TESTED / performance miss; superseded by dev105",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v15-dev104-cpustate-charge-quantum",
+    "module_version": "m14-dev104-cpustate-charge-quantum",
+    "exact_site": "0x8005B29C",
+    "diagnosis": "dev102 used positive-remaining-budget semantics on CPUState.downcount, but OpenSPM RecompCore uses zero-origin negative accumulated charge",
+    "changes": [
+      "keep native-ABI dev99 helper unchanged",
+      "route exact CPUState dispDraw site through openspm_m14_dev104_cpustate_nested_dispatch",
+      "allow nested callbacks while downcount charge is above -32768",
+      "yield fail-closed at target before a callback or continuation after a normal callback once charge reaches -32768",
+      "preserve fallback/exception/abnormal-return escape through the historical outer dispatcher"
+    ],
+    "correctness_canary": "walking-off and jumping-in are separate routes; latest jump-in repro softlocks at HP0/MOT_24 with seq=2,next=2",
+    "expected_stats": "attempts > 0; handled and normal_returns should become nonzero; budget_yields should be far below attempts if callbacks fit the charge quantum",
+    "player_verified": true,
+    "player_log": "launch(20260919-173529).log",
+    "result": {
+      "attempts": 2961408,
+      "handled": 2961408,
+      "normal_returns": 376344,
+      "abnormal_returns": 2585064,
+      "budget_yields": 0,
+      "interpretation": "exact site and charge semantics work, but a single generated dispatch reaches PC+4 for only ~12.7% of callbacks; most exits are intermediate generated PCs rather than lookup/budget failures"
+    }
+  },
+  "dev105": {
+    "status": "ACTIVE PLAYER TEST CANDIDATE",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v16-dev105-multiblock-dispdraw-pittrace",
+    "module_version": "m14-dev105-multiblock-dispdraw-pittrace",
+    "performance_change": {
+      "exact_site": "0x8005B29C",
+      "helper": "openspm_m14_dev105_cpustate_nested_dispatch",
+      "max_steps": 64,
+      "charge_quantum": 32768,
+      "semantics": "walk existing dolrecomp_call dispatcher across intermediate generated chunks; fail closed on fallback, exception, miss, no progress, step limit or charge limit; no callback skipping/reordering"
+    },
+    "jump_death_trace": {
+      "trigger": "hp==0 && motion==24 at spmarioMain",
+      "fields": [
+        "prevMotionId",
+        "subMotionId",
+        "poseTime",
+        "airTimer",
+        "position",
+        "seq",
+        "next_seq"
+      ],
+      "onHpEquals0_us2": "0x801615E4",
+      "onHp_visibility": "counts/logs host-visible entry only; direct native calls may remain invisible",
+      "purpose": "separate walking-off success from jumping-in HP0/MOT_24 stall without forcing Game Over"
+    },
+    "expected_runtime_markers": [
+      "M14 LLVM dev105 CPUState dispDraw multiblock nesting active:",
+      "M14 LLVM dev105 jump-death trace active:",
+      "M14 LLVM dev105 jump-death truth n=",
+      "M14 LLVM dev105 dispDraw nested stats",
+      "M14 LLVM dev105 jump-death stats"
+    ],
+    "player_verified": false
+  },
+  "dev106": {
+    "status": "ACTIVE PLAYER TEST CANDIDATE",
+    "handoff": "docs/archive/M14-LLVM-DEV106-NATIVE-DEATH-ENTRY-TRUTH-HANDOFF-2026-09-19.md",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v17-dev106-native-death-entry-truth",
+    "module_version": "m14-dev106-native-death-entry-truth",
+    "source_log": "launch(20260919-173529).log",
+    "diagnosis": "failed jump death reaches hp=0/motion=24/y=-150 with next_seq still 2; successful prior deaths cannot be used as proof because user reports those were walking-off deaths and prior runs used different candidates",
+    "exact_native_entries": {
+      "onHpEquals0": "0x801615E4",
+      "seqSetSeq": "0x8017B834",
+      "helper": "openspm_m14_note_death_entry_native",
+      "semantics": "host-only counters at generated block entry; no CPUState materialization or guest-state mutation"
+    },
+    "hp0_snapshot": {
+      "fields": [
+        "native_onHp0 total and delta since previous non-HP0 frame",
+        "native_seqSetSeq total and delta since previous non-HP0 frame",
+        "host_visible_onHpEquals0 total",
+        "submotion",
+        "poseTime",
+        "airTimer",
+        "prevMotionId",
+        "position",
+        "seq",
+        "next_seq"
+      ],
+      "interpretation": [
+        "onHp0 delta 0 => jump path never entered onHpEquals0",
+        "onHp0 delta >0 and seqSetSeq delta 0 => handler ran but did not enter seqSetSeq",
+        "both deltas >0 with next_seq=2 => inspect seqSetSeq args/caller next",
+        "both deltas >0 with next_seq=4 => request succeeded; any failure is downstream"
+      ]
+    },
+    "retained_performance_ab": {
+      "dev103": "retain",
+      "dev105_multiblock": "still active for one player A/B; retire if correctness regresses or bounded exits dominate"
+    },
+    "player_verified": false
+  },
+  "dev107": {
+    "status": "ACTIVE PERFORMANCE CANDIDATE",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v18-dev107-direct-bl-native-first",
+    "module_version": "m14-dev107-direct-bl-native-first",
+    "source_run": "launch(20260919-190301).log",
+    "rationale": {
+      "dev105_attempts": 2340044,
+      "dev105_normal_returns": 2146113,
+      "dev105_nested_steps": 53522213,
+      "heavy_scene": "sustained 30-31 completed frames/s; disp ~8.6-8.8ms + main ~7.5-7.7ms then DoneRender waits next retrace",
+      "present_call_avg_us": 207,
+      "conclusion": "remaining cliff is pre-present native execution/chunk churn, not GPU present"
+    },
+    "partition_policy": {
+      "generic_dev57": "legal entry; no chunk partition",
+      "direct_bl_sources": "legal entry; no chunk partition",
+      "dev97_hp0": "retain real partition",
+      "semantic_host_and_fallback": "retain host-first/fail-closed behavior"
+    },
+    "dispatch_policy": "safe decoded direct-BL source PCs native-first only when outside semantic host sets and compiler FALLBACK addresses; native lookup refusal immediately falls back to historical BL rescue",
+    "player_verified": false
+  },
+  "dev108": {
+    "status": "ACTIVE BOOT/PERFORMANCE A/B",
+    "codegen_identity": "llvm-inline-wpar-indirect-budget-v19-dev108-partition-only-ab",
+    "module_version": "m14-dev108-partition-only-ab",
+    "source_run": "launch(20260919-204920).log",
+    "observed_stall": {
+      "pc": "0x8026CA60",
+      "lr": "0x8026CA60",
+      "first_heartbeat_stationary": true,
+      "bl_rescues": 0,
+      "region_queries": 0,
+      "write_gather": 0,
+      "ordinary_callbacks_after_first_second": 0,
+      "slice_guest_cycles": 65536
+    },
+    "keeps": [
+      "dev107 generic dev57 entry-only/no-partition policy",
+      "dev107 decoded direct-BL source legal entries without chunk partitions",
+      "dev97 HP-zero real partitions",
+      "dev90 three exact proven native-first entries"
+    ],
+    "disables": "broad dev107 decoded direct-BL native-first dispatch; historical host-first/direct-BL rescue owns those PCs",
+    "interpretation": "~15k object count is expected from fewer partition boundaries and is not automatically a regression; dev108 tests that independently of the unsafe-looking execution shortcut",
+    "player_verified": false
+  },
+  "dev108_result": {
+    "player_verified": true,
+    "repo_revision": "6bbdc7b39025cdc73faf30c4d25bcc87da8f93c7",
+    "result": "boots and plays with reduced partition/object layout",
+    "conclusion": "keep reduced entry-only partition policy; do not restore broad decoded direct-BL native-first",
+    "direct_bl_ab": "disabled_hits=0 disabled_fallbacks=0",
+    "nested_dispatch": {
+      "attempts": 1717013,
+      "nested_steps": 33763420,
+      "steps_per_attempt": 19.664,
+      "prior_dev106_steps_per_attempt": 22.872,
+      "approximate_reduction_percent": 14
+    },
+    "heavy_room": {
+      "produced_frames_per_second": "29-31",
+      "retraces_per_second": "~60",
+      "representative_pre_wait_ms": [
+        16.558,
+        17.346,
+        16.841,
+        18.527
+      ],
+      "draw_done_sync_avg_us": 2781,
+      "draw_done_sync_p95_us": 4250,
+      "present_safepoint_avg_us": 43
+    },
+    "renderer_interpretation": "DrawDone path is synchronous CPU aurora::gx::raw::drain() parsing/draw preparation; renderer dev4 does not present or GPU-synchronize there."
+  },
+  "dev109": {
+    "status": "ACTIVE PERFORMANCE A/B",
+    "implementation_commit": "a18fa6c02ad4699cb788c40435d3a0233668da13",
+    "contract_commit": "dc6e95f8f29c89a06b1fba63b8e678bc92491812",
+    "handoff_commit": "b8fe82723db707bdc237e0d46785490cb81ae9a1",
+    "runtime_marker": "M14 raw guest-array fused scan-plan active",
+    "target": "synchronous Aurora DrawDone CPU work",
+    "mechanism": "build the existing exact descriptor plan once, walk each interleaved vertex record once, update every indexed attribute interval in that pass, then derive the same guest byte intervals",
+    "unchanged": [
+      "exact guest-array byte intervals",
+      "NBT3 per-slice offsets and bounds",
+      "snapshot byte-for-byte memcmp reuse",
+      "staging/upload bytes",
+      "FIFO ordering",
+      "Drain processing mode",
+      "guest-memory visibility timing",
+      "draw merge semantics",
+      "renderer threading"
+    ],
+    "cache_behavior": "existing cached dev89 Aurora source upgrades automatically through the already-active CMake transform; no cache wipe required",
+    "player_verified": false
+  },
+  "prohibited_regressions": {
+    "async_fifo": "Do not restore threaded/async raw FIFO while commands resolve live mutable guest RAM; prior experiment caused black-square/invisible-Mario/corruption.",
+    "timing": "Do not bypass authentic VIWaitForRetrace or fake game timing.",
+    "instrumentation": "Do not re-enable broad dev100 CFG/call-owner instrumentation.",
+    "direct_bl": "Do not restore dev107 broad all-direct-BL native-first execution."
+  },
+  "dev109_result": {
+    "player_verified": true,
+    "repo_revision": "fa49904085b7",
+    "marker": "M14 raw guest-array fused scan-plan active",
+    "result": "still laggy in heavy NPC scenes",
+    "conclusion": "fused exact guest-array scanning may reduce some parser work but does not solve the main performance bottleneck; stop iterating blindly on this path"
+  },
+  "dev110": {
+    "status": "feature-frozen, test-ready; player build/validation pending",
+    "backend_version": "14.0-dev29",
+    "mailbox": "Local\\\\OpenSPM.Debug.<pid>",
+    "safe_boundary": "OPENSPM_M14_HOST_EVENT_PRESENT_SAFEPOINT",
+    "invariant": "client never maps MEM1/MEM2; backend executes commands while guest CPU is paused at once-per-frame boundary",
+    "files": [
+      "backend/native/openspm_native_backend_v12.c",
+      "tools/native_bridge/m14_debug_console.py",
+      "M14-DEBUG-CONSOLE.cmd",
+      "docs/M14-LIVE-DEBUG-CONSOLE-2026-09-19.md"
+    ],
+    "commands": [
+      "help",
+      "status",
+      "perf",
+      "seq",
+      "map",
+      "story [value]",
+      "gsw <index> [value]",
+      "warp <map>",
+      "read8 <addr>",
+      "read16 <addr>",
+      "read32 <addr>",
+      "write8 <addr> <value>",
+      "write16 <addr> <value>",
+      "write32 <addr> <value>",
+      "dump <addr> <len<=128>"
+    ],
+    "script_mode": "M14-DEBUG-CONSOLE.cmd --script file.txt; blank/# lines ignored; client-side sleep <seconds> supported",
+    "limitation": "raw writes mutate guest data only; already-generated LLVM/x86 code requires a separate native hook facility",
+    "commits": {
+      "backend": "b94fa1272575d92b81f9102de1d47087d72cfba7",
+      "backend_include_fix": "59259b09da6644d29d97d97e4a67f081837c9786",
+      "client": "25d3e6fe0649ab7568a42f9e0d1e0a999d9d031f",
+      "launcher": "9ef5f6b4e5125e77f933cdbae9319f1c21a8ea92",
+      "docs": "3a887913d662ee1bf195a27ee3ac0279448cde50",
+      "contracts": "4fe6e19fab258b02158d8d7a3d6b3b9dfd7fc11d",
+      "handoff": "380299f46d4f48292f8cc6625e711953c13097b2"
+    },
+    "player_verified": false,
+    "build_attempt": {
+      "source_revision": "53bafdd5e504c3204639e7c90d5c957c5a498300",
+      "result": "configure failed before backend compile",
+      "stage": "LLVM 3/7 CMake configure",
+      "error": "dev89 applied source is missing zero-vertex guard and the exact one-index scan anchor is not unique",
+      "root_cause": "already-dev109 fused scanner has the semantic zero-vertex guard at 4-space indentation/outside the old one-index branch; migration checked dev89's 6-space literal before fused signature",
+      "repaired_commits": [
+        "b78f3efc1e78994a5a4bd41bf07117e76d25314d",
+        "38c479ff88f36416ca28c763ecd58bf95398e7c2",
+        "827122c195f6aeb02b6ab185ca309af6a41e6671"
+      ],
+      "cache_wipe_required": false
+    },
+    "exi_contract_repair": {
+      "result": "player build reached CTest; 4/5 selected tests passed",
+      "failed_test": "m14_exi_diagnostic",
+      "cause": "stale exact backend_version assertion expected 14.0-dev27 after dev110 advanced backend to 14.0-dev28",
+      "behavior_failure": false,
+      "repair_commit": "e396dbc2acc921a904af7afe96ad2cb76c7d3335"
+    },
+    "cockpit": {
+      "gui": "tools/native_bridge/m14_debug_gui.py",
+      "launcher": "M14-DEBUG-CONSOLE.cmd",
+      "default_mode": "GUI when launched without arguments; CLI for one-shot/--script",
+      "commands": [
+        "nextroom",
+        "prevroom",
+        "reloadroom",
+        "warp",
+        "pos",
+        "setpos",
+        "nudge",
+        "hp",
+        "speed",
+        "npcs info",
+        "npcs freeze on|off",
+        "npcs suspend on|off",
+        "freeze8/16/32",
+        "unfreeze",
+        "freezes",
+        "read/write/dump",
+        "mark"
+      ],
+      "moonjump": "reserved/fail-closed pending exact US2 jump parameter proof",
+      "script_client_features": [
+        "wait/sleep",
+        "repeat",
+        "defer/onexit cleanup",
+        "capture start/stop",
+        "capture auto-stop on script failure/Stop",
+        "serialized mailbox sends"
+      ],
+      "capture_dir": ".openspm/m14/debug-captures",
+      "npc_safety": [
+        "suspend requires complete table to fit reversible snapshot",
+        "restore mutates only NPCEntry active bit",
+        "room warp clears cockpit NPC controls before sequence change"
+      ],
+      "speed_safety": "persistent multiplier disables itself on player-character change"
+    },
+    "audit_2026_09_19": {
+      "stale_version_sweep": "active backend/test/docs advanced to dev29; dev27/dev28 retained only as historical chronology",
+      "launcher": "quoted python.exe path restored; py.exe -3 fallback retained",
+      "gui_concurrency": "outer GUI lock no longer held across scripts/waits; DebugConnection serializes sends",
+      "script_cleanup": "defer/onexit commands run after normal completion, failure or Stop",
+      "capture_truncation": "new launch.log after restart is captured from byte 0 rather than producing empty snippet",
+      "source_contracts": "AST parse CLI+GUI and assert dev29/reversible runtime experiment surface"
+    },
+    "experiments": [
+      "tools/native_bridge/experiments/cockpit_smoke.spmdbg",
+      "tools/native_bridge/experiments/npc_performance_ab.spmdbg",
+      "tools/native_bridge/experiments/stop_cleanup_test.spmdbg"
+    ],
+    "audit_2026_09_19_final": {
+      "backend_version": "14.0-dev29",
+      "exact_version_assertions": "all C tests swept; only tests/m14_exi_diagnostic_test.c asserts 14.0-dev29",
+      "stale_test_prevention": "source-only native pipeline now reads EXI test and asserts matching dev29 version",
+      "transport": "per-process Python RLock plus named Local\\\\OpenSPM.Debug.Client.<pid> mutex; exact response generation match",
+      "reset": "resetdebug restores NPC debug controls, speed multiplier, persistent memory freezes and position checkpoint",
+      "npc_natural_map_change": "NPC table replacement while suspended clears stale snapshot and auto-disables without writing new-room entries",
+      "npc_capacity_growth": "auto-restores/auto-disables instead of partial suspension",
+      "checkpoint": "same-map position checkpoint save/load/clear",
+      "sampling": "sample <seconds> <count> <runtime command>",
+      "close_behavior": "GUI best-effort resetdebug before closing mailbox; active capture then closes/saves",
+      "validation_limit": "connector-backed source audit complete; local container could not DNS-resolve github.com, so Windows compile/runtime remains player-side gate"
+    },
+    "commands_added_after_initial_polish": [
+      "checkpoint save|load|clear",
+      "resetdebug"
+    ],
+    "script_features_added_after_initial_polish": [
+      "sample <seconds> <count> <runtime command>"
+    ],
+    "checkpoint_doc": "docs/archive/M14-DEV29-LIVE-COCKPIT-TEST-CHECKPOINT-2026-09-19.md",
+    "feature_freeze": true,
+    "source_preflight": {
+      "version_sync_guard": "source preflight verifies m14_exi_diagnostic expects 14.0-dev29",
+      "ast": [
+        "m14_debug_console.py",
+        "m14_debug_gui.py"
+      ],
+      "behavior": [
+        "timed sample",
+        "scoped launch.log capture",
+        "deferred cleanup",
+        "Stop during wait -> cleanup + capture auto-close"
+      ],
+      "convenience_launchers": [
+        "M14-DEBUG-SMOKE.cmd",
+        "M14-DEBUG-NPC-AB.cmd"
+      ]
+    },
+    "final_safety": {
+      "cross_process_mutex": "Local\\OpenSPM.Debug.Client.<pid>",
+      "exact_response_generation": true,
+      "resetdebug": "NPC controls off; speed restored when safe; memory freezes and checkpoint cleared",
+      "explicit_room_change": "reset all temporary debug state before semantic map change",
+      "npc_suspend": [
+        "requires complete reversible snapshot",
+        "restores only NPCEntry flag8 active bit",
+        "keys snapshot to NPC table and current map",
+        "auto-disables/discards stale snapshot across map change"
+      ],
+      "speed": "character-scoped; auto-disables if player character changes",
+      "checkpoint": "same-map only",
+      "moonjump": "unarmed/fail-closed pending exact jump/fall parameter proof"
+    },
+    "address_provenance": {
+      "mario_work": "0x804CEE58 (already proven by dev96 relocation)",
+      "mario_pouch_work": "0x804D0428 (already proven by dev96 relocation)",
+      "mario_hp_offset": "0x0C",
+      "mario_position_offset": "0x5C",
+      "mario_character_offset": "0x38 (public MarioWork header)",
+      "mario_walk_speed_offset": "0x14C (public MarioWork header)",
+      "mario_dash_speed_offset": "0x150 (public MarioWork header)",
+      "npcdrv_wp": "0x8056CB88 (public US2 symbol map)",
+      "npc_work": "flag +0x0, num +0x4, entries +0x8, freeze-all bit 0x1",
+      "npc_entry": "size 0x748, flag8 +0x8, active bit 0x1"
+    }
+  },
+  "test_harness": {
+    "canonical_scene": "Yold Town / he2_03",
+    "default_candidate": "chunk256/state_mem=0 via M14-LLVM-UPDATE-RUN.cmd",
+    "retained_baseline": "chunk128/state_mem=0 via M14-LLVM-CHUNK128-RUN.cmd",
+    "scoped_benchmark": "M14-DEBUG-YOLD-BENCH.cmd",
+    "report": "M14-PERF-REPORT.cmd --latest-capture yold-perf",
+    "automatic_compare": "M14-PERF-REPORT.cmd --compare-latest-chunks",
+    "safeguards": [
+      "require_map he2_03 before benchmark",
+      "stable NPC table/population before and after capture",
+      "chunk geometry threaded through generator provenance and native compile definition",
+      "runtime cadence line self-identifies chunk=128 or chunk=256",
+      "generated provenance rejects stale/wrong chunk geometry",
+      "analyzer self-test runs in test_llvm_native_pipeline.py",
+      "known-good C DLL remains transactionally restored after LLVM launch",
+      "runtime cadence self-identifies chunk and state_mem",
+      "automatic chunk comparison accepts only state_mem=0",
+      "automatic state-memory comparison accepts only chunk=256",
+      "explicit transactional runner mode --state-in-memory-mode 0|1"
+    ],
+    "metrics": [
+      "median produced fps",
+      "display/main phase medians",
+      "synchronous DrawDone median/p95 when present",
+      "first-retrace critical path and margin vs 16.667ms",
+      "dev105 nested generated steps per attempt",
+      "generated object count when available"
+    ],
+    "state_memory_candidate": "chunk256/state_mem=1 via M14-LLVM-STATE-MEM-RUN.cmd",
+    "automatic_chunk_compare": "M14-PERF-REPORT.cmd --compare-latest-chunks",
+    "automatic_state_memory_compare": "M14-PERF-REPORT.cmd --compare-latest-state-memory"
+  },
+  "dev113_candidate": {
+    "variable": "DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS",
+    "baseline": 128,
+    "candidate": 256,
+    "rationale": "stable Yold is only ~1-2ms beyond the first 16.667ms retrace deadline while dev105 still walks roughly 20 generated chunks per callback across ~370 callbacks per produced frame",
+    "semantics_unchanged": [
+      "dev103 host filtering",
+      "dev90 exact structural native-first",
+      "dev107 broad direct-BL native-first remains disabled",
+      "dev97 HP-zero correctness partitions",
+      "dev105 bounded fail-closed dispDraw nesting",
+      "indexed dispatch",
+      "renderer/GX memory visibility",
+      "VI/retrace pacing"
+    ],
+    "module_identity": "m14-dev113-chunk128/256-sim0-yold",
+    "state_in_memory": 0
+  },
+  "dev114_candidate": {
+    "status": "staged-opt-in-not-default",
+    "name": "dev114 state-in-memory Yold A/B",
+    "launcher": "M14-LLVM-STATE-MEM-RUN.cmd",
+    "baseline": "chunk256/state_mem=0",
+    "candidate": "chunk256/state_mem=1",
+    "rationale": "pinned DolRecomp state-in-memory targets non-native-ABI/CPUState bodies; OpenSPM's measured hot dispDraw callback site 0x8005B29C is CPUState ABI and repeatedly materializes/reloads state across dev105 nested dispatch",
+    "upstream_evidence": "DolRecomp issue #29 reports state-in-memory materially improving LLVM/C throughput ratios across several other games on x86-64 Windows; this is motivation only, not an OpenSPM result",
+    "expected_signal": "lower disp/main wall time and improved first-retrace margin; nested_steps/attempt may remain unchanged because this optimizes per-boundary state synchronization rather than traversal count",
+    "provenance": "chunk_instructions plus state_in_memory are both fail-closed; pinned DolRecomp job hash includes state_in_memory",
+    "runtime_identity": "m14-dev114-chunk256-sim1-yold",
+    "compare": "M14-PERF-REPORT.cmd --compare-latest-state-memory",
+    "preserve": [
+      "default dev113 remains state_mem=0",
+      "native ABI remains unrestricted",
+      "chunk=256 for this A/B",
+      "dev103/dev90/dev97/dev105 behavior unchanged",
+      "dev107 broad native-first remains disabled",
+      "renderer/GX/VI semantics unchanged",
+      "transactional known-good C rollback unchanged"
+    ],
+    "compiler_source_audit": {
+      "status": "fail-closed and runner-enforced",
+      "verified_invariants": [
+        "state-in-memory disabled for native ABI",
+        "eligible CPUState-ABI slots alias CPUState directly",
+        "syncDirtyState skips memory-resident aliases",
+        "reloadState skips memory-resident aliases through reloadUsedState"
+      ],
+      "toolchain_manifest": "state_in_memory_contract=true",
+      "runner_policy": "transactional candidate refuses toolchain manifests without the verified source contract",
+      "conclusion": "no stale-state conflict found with dev105 CPUState dispDraw nesting; runtime A/B remains authoritative"
+    }
+  },
+  "benchmark_hardening_2026_09_20": {
+    "canonical_room": "he2_03 / Yold Town",
+    "preflight": [
+      "exact map he2_03",
+      "exact active NPC population 7",
+      "exact actor-name set mise,mura_1,mura_2,mura_3,mura_4,mura_5,so",
+      "stable NPC num/active/entries identity"
+    ],
+    "capture_manifest": {
+      "schema_version": 1,
+      "sidecar": "same-name .json beside scoped .log",
+      "fields": [
+        "repo_revision",
+        "capture_sha256",
+        "pid",
+        "source offset/size",
+        "rotation status",
+        "captured byte count",
+        "start/stop/elapsed timestamps"
+      ],
+      "analyzer_policy": "present manifests are SHA-256 verified; invalid manifests fail benchmark quality"
+    },
+    "quality_gate": {
+      "launcher": "M14-DEBUG-YOLD-BENCH.cmd",
+      "analyzer_exit_code_invalid": 3,
+      "minimum_phase_windows": 3,
+      "minimum_cadence_windows": 2
+    },
+    "regression_gate": {
+      "launcher": "M14-PERF-GATE.cmd",
+      "default_compare": "latest chunk128/state_mem=0 -> chunk256/state_mem=0",
+      "analyzer_exit_code_regression": 4,
+      "tolerances": {
+        "median_fps_drop": 3,
+        "first_retrace_critical_ms_increase": 0.75,
+        "drawdone_ms_increase": 0.75
+      }
+    },
+    "automatic_pairing": "captures with a present-but-invalid provenance manifest are skipped; older valid/no-sidecar historical captures remain eligible"
+  },
+  "dev114_result": {
+    "status": "PROMOTED DEFAULT / PERFORMANCE BLOCKER CLOSED",
+    "configuration": "chunk=256 state_mem=1",
+    "baseline": "chunk=256 state_mem=0",
+    "yold_ab": {
+      "median_fps": "30.00 -> 58.01 (+28.00)",
+      "disp_ms": "7.434 -> 5.689 (-1.745)",
+      "main_ms": "9.182 -> 5.499 (-3.683)",
+      "disp_plus_main_ms": "16.596 -> 11.227 (-5.368)",
+      "draw_done_ms": "2.267 -> 2.287 (+0.020)",
+      "critical_ms": "18.863 -> 13.514 (-5.349)",
+      "vi_margin_ms": "-2.196 -> +3.153 (+5.349)",
+      "nested_steps_per_attempt": "23.67 -> 22.99 (-0.68)",
+      "regression_gate": "PASS",
+      "interpretation": "state-memory removes CPUState-ABI materialize/reload overhead; generated walk length and DrawDone remain nearly unchanged"
+    },
+    "dev115": {
+      "target": "0x8008533C",
+      "calls_per_16_frames": 4880,
+      "calls_per_frame": 305,
+      "camera_ids": "camera 5 only",
+      "unique_callback_params": 254,
+      "top_param_frequency": "16/16 frames",
+      "interpretation": "broad map/display object traversal once per frame, not a single pathological callbackParam"
+    },
+    "promotion_gate": {
+      "default_changed": true,
+      "fallback": "state_mem=0",
+      "required_smoke": [
+        "M14-DEBUG-SMOKE.cmd",
+        "reloadroom / nextroom / prevroom",
+        "one flip transition",
+        "pit Game Over resolves normally",
+        "wedding/cutscene liveness when convenient"
+      ],
+      "smoke_result": "broad player gameplay/cutscene validation + cockpit smoke PASS"
+    }
+  },
+  "performance_status": {
+    "status": "BLOCKER CLOSED / POLISH ONLY",
+    "default_configuration": "chunk=256 state_mem=1",
+    "fallback_configuration": "chunk=256 state_mem=0 via M14-LLVM-STATE-MEM0-RUN.cmd",
+    "yold_ab": "30.00 -> 58.01 median fps; critical 18.863 -> 13.514 ms; VI margin -2.196 -> +3.153 ms; regression gate PASS",
+    "broader_player_validation": [
+      "spikeball-heavy room smooth",
+      "spikeball-heavy room smooth in 3D",
+      "opening cutscenes smooth",
+      "Bowser/minion-heavy opening cutscene feels ~60fps",
+      "UI ticks smoothly",
+      "enemies walk smoothly",
+      "Mario walks smoothly",
+      "M14-DEBUG-SMOKE cockpit smoke PASS on sim1"
+    ],
+    "conclusion": "state-memory removes dominant CPUState-ABI synchronization overhead; performance is no longer an active blocker"
+  },
+  "active_defect": {
+    "name": "60Hz authoritative motion mapped onto ~99.943Hz display cadence",
+    "status": "high-refresh interpolation implementation in progress",
+    "current_evidence": [
+      "dev139 retained-XFB presenter is stable near 100Hz but still visually judders because it repeats only 60 unique poses",
+      "dev138 adjacent-frame geometry/material identity is effectively exact in sustained gameplay",
+      "dev140a prepares conservative translation-only intermediate transform uniforms without touching visible output",
+      "dev140b can be locally tested to replay prepared poses into isolated render-worker-owned targets before publishing them"
+    ],
+    "exclusions": [
+      "broad average producer performance is no longer the blocker; dev117+ heavy gameplay is normally ~58-61 completed Wii frames/s",
+      "do not change Wii simulation/VI/input/audio away from authoritative 60Hz",
+      "do not restore dev137 live midpoint substitution or element-wise affine matrix interpolation",
+      "do not perform Dawn/WebGPU work from the cadence thread"
+    ],
+    "next_tests": [
+      "M14-LLVM-INTERP-REPLAY-PREP-RUN.cmd",
+      "M14-LLVM-INTERP-REPLAY-ENCODE-RUN.cmd"
+    ]
+  },
+  "high_refresh_direction": {
+    "authoritative_simulation_hz": 60,
+    "strategy": "render/presentation interpolation, not 120/240Hz guest simulation",
+    "targets": [
+      120,
+      144,
+      165,
+      240
+    ],
+    "reset_on": [
+      "warp",
+      "flip",
+      "camera cut",
+      "teleport",
+      "scene transition"
+    ]
+  },
+  "camera_trace_result": {
+    "captures": [
+      "20260920-143838-camera-follow-trace.csv",
+      "20260920-143910-camera-follow-trace.csv"
+    ],
+    "result": "cam5 is the live Yold world camera in both traces; cam11 is inert. Cam5 pos/target advances continuously while Mario moves except for the first trace's legitimate hard room-edge clamp near x=1609.96.",
+    "second_trace_motion_correlation": 0.986,
+    "second_trace_cam5_stalls_while_mario_moves": 0,
+    "implication": "guest camera follow and final guest view matrix are cleared; remaining visible judder is downstream in renderer/presentation/frame pacing",
+    "next_live_probe": "camera_trace now also records cam5 CamEntry.viewMtx (+0x54), no rebuild required",
+    "latest_capture": "20260920-151513-camera-follow-trace.csv",
+    "samples": 110,
+    "duration_host_s": 7.9909981,
+    "view_matrix_result": "after cam5 leaves legitimate room-edge clamp, viewMtx updates on every camera movement; no stale-matrix intervals",
+    "view03_vs_camera_target_dx_correlation": -0.9924336512898193,
+    "median_view03_to_camera_dx_ratio": -0.997316809249938
+  },
+  "dev116": {
+    "status": "TEST READY / PLAYER RERUN NEEDED",
+    "default": "chunk=256 state_mem=1 heavy_diag=0",
+    "profile_fallback": "M14-LLVM-PROFILE-RUN.cmd -> chunk=256 state_mem=1 heavy_diag=1",
+    "sim0_fallback": "M14-LLVM-STATE-MEM0-RUN.cmd",
+    "hot_path_change": [
+      "disable dev111 dispDraw target hash/census in normal play",
+      "disable dev112 NPC callback ownership classification in normal play",
+      "disable dev115 map callback parameter/camera census in normal play",
+      "disable dev111 per-frame NPC table refresh and Mario motion sample in normal play"
+    ],
+    "preserved": [
+      "dev105 CPUState multiblock callback execution semantics",
+      "state-memory=1",
+      "fail-closed fallback/exception/budget/no-progress/step-limit behavior",
+      "phase timing and low-frequency correctness probes"
+    ],
+    "hypothesis": "removing diagnosis-only hot-path work may increase pacing headroom from the instrumented ~58 fps median toward stable 60; generated LLVM object cache remains reusable because this mode changes only bridge compilation",
+    "first_test_blocker": "source-only contract still asserted m14-dev114-chunk before compilation",
+    "blocker_fix_commit": "2ea8b928213ad5f5a7468b35a261e8f7c73c0d00"
+  },
+  "video_pacing_result": {
+    "source": "2026-09-20 15-32-41.mp4",
+    "capture_fps": 60.00157691397934,
+    "total_frames": 2283,
+    "duration_s": 38.049,
+    "continuous_pan": {
+      "frame_range": "145..1356",
+      "transitions": 1211,
+      "near_duplicate_frames": 273,
+      "near_duplicate_rate": 0.2254335260115607,
+      "classification": "whole-desktop-frame holds during scrolling; not guest camera transform stalls"
+    }
+  },
+  "presentation_pacing_result": {
+    "source": "launch(20260920-193500).log",
+    "present_mode": "Fifo",
+    "presents_4096": {
+      "avg_us": 19324,
+      "p50_us": 17500,
+      "p95_us": 33000,
+      "p99_us": 35500,
+      "over18": 1225,
+      "over25": 604,
+      "over33": 173
+    },
+    "presents_8192": {
+      "avg_us": 19354,
+      "p50_us": 17500,
+      "p95_us": 33000,
+      "p99_us": 35000,
+      "over18": 2371,
+      "over25": 1142,
+      "over33": 290
+    },
+    "shutdown": {
+      "presents": 15667,
+      "avg_us": 19293,
+      "p50_us": 17500,
+      "p95_us": 32500,
+      "p99_us": 34500,
+      "over18": 4684,
+      "over25": 2228,
+      "over33": 502,
+      "present_call_avg_us": 247
+    },
+    "implication": "VI stays near 60 while producer/completed-frame cadence is irregular; camera scrolling makes repeated desktop frames visible"
+  },
+  "presentation_ab": {
+    "status": "STAGED / PLAYER TEST NEEDED",
+    "launcher": "M14-LLVM-NOVSYNC-RUN.cmd",
+    "environment": "OPENSPM_M14_VSYNC=0",
+    "normal_default": "vsync on",
+    "pinned_aurora_policy": "vsync off prefers Mailbox on non-Metal, then Immediate, otherwise Fifo",
+    "constants": "chunk256 state_mem=1 heavy_diag=0; guest simulation and GX semantics unchanged",
+    "decision": [
+      "Mailbox/Immediate + much smoother pan => FIFO refresh-quantization amplifies late frames",
+      "tails improve but pan remains uneven => producer cadence needs interpolation/decoupled presentation",
+      "still Fifo => backend does not expose non-Fifo mode; A/B inconclusive"
+    ]
+  },
+  "mailbox_presentation_ab": {
+    "source": "launch(20260920-201021).log",
+    "repo_revision": "2b22a6866de6",
+    "present_mode": "Mailbox",
+    "player_result": "just as jittery; slight jitter also visible with camera clamped",
+    "present_4096": {
+      "avg_us": 16731,
+      "p50_us": 17000,
+      "p95_us": 18500,
+      "p99_us": 19500,
+      "over33": 1
+    },
+    "conclusion": "Mailbox removes most FIFO 33ms present quantization but does not materially change perceived jitter; primary defect is upstream produced-frame cadence"
+  },
+  "producer_frontier": {
+    "heavy_yold_completed_frames_per_s": "~48-57",
+    "authoritative_retraces_per_s": "~60",
+    "typical_disp_ms": "~6",
+    "typical_main_ms": "~6",
+    "drawdone_ms": "~2.5",
+    "dev105_shutdown": {
+      "attempts": 2114083,
+      "nested_steps": 43321462,
+      "budget_yields": 78725,
+      "step_limit_yields": 70462,
+      "no_progress_yields": 44995
+    },
+    "prior_dev115": {
+      "target": "0x8008533C",
+      "calls_per_produced_frame": 305,
+      "unique_params_per_16_frames": 254,
+      "camera_id": 5,
+      "interpretation": "map-object traversal, not repeated pathological same-object loop"
+    }
+  },
+  "chunk512_ab": {
+    "status": "STAGED / PLAYER TEST NEEDED",
+    "launcher": "M14-LLVM-CHUNK512-RUN.cmd",
+    "chunk_instructions": 512,
+    "state_in_memory": 1,
+    "heavy_diagnostics": 0,
+    "vsync": 0,
+    "baseline": "immediately preceding Mailbox chunk256/state_mem=1 run",
+    "unchanged": "semantic/dev97 partitions, exact host routing, dev105 64-step/32768-cycle fail-closed callback semantics, GX/render semantics, 60Hz Wii timing",
+    "upstream_contract": "pinned DolRecomp accepts chunk values 64..4096",
+    "decision": [
+      "materially smoother / near-60 => retain 512 and quantify nested-step reduction",
+      "little change => target dev105 dispDraw callback fallback/dispatch architecture directly",
+      "correctness regression => return to 256 state_mem=1 baseline"
+    ]
+  },
+  "dev118": {
+    "status": "TEST READY / PLAYER A-B NEEDED",
+    "hypothesis": "occasional Windows Sleep(1) overshoot at the true-idle VI boundary may convert otherwise-ready frames into uneven delivery",
+    "instrumentation": "once-per-second counters for from_idle vs busy_due, idle-ready margin, VI lateness, host wait deadline crossing/overshoot, VI-handler cost and v20 expired deadlines",
+    "candidate_wait_policy": "while Nintendo scheduler is truly idle: Sleep(1) when >2ms early; Sleep(0) only in final <=2ms before unchanged fixed VI deadline",
+    "default_behavior": "precise wait disabled unless OPENSPM_M14_PRECISE_IDLE_WAIT is enabled",
+    "invariants": [
+      "fixed 60 Hz VI deadline grid unchanged",
+      "no catch-up/burst retraces",
+      "guest simulation and Nintendo scheduler state unchanged",
+      "dev117 progress-aware callback walker unchanged",
+      "chunk=256 state_mem=1 heavy_diag=0 baseline retained",
+      "GX and presentation ordering unchanged"
+    ],
+    "handoff": "docs/archive/M14-DEV118-RETRACE-PACING-HANDOFF-2026-09-20.md"
+  },
+  "dev119": {
+    "status": "PLAYER-PROVEN VISUAL WIN / RETAIN",
+    "source_log": "launch(20260921-001046).log",
+    "dev118_interpretation": {
+      "subjective": "still jittery but seemingly a little less so",
+      "vi_boundary": "mostly from_idle, usually 0-3 busy_due per 60 retraces, ordinary lateness near zero",
+      "present_shutdown": "presents=5245 avg_us=17189 p50=17000 p95=19000 p99=31000 over25=90 over33=6 present_call_avg=199us"
+    },
+    "change": "private Aurora OPENSPM_M14_PRESENT_MODE override with immediate/mailbox/fifo values; unset preserves historical automatic policy",
+    "immediate_launcher": "M14-LLVM-IMMEDIATE-RUN.cmd",
+    "mailbox_launcher": "M14-LLVM-PACING-RUN.cmd",
+    "handoff": "docs/archive/M14-DEV119-IMMEDIATE-PRESENT-HANDOFF-2026-09-20.md",
+    "player_result": "still not perfect but pretty dang smooth; occasional jitter only, estimated about one quarter as much jitter as before",
+    "conclusion": "forced Immediate presentation removes most remaining visible Mailbox-amplified judder; keep Immediate for current development pacing work"
+  },
+  "dev120": {
+    "status": "PLAYER-TESTED / NEGATIVE FOR RESIDUAL STUTTER",
+    "name": "same-thread command-complete FIFO Inline pacing",
+    "launcher": "M14-LLVM-INLINE-RUN.cmd",
+    "rollback_launcher": "M14-LLVM-IMMEDIATE-RUN.cmd",
+    "presentation": "Immediate",
+    "precise_vi_wait": 1,
+    "chunk": 256,
+    "state_in_memory": 1,
+    "heavy_diagnostics": 0,
+    "fifo_mode_candidate": "Inline",
+    "fifo_mode_baseline": "Drain",
+    "publish_interval_bytes": 16384,
+    "safety_model": "command-aware v9 framer publishes only when phase==V9_GX_FRAME_OPCODE; parsing runs synchronously on Broadway/runtime thread before guest RAM can be mutated",
+    "rejected_architecture": "Aurora ProcessingMode::Thread / asynchronous raw FIFO parsing remains retired because it can dereference mutable MEM1/MEM2 after Broadway reuse",
+    "handoff": "docs/archive/M14-DEV120-INLINE-FIFO-PACING-HANDOFF-2026-09-20.md",
+    "player_result": "still has the little stutter",
+    "conclusion": "same-thread Inline distribution did not materially change residual pacing; return ordinary play to Drain"
+  },
+  "dev121": {
+    "status": "PLAYER-TESTED / NO SUBJECTIVE CHANGE",
+    "name": "quiet normal-play slice-profiler retirement",
+    "launcher": "M14-LLVM-QUIET-RUN.cmd",
+    "configuration": "chunk256 state_mem=1 heavy_diag=0 precise_vi_wait=1 Immediate + Drain",
+    "evidence": "dev119 log shutdown slice stats calls=10027806 wall_us=64711728; ~155k native slices/sec were each wrapped in two host clock reads and diagnostic bookkeeping",
+    "change": [
+      "heavy_diag=0 bridge_run_dev67 directly calls underlying native runtime with no per-slice clocks/histograms/pair tracking",
+      "retire dev95/dev96/dev106 observation wrappers from normal play",
+      "retire dev100/dev111/dev112/dev115 scene/census diagnostics from normal play",
+      "retain lightweight frame-phase telemetry",
+      "retain dev118 pacing report but check it from frame cadence instead of every native slice"
+    ],
+    "invariants": [
+      "guest execution semantics unchanged",
+      "dev105 callback nesting unchanged",
+      "VI fixed-rate grid and precise wait unchanged",
+      "Immediate presentation retained",
+      "FIFO Drain baseline retained",
+      "full diagnostic stack remains available with heavy_diag=1"
+    ],
+    "handoff": "docs/archive/M14-DEV121-QUIET-NORMAL-PLAY-HANDOFF-2026-09-20.md",
+    "player_result": "same little jitter; all other motion feels smooth, defect presents as camera/world scrolling stutter",
+    "conclusion": "per-slice profiler retirement was correct cleanup but not the residual-stutter fix"
+  },
+  "dev122": {
+    "status": "PLAYER-TESTED / CAMERA STATE MOSTLY CLEARED, TAIL INTERPRETATION CORRECTED",
+    "launcher": "M14-LLVM-CAMERA-TAIL-RUN.cmd",
+    "configuration": "chunk256 state_mem=1 heavy_diag=0 precise_vi_wait=1 Immediate + Drain",
+    "instrumentation": [
+      "reuse existing four phase clocks; log only complete produced frames >20ms",
+      "sample Mario X and cam5 pos/target/view translation at phase0; emit only with frame tail",
+      "augment existing successful-Present probe to log only intervals >25ms with no new timestamps"
+    ],
+    "invariants": [
+      "no per-slice profiler restored",
+      "guest camera state is not modified",
+      "presentation mode and FIFO semantics unchanged",
+      "no GitHub Actions"
+    ],
+    "handoff": "docs/archive/M14-DEV122-CAMERA-PRESENT-TAIL-HANDOFF-2026-09-21.md",
+    "player_result": "camera still jittery",
+    "conclusion": "most walking tails show nonzero smooth cam5 view deltas and correlate with host present gaps; 33ms total alone cannot prove producer overrun because done phase includes VI waiting"
+  },
+  "dev123": {
+    "status": "TEST READY / TWO INDEPENDENT A-Bs",
+    "name": "Windows producer scheduling + sticky pressed-edge isolation",
+    "baseline": "Immediate + Drain + precise VI wait, chunk256 state_mem=1 heavy_diag=0",
+    "priority_launcher": "M14-LLVM-PRIORITY-RUN.cmd",
+    "priority_change": "after Aurora renderer binding, set only current producer/main thread to THREAD_PRIORITY_ABOVE_NORMAL; sticky pressed-edge carry explicitly remains on; restore old priority on exit",
+    "nosticky_launcher": "M14-LLVM-NOSTICKY-INPUT-RUN.cmd",
+    "nosticky_change": "producer priority remains normal; disable only dev27/dev29 unconsumed buttonsPressed carry across retraces; buttonsHeld remains direct physical frame-latched state",
+    "input_audit": {
+      "held": "g_v9_input_down is physically resampled once per input/retrace epoch and written directly to KPAD buttonsHeld",
+      "pressed": "g_v9_input_pressed is an edge mask; only this edge mask is retained until observed",
+      "repeat": "g_v12_input_repeat is a 0x80000000 SDK repeat marker ORed alongside held bits; it does not replace D-pad direction bits"
+    },
+    "next_if_negative": [
+      "Windows P-core/EcoQoS telemetry or CPU-set preference without hardcoded affinity",
+      "tail-only attribution triggered by busy_due rather than all >20ms done-phase totals",
+      "produced display-copy serial -> successful Immediate Present serial identity",
+      "host-side camera/world interpolation only as polish after avoidable stalls are exhausted"
+    ],
+    "handoff": "docs/archive/M14-DEV123-RESIDUAL-TAIL-SCHEDULING-HANDOFF-2026-09-21.md",
+    "dev122_correlation": {
+      "source_log": "launch(20260921-044640).log",
+      "scope": "steady gameplay/walking report windows",
+      "busy_due_vs_present_tail_pearson": 0.979,
+      "busy_due_vs_frame_tail_pearson": 0.986,
+      "busy_due_total": 119,
+      "present_tail_total": 104,
+      "frame_tail_total": 104,
+      "conclusion": "after Immediate, residual >25ms presentation tails are strongly coupled to the minority of VI deadlines reached before Nintendo idle; target rare producer/VI tail rather than broad average throughput"
+    },
+    "input_tail_crosscheck": {
+      "representative_steady_walking_tails": 55,
+      "median_abs_mario_dx": 2.999878,
+      "observed_abs_mario_dx_range": [
+        2.088928,
+        3.04834
+      ],
+      "conclusion": "visible tail frames do not coincide with a one-frame Mario movement cancellation; sticky pressed-edge carry is structurally and empirically unlikely to cause camera jitter"
+    }
+  },
+  "dev124": {
+    "status": "TEST READY / PLAYER A-B NEEDED",
+    "name": "Windows producer/main thread explicit HighQoS A/B",
+    "launcher": "M14-LLVM-HIGHQOS-RUN.cmd",
+    "baseline": "Immediate + Drain + precise VI wait, chunk256 state_mem=1 heavy_diag=0; sticky pressed carry ON; Win32 priority normal",
+    "change": "runtime-resolve SetThreadInformation and explicitly disable execution-speed throttling on producer/main thread only after Aurora worker creation; restore system-managed QoS on exit",
+    "fail_closed": "if SetThreadInformation is unavailable/fails, warn and leave scheduling unchanged",
+    "rationale": "residual >25ms tails correlate ~0.98 with busy_due; HighQoS tests power/QoS scheduling independently from dev123 ABOVE_NORMAL priority",
+    "next_if_negative": "enumerate Windows CPU Sets and test a soft max-EfficiencyClass fast-core preference; do not hardcode CPU IDs",
+    "handoff": "docs/archive/M14-DEV124-HIGHQOS-HANDOFF-2026-09-21.md"
+  },
+  "dev125": {
+    "status": "IMPLEMENTED / PLAYER VALIDATION NEEDED",
+    "name": "cache invariant QueryPerformanceFrequency",
+    "change": "query QPC frequency once after CLI validation before host API exposure; host_monotonic_ns now calls only QueryPerformanceCounter and uses the cached frequency with unchanged integer conversion",
+    "rationale": "dev118 fine wait commonly performs 150k-190k Sleep(0) yields/sec and calls the host clock before and after each wait; prior launcher redundantly queried invariant QPC frequency on every timestamp, potentially ~300k-380k redundant frequency queries/sec in that path alone",
+    "semantics": "no VI/grid/wait-threshold/timebase/renderer/input/thread-scheduling changes",
+    "marker": "M14 dev125 cached QPC frequency active:",
+    "handoff": "docs/archive/M14-DEV125-CACHED-QPC-FREQUENCY-HANDOFF-2026-09-21.md"
+  },
+  "dev126": {
+    "status": "TEST READY / PLAYER A-B NEEDED",
+    "name": "final true-idle spin instead of repeated Sleep(0)",
+    "launcher": "M14-LLVM-SPINWAIT-RUN.cmd",
+    "baseline": "Immediate + Drain + precise VI wait, chunk256 state_mem=1 heavy_diag=0, sticky pressed edges ON, normal producer priority/QoS",
+    "change": "only when Nintendo scheduler is truly idle and <=2ms before the fixed VI deadline, use YieldProcessor spin to the same deadline instead of repeated Sleep(0)",
+    "rationale": "steady Yold commonly issues ~150k-190k Sleep(0) yields/sec; sparse host descheduling during this scheduler-yield storm could explain residual busy_due/present tails after dev125 removes redundant QPF queries",
+    "invariants": [
+      "fixed 60Hz VI grid unchanged",
+      "guest timebase unchanged",
+      "no guest work runs during spin",
+      "renderer/FIFO/presentation ordering unchanged",
+      "input semantics unchanged",
+      "normal priority and QoS in this launcher"
+    ],
+    "expected_markers": [
+      "M14 dev126 final-idle-spin A/B active:",
+      "precise=1 spin2ms=1"
+    ],
+    "handoff": "docs/archive/M14-DEV126-FINAL-IDLE-SPIN-HANDOFF-2026-09-21.md"
+  },
+  "input_sticky_audit": {
+    "status": "CODE-AUDITED / LOW-PROBABILITY CAUSE / A-B AVAILABLE",
+    "conclusion": "dev29 sticky behavior carries only unobserved buttonsPressed edge bits; buttonsHeld is replaced from fresh physical key state every input/retrace epoch, so sticky carry cannot directly toggle a held direction off for a frame",
+    "held_path": "v9_keyboard_down -> g_v9_input_down -> KPAD buttonsHeld (+ independent repeat marker)",
+    "sticky_path": "g_v9_input_pressed unobserved bits only",
+    "falsification_launcher": "M14-LLVM-NOSTICKY-INPUT-RUN.cmd",
+    "player_result": "no-sticky was clearly the worst of the six runs; Mario sometimes appeared to stop for a frame or jitters were more frequent",
+    "decision": "retain sticky pressed-edge delivery ON; code audit still shows held directions are independently physical/frame-latched"
+  },
+  "dev127": {
+    "status": "TEST READY / PLAYER A-B NEEDED",
+    "name": "soft fastest-EfficiencyClass CPU Set preference",
+    "launcher": "M14-LLVM-FASTCORE-RUN.cmd",
+    "baseline": "Immediate + Drain + precise VI wait, chunk256 state_mem=1 heavy_diag=0, sticky pressed edges ON, normal priority/QoS, dev126 spin OFF",
+    "change": "after Aurora worker creation, snapshot producer thread CPU Set selection, enumerate Windows CPU Sets, choose all eligible nonparked sets in highest EfficiencyClass, apply only to producer thread, restore exact prior selection on exit",
+    "rationale": "remaining busy_due/present tails may be sparse host scheduling/migration effects; CPU Sets test fast-core preference without hardcoded CPU indices or whole-process affinity",
+    "invariants": [
+      "soft CPU Set selection only",
+      "no hard affinity mask",
+      "renderer workers untouched",
+      "normal Win32 priority",
+      "system-managed QoS",
+      "dev126 spin disabled",
+      "VI grid, guest timing, renderer/FIFO ordering and input semantics unchanged"
+    ],
+    "expected_markers": [
+      "M14 dev127 fast-core CPU Set A/B active:",
+      "M14 dev127 fast-core CPU Set A/B skipped:"
+    ],
+    "handoff": "docs/archive/M14-DEV127-FASTCORE-CPUSET-HANDOFF-2026-09-21.md"
+  },
+  "dev128": {
+    "status": "OBSERVATION ACTIVE / NO SPECIAL LAUNCHER",
+    "name": "tail-only busy_due phase ownership",
+    "change": "reuse existing four phase timestamps and emit bounded diagnostics only when a fixed VI deadline arrives while the guest is still busy",
+    "marker": "M14 dev128 busy-due owner n=",
+    "fields": [
+      "top-level phase id/name",
+      "phase age at deadline",
+      "delivery lateness",
+      "guest PC/LR",
+      "MSR",
+      "downcount"
+    ],
+    "steady_state_overhead": "no additional periodic clock reads; only two assignments at existing phase callbacks and bounded logging on actual busy_due events",
+    "purpose": "if scheduling A/Bs are neutral, identify exact deterministic phase/PC owning the residual tail instead of restoring broad profiling",
+    "handoff": "docs/archive/M14-DEV128-BUSY-DUE-OWNERSHIP-HANDOFF-2026-09-21.md"
+  },
+  "dev129": {
+    "status": "TEST READY / ARCHITECTURAL FIX",
+    "name": "state-sensitive scheduler-idle host side exit",
+    "trigger": "dev128 shows the dominant single busy_due owner across all six A/B runs is the exact scheduler-idle continuation pc=0x8027551C in phase done",
+    "mechanism": "remove 0x8027551C from dev90 unconditional native-first table; force exact host classifier at idle entry; if live Nintendo RunQueueBits==0 consume an internal detail-34 side exit into an ordinary safepoint; if RunQueueBits>0 or unavailable preserve native SelectThread execution",
+    "preserves": [
+      "dev68 runnable-idle wake semantics",
+      "v28 exact compiler partition at 0x8027551C",
+      "Nintendo RunQueueBits authority",
+      "fixed 60Hz VI grid",
+      "no fabricated PC/LR/TCB/run-queue state",
+      "Immediate presentation + FIFO Drain",
+      "sticky pressed-edge retention"
+    ],
+    "expected_markers": [
+      "M14 LLVM dev129 scheduler-idle dynamic dispatch active:",
+      "M14 LLVM dev129 scheduler-idle dynamic stats"
+    ],
+    "success_signals": [
+      "camera/world scrolling smoother",
+      "dev128 busy-due owner pc=0x8027551C population collapses",
+      "dev118 busy_due and >25ms present tails decline",
+      "runnable_native remains nonzero when Nintendo work is woken"
+    ],
+    "handoff": "docs/archive/M14-DEV129-DYNAMIC-SCHEDULER-IDLE-HANDOFF-2026-09-21.md"
+  },
+  "six_way_pacing_result": {
+    "status": "PLAYER TESTED",
+    "variants": [
+      "baseline Immediate",
+      "dev126 final-idle spin",
+      "dev123 ABOVE_NORMAL priority",
+      "dev124 HighQoS",
+      "dev127 fast-core CPU Sets",
+      "dev123 no-sticky"
+    ],
+    "subjective": "mostly similar; fast-core may be best but still jitters; no-sticky clearly worst",
+    "dev128_finding": "scheduler-idle PC 0x8027551C is the dominant single busy_due owner across every variant, revealing late recognition of true idle inside an already-running native slice"
+  },
+  "dev130": {
+    "status": "TEST READY / COMBINED PLAYER CANDIDATE",
+    "name": "dev129 + fast-core CPU Sets + final true-idle spin",
+    "launcher": "M14-LLVM-SMOOTH-RUN.cmd",
+    "baseline": "dev129 dynamic scheduler-idle + Immediate + Drain + precise VI, chunk256 state_mem=1 heavy_diag=0",
+    "change": [
+      "enable dev126 final <=2ms true-idle YieldProcessor spin",
+      "enable dev127 highest-EfficiencyClass soft CPU Set preference",
+      "keep sticky pressed-edge retention ON",
+      "keep Win32 priority normal",
+      "keep HighQoS off/system-managed"
+    ],
+    "rationale": "fastcore felt best subjectively and spinwait moved tail metrics in the helpful direction; no-sticky was clearly worse; priority/HighQoS were not clear wins",
+    "handoff": "docs/archive/M14-DEV130-COMBINED-SMOOTH-PACING-HANDOFF-2026-09-21.md"
+  },
+  "six_way_pacing_ab": {
+    "status": "PLAYER-TESTED / QUANTIFIED",
+    "scope": "steady seq=2 stage=1 gameplay windows only",
+    "variants": {
+      "baseline_immediate": {
+        "seconds": 67.6,
+        "busy_due_per_s": 1.405,
+        "present_tail_gt25ms_per_s": 1.094
+      },
+      "dev126_final_spin": {
+        "seconds": 46.4,
+        "busy_due_per_s": 0.926,
+        "present_tail_gt25ms_per_s": 0.603
+      },
+      "dev123_above_normal": {
+        "seconds": 51.5,
+        "busy_due_per_s": 1.165,
+        "present_tail_gt25ms_per_s": 0.952
+      },
+      "dev124_highqos": {
+        "seconds": 64.1,
+        "busy_due_per_s": 1.684,
+        "present_tail_gt25ms_per_s": 1.263
+      },
+      "dev127_fastcore": {
+        "seconds": 493.6,
+        "busy_due_per_s": 0.798,
+        "present_tail_gt25ms_per_s": 0.677
+      },
+      "dev123_no_sticky": {
+        "seconds": 48.9,
+        "busy_due_per_s": 2.045,
+        "present_tail_gt25ms_per_s": 1.698
+      }
+    },
+    "player_report": "mostly similar; no-sticky easily worst; fastcore maybe best but still some jitter",
+    "conclusion": "retain sticky pressed edges; reject HighQoS as candidate; fastcore and final-spin are the two independently helpful host scheduling settings and are combined only in dev130"
+  },
+  "dev131": {
+    "status": "OBSERVATION ACTIVE / NO BEHAVIOR CHANGE",
+    "name": "SDL window display-refresh cadence diagnostic",
+    "change": "after Aurora SDL window creation, log current display mode refresh and ratio to authoritative 60Hz simulation",
+    "marker": "M14 display cadence current=",
+    "fields": [
+      "current window display resolution",
+      "float refresh Hz",
+      "precise refresh numerator/denominator",
+      "refresh/60 ratio",
+      "nearest integer multiple",
+      "distance from exact 60Hz multiple",
+      "diagnostic integer_multiple boolean"
+    ],
+    "rationale": "if scheduler/present tails are repaired but only camera scrolling retains small periodic judder, a non-integer desktop refresh ratio can produce unequal 60Hz frame persistence; measure before implementing high-refresh interpolation",
+    "invariants": [
+      "observation only",
+      "no present-mode change",
+      "no vsync change",
+      "no VI/simulation cadence change",
+      "no renderer ordering change"
+    ],
+    "handoff": "docs/archive/M14-DEV131-DISPLAY-CADENCE-DIAG-HANDOFF-2026-09-21.md"
+  },
+  "dev132": {
+    "status": "TEST READY / DIAGNOSTIC ONLY",
+    "name": "99.943Hz monitor-half cadence diagnostic",
+    "launcher": "M14-LLVM-100HZ-CADENCE-RUN.cmd",
+    "baseline": "dev130 smooth candidate",
+    "change": "replace normal 16,666,667ns VI period with 20,011,407ns (~49.9715Hz), exactly half of player-reported 99.943Hz monitor rate",
+    "warning": "gameplay intentionally ~16.7% slow; not a production mode or proposed gameplay setting",
+    "rationale": "60Hz source cannot map evenly to ~100Hz fixed display without interpolation; camera pans expose unequal frame persistence more strongly than character animation",
+    "expected_marker": "M14 dev132 diagnostic cadence active:",
+    "interpretation": {
+      "smooth_but_slow": "strong evidence residual camera-only judder is mostly 60-on-100 display cadence; production fix is 60Hz simulation + decoupled/interpolated high-refresh presentation",
+      "same_jitter": "display cadence insufficient; continue producer/presentation tail work",
+      "partly_better": "both display cadence and sparse OpenSPM holds contribute"
+    },
+    "invariants": [
+      "default launchers remain 60Hz",
+      "no Windows display mode changes",
+      "no renderer ordering changes",
+      "dev129/dev125/dev126/dev127 retained",
+      "sticky pressed-edge retention ON"
+    ],
+    "handoff": "docs/archive/M14-DEV132-99_943HZ-CADENCE-DIAG-HANDOFF-2026-09-21.md"
+  },
+  "dev133": {
+    "status": "DESIGN READY / GATED ON DEV132 RESULT / HISTORY SEMANTICS CORRECTED",
+    "name": "decoupled high-refresh presentation architecture",
+    "trigger": "player monitor 99.943Hz; 60Hz simulation cannot map evenly without interpolation",
+    "prerequisites": [
+      "dev132 cadence A/B result",
+      "current-frame Wii GXCopyDisp snapshot correctness",
+      "dedicated presenter-owned cross-frame history textures",
+      "Aurora render-worker GPU ownership",
+      "dev131 actual display cadence diagnostic"
+    ],
+    "current_snapshot_semantics": "openspmDisplayCopySnapshot shared ownership keeps the allocation alive for the current async present, but Aurora copyTextureCache reuses the same handle for later copies; do not treat it as immutable cross-frame history",
+    "history_design": [
+      "3-slot presenter-owned GPU texture ring",
+      "copy current completed XFB into next history slot before later GXCopyDisp can overwrite cache allocation",
+      "first prototype uses render-blit because Aurora new_render_texture lacks CopySrc",
+      "later optimization may add OpenSPM-specific CopySrc and CopyTextureToTexture after validation"
+    ],
+    "verified_lifetime_chain": [
+      "apply_fifo_reentrancy_patch.py",
+      "apply_bytebuffer_abort_diag_patch.py",
+      "apply_display_copy_snapshot_patch.py"
+    ],
+    "architecture": [
+      "keep authoritative Wii simulation/VI/input/audio at 60Hz",
+      "capture current completed XFB into dedicated presenter history texture with serial/timestamp",
+      "retain previous/current/spare history slots",
+      "drive display-cadence scheduling independently",
+      "enqueue GPU presentation only through Aurora render worker",
+      "use current frame as correctness fallback"
+    ],
+    "interpolation_policy": {
+      "nearest_repeat": "useful for presenter skeleton only; cannot remove 60-on-100 motion cadence",
+      "full_frame_blend": "diagnostic only; temporal ghosting makes it unsuitable as normal mode",
+      "preferred": "semantic draw-time transform interpolation, starting with camera then actors/models"
+    },
+    "gate": {
+      "smooth_but_slow_dev132": "proceed to dev134 presenter-history proof",
+      "same_jitter_dev132": "continue producer/presentation tail debugging",
+      "partial_improvement": "retain dev129/dev130 and pursue interpolation as a second layer"
+    },
+    "handoff": "docs/archive/M14-DEV133-HIGH-REFRESH-PRESENTER-DESIGN-2026-09-21.md"
+  },
+  "dev134": {
+    "status": "PLANNED / NOT YET PLAYER-FACING",
+    "name": "presenter-owned XFB history ring proof",
+    "goal": "prove 3-slot GPU-local history capture without changing visible presentation",
+    "method": "render-blit current sampleable Wii XFB into dedicated history texture on Aurora render worker; no CPU readback",
+    "gate": "only worth enabling after dev132 demonstrates cadence materiality"
+  },
+  "session_handoff": {
+    "status": "DURABLE CHECKPOINT",
+    "date": "2026-09-21",
+    "file": "docs/archive/M14-DEV133-SESSION-HANDOFF-2026-09-21.md",
+    "base_head": "5a55c103d10a20ad08c6a125d044e841bc1d3aef",
+    "next_required_action": "player compares M14-LLVM-SMOOTH-RUN.cmd vs M14-LLVM-100HZ-CADENCE-RUN.cmd on the same camera-scrolling path",
+    "gate": {
+      "smooth_but_slow": "proceed to dev134 presenter-owned 3-slot history-ring proof and decoupled display clock",
+      "same_jitter": "return to residual producer/present ownership; do not build interpolation yet",
+      "partial_improvement": "retain dev129/dev130 and pursue high-refresh presentation as second layer"
+    },
+    "important_constraints": [
+      "normal simulation remains 60Hz",
+      "dev132 49.9715Hz mode is diagnostic-only",
+      "sticky pressed-edge retention stays ON",
+      "do not include HighQoS in preferred candidate",
+      "current openspmDisplayCopySnapshot handle is current-frame-safe but not immutable cross-frame history",
+      "future GPU presenter work stays on Aurora render worker",
+      "no GitHub Actions"
+    ]
+  },
+  "dev137_first_launch_hotfix": {
+    "failed_head": "0888a916417df33790ae5242ce8661bf40652368",
+    "stage": "CMake Aurora source adaptation before build",
+    "error": "command_processor limits include: expected source fragment exactly once, found 2",
+    "conclusion": "patch-applicator cache fragility only; no runtime/interpolation evidence",
+    "fix": "ensure_include anchored on stable Tracy include plus duplicate-unordered_map regression contract",
+    "next": "rerun M14-LLVM-INTERP-MIDPOINT-RUN.cmd"
+  },
+  "dev137_second_launch_hotfix": {
+    "failed_head": "1b2d2206d018581edf17f78181681451150c2cea",
+    "stage": "CMake Aurora dev137 source adaptation before build",
+    "error": "dev137 DrawData interpolated range: expected source fragment exactly once, found 0",
+    "conclusions": [
+      "cumulative M14 draw source differs from pristine Aurora, including zCompLoc nested m14PushDraw lambda",
+      "64-bit Aurora GX DrawData already equals 128-byte InlineDrawPayloadSize; adding a second Range is invalid"
+    ],
+    "fix": "command_processor-only midpoint proof; temporary local midpoint range selected through existing DrawData.uniformRange; structural zComp-safe migration",
+    "runtime_evidence": false,
+    "next": "rerun M14-LLVM-INTERP-MIDPOINT-RUN.cmd"
+  },
+  "dev137_status": "rejected-runtime-experiment-do-not-restore",
+  "latest_configure_failure": {
+    "date": "2026-09-21",
+    "launcher": "M14-LLVM-INTERP-IDENTITY-RUN.cmd",
+    "stage": "CMake dev138 interpolation identity adaptation",
+    "runtime_evidence": false,
+    "error": "dev138 migration incomplete: M14 dev138 identity frame=",
+    "diagnosis": "transform required tuple still referenced pre-sampling telemetry marker",
+    "fix": [
+      "require M14 dev138 identity sample= instead",
+      "contract sampled validator marker",
+      "forbid retired identity frame= marker in dev138 patch source"
+    ],
+    "next": "rerun M14-LLVM-INTERP-IDENTITY-RUN.cmd"
+  },
+  "latest_compile_failure": {
+    "date": "2026-09-21",
+    "launcher": "M14-LLVM-INTERP-IDENTITY-RUN.cmd",
+    "stage": "MSVC command_processor.cpp compile after successful configure",
+    "runtime_evidence": false,
+    "error": "M14InterpHashOffset redefinition; multiple initialization",
+    "diagnosis": "canonicalization preserved the old seed because region replacement started at M14InterpProbeDraw struct, while the seed lives immediately before the struct",
+    "fix": [
+      "strip exact existing M14InterpHashOffset seed declarations from preserved prefix",
+      "insert exactly one canonical seed",
+      "fail closed unless final seed count is one",
+      "regress two-adjacent-seed cached shape and byte-idempotent replay"
+    ],
+    "next": "rerun M14-LLVM-INTERP-IDENTITY-RUN.cmd"
+  },
+  "latest_runtime": {
+    "date": "2026-09-22",
+    "log": "launch(20260922-025138).log",
+    "repo_revision": "831b8a39f0cb366583e82d91ce0187e547061f27",
+    "result": "dev139 accepted; stable decoupled ~100Hz retained-XFB presenter, motion still jittery as expected without interpolation",
+    "display_refresh_hz": 99.943,
+    "observations": {
+      "source_publishes": 7096,
+      "host_presents": 12153,
+      "shutdown_present_pacing": {
+        "avg_ms": 10.185,
+        "p50_ms": 10.5,
+        "p95_ms": 10.5,
+        "p99_ms": 12.5
+      },
+      "producer": "late-game windows normally ~58-61 completed Wii frames/s"
+    },
+    "diagnosis": [
+      "retained-XFB lifetime and render-worker WebGPU ownership are proven",
+      "60 unique motion poses cannot map evenly to ~100Hz without interpolation",
+      "repeated final XFB presentation can itself look slightly more uneven than the old 60Hz baseline"
+    ],
+    "next": "validate dev140a replay preparation, then dev140b offscreen scene replay"
+  },
+  "latest_source_contract_failure": {
+    "date": "2026-09-21",
+    "launcher": "M14-LLVM-INTERP-IDENTITY-RUN.cmd",
+    "stage": "LLVM 2/7 source-only native-pipeline contracts",
+    "runtime_evidence": false,
+    "error": "second canonicalize_interpolation_region pass differed byte-for-byte from first",
+    "diagnosis": "seed text was removed from preserved prefix but its surrounding newline remained, creating whitespace drift",
+    "fix": [
+      "start canonical replacement at earliest existing exact hash-seed declaration when present",
+      "replace seed+helper region as one unit",
+      "retain duplicate-seed and second-pass byte-idempotency regression"
+    ],
+    "next": "rerun M14-LLVM-INTERP-IDENTITY-RUN.cmd"
+  },
+  "dev139": {
+    "status": "PLAYER-TESTED / ACCEPTED PRESENTATION-LIFETIME PROOF",
+    "launcher": "M14-LLVM-ASYNC-PRESENTER-RUN.cmd",
+    "accepted_log": "launch(20260922-025138).log",
+    "accepted_revision": "831b8a39f0cb366583e82d91ce0187e547061f27",
+    "display_refresh_hz": 99.943,
+    "simulation_hz": 60,
+    "target_present_hz": 100,
+    "interpolation": false,
+    "result": {
+      "source_publishes": 7096,
+      "host_presents": 12153,
+      "shutdown_present_avg_ms": 10.185,
+      "shutdown_present_p50_ms": 10.5,
+      "shutdown_present_p95_ms": 10.5,
+      "shutdown_present_p99_ms": 12.5,
+      "player_report": "still jittery, possibly slightly worse than baseline because 60 unique poses are unevenly repeated across ~100Hz"
+    },
+    "conclusion": "retained-XFB lifetime, render-worker WebGPU ownership and decoupled ~100Hz presentation are proven; repeated XFBs cannot remove temporal motion judder",
+    "next": "dev140 transform replay"
+  },
+  "dev140a": {
+    "status": "IMPLEMENTED / LOCAL RUNTIME TEST PENDING",
+    "name": "visual-neutral interpolation replay preparation",
+    "launcher": "M14-LLVM-INTERP-REPLAY-PREP-RUN.cmd",
+    "flags": [
+      "OPENSPM_M14_INTERP_REPLAY=1",
+      "OPENSPM_M14_ASYNC_PRESENTER=1"
+    ],
+    "visual_output": "unchanged dev139 retained-XFB presentation",
+    "architecture": [
+      "pair adjacent finalized GX draws using sampled final geometry/material identity",
+      "keep gx::DrawData exactly Aurora's 128-byte InlineDrawPayloadSize; replay metadata lives on DrawCommand sidecar",
+      "explicit 16-byte vs 32-byte GX uniform prefix, indexed-matrix flag and GX replay tag carried on DrawCommand",
+      "derive replay alphas from a rational display/source phase accumulator; exactly 100Hz yields 0,.6 | .2,.8 | .4",
+      "prefer SDL precise display refresh numerator/denominator when within 2Hz of requested presenter target",
+      "advance rational phase on every authoritative frame including empty/transition/no-match frames",
+      "clone existing uniform arena; never rebuild GX uniforms",
+      "store only active non-indexed currentPnMtx position matrix per draw instead of the full PN matrix palette",
+      "interpolate active currentPnMtx translation only; projection, rotation/scale and normal matrices remain authoritative/current",
+      "snap indexed-matrix draws, projection/basis discontinuities, ambiguity and implausible translation",
+      "prepare before gfx::finish while staging memory is mapped",
+      "reserve gx::MaxUniformSize for Aurora final scratch append",
+      "skip full-arena phase clones when no usable matched transform range exists",
+      "retain FramePacket through end-frame callback"
+    ],
+    "expected_markers": [
+      "M14 dev140 replay prep active:",
+      "M14 dev140 replay prep interval="
+    ],
+    "gate": "high match coverage, no arena exhaustion/crash, producer stays near dev139/dev138 envelope"
+  },
+  "dev140b": {
+    "status": "IMPLEMENTED / LOCAL RUNTIME TEST PENDING / VISUAL-NEUTRAL",
+    "name": "offscreen interpolation replay encode proof",
+    "launcher": "M14-LLVM-INTERP-REPLAY-ENCODE-RUN.cmd",
+    "flags": [
+      "OPENSPM_M14_INTERP_REPLAY=1",
+      "OPENSPM_M14_INTERP_REPLAY_ENCODE=1",
+      "OPENSPM_M14_ASYNC_PRESENTER=1"
+    ],
+    "purpose": "consume dev140a phase uniform arenas on Aurora render worker and replay EFB GX draws into isolated color/depth targets without publishing them",
+    "safety": [
+      "reuse dev140a DrawCommand GX sidecar tag and explicit EFB-pass tag; never infer from labels",
+      "authoritative EFB, guest EFB-copy side effects and visible dev139 presenter remain untouched",
+      "explicitly upload each prepared replay uniform arena from unmapped staging to shared GPU uniform buffer on Aurora render worker before replay",
+      "replay upload does not depend on a later authoritative FrameOp high-water mark existing",
+      "reject unsupported MSAA/multi-attachment/stencil/custom-draw/prior-load shapes closed",
+      "validate replay uniform ranges before remapped dynamic offsets",
+      "release proof targets before gfx/webgpu teardown",
+      "detailed rejection telemetry: layout, prior-load, custom-draw and range failures"
+    ],
+    "expected_markers": [
+      "M14 dev140b offscreen replay encode active:",
+      "M14 dev140b replay encode frame="
+    ],
+    "next_after_success": "publish prepared replay targets as deadline-scheduled presentation jobs with one-frame latency instead of dev139 repeated-XFB slots"
+  },
+  "frontier": {
+    "date": "2026-09-22",
+    "status": "dev140a/dev140b implemented; local validation pending",
+    "next_required_action": "run M14-LLVM-INTERP-REPLAY-PREP-RUN.cmd first; if accepted, run M14-LLVM-INTERP-REPLAY-ENCODE-RUN.cmd",
+    "constraints": [
+      "no GitHub Actions",
+      "authoritative Wii simulation remains 60Hz",
+      "all Dawn/WebGPU work remains on Aurora render worker",
+      "normal/default launchers leave dev140 runtime flags off",
+      "do not publish interpolated pixels until replay prep and offscreen encode are validated"
+    ]
+  },
+  "internal_resolution_audit": {
+    "status": "SOURCE-AUDITED",
+    "pinned_aurora_default": "window.cpp g_frameBufferScale defaults to 0.0f; get_window_size uses native SDL framebuffer pixels when scale is 0",
+    "openspm_usage": "no OpenSPM call to set_frame_buffer_scale or VISetFrameBufferScale found",
+    "conclusion": "current OpenSPM raster resolution is not hard-locked to the Wii base framebuffer; the user's ~100Hz judder is not explained by a 640x480 physical-pixel floor",
+    "nuance": "game-authored transform/camera coordinate quantization can still create spatial stepping independently of raster resolution",
+    "future_ab": "after temporal replay is validated, an explicit framebuffer-scale/resolution A/B can isolate any remaining spatial stepping"
+  },
+  "historical_dev88_performance_gate": {
+    "llvm_local_win_proven": false,
+    "current_question": "can dev89 remove enough measured guest-array staging/scan CPU, plus dev90 trim exact structural callback/rescue crossings, to keep deepest frames below the 16.667ms VI deadline?",
+    "required_next_steps_after_dev88": [
+      "run normal M14-LLVM-UPDATE-RUN.cmd; no cache wipe",
+      "verify dev89 configure marker applied/already active",
+      "verify generation prints dev90_native_first_entries=3",
+      "verify runtime dev90 startup marker",
+      "pass one wedding and keep hang_80065128_max=0",
+      "play 30-60 seconds in same heavy enemy/NPC area",
+      "compare M14 main-loop phases frames/host_ms and draw_done producer avg/p95 with launch(20260918-180757).log",
+      "on exit record dev90 hits/fallbacks and ordinary heavy sample",
+      "if DrawDone falls but 30Hz cliff remains, move to dev81 disp/main native profiling instead of broader dispatch speculation"
+    ]
+  },
+  "dev140_audit": {
+    "base_revision": "84ff81ec273e1065826f55afc848560f7a1a9075",
+    "status": "CLOUD ADAPTER/COMPILE/BEHAVIOR CHECKS PASS; WINDOWS RUNTIME PENDING",
+    "handoff": "docs/archive/M14-DEV140-AUDIT-2026-09-22.md",
+    "repairs": [
+      "scope real cumulative-source anchors",
+      "repair cached predecessor coexistence and canonicalize old dev140 bodies",
+      "complete outer DrawCommand metadata plumbing; preserve 128-byte inline DrawData",
+      "fix dev140b reconstruction marker dictionary slicing",
+      "require agreement of every shared GX uniform consumer, including indexed/rejected draws",
+      "run previously uncalled dev140 migration and analyzer tests",
+      "expose preparation cost and validate the selected active PN slot before snapshot reads"
+    ],
+    "verified": [
+      "cumulative adapter chain byte-idempotency",
+      "targeted Python contracts",
+      "GCC syntax compilation of five affected Aurora translation units",
+      "generated preparation behavior with ASan/UBSan (leak detection disabled under ptrace)"
+    ],
+    "not_verified": [
+      "MSVC build/link",
+      "dev140 Windows gameplay",
+      "offscreen replay image equivalence",
+      "new source/GPU frame-time results"
+    ]
+  },
+  "dev140_abi_audit": {
+    "status": "CORRECTED BEFORE LOCAL TEST",
+    "finding": "pinned Aurora gx::DrawData is exactly 128 bytes, equal to InlineDrawPayloadSize",
+    "rejected_design": "adding replay prefix/indexed fields directly to gx::DrawData",
+    "canonical_design": "DrawCommand sidecar metadata + metadata-aware GX recorder; DrawData unchanged",
+    "guard": "generated static_assert(sizeof(DrawData) == gfx::InlineDrawPayloadSize) plus source-only contracts",
+    "migration": "stale oversized cached draft is stripped and converged in place"
+  },
+  "dev140_presentation_timing": {
+    "proof_schedule": "rational display/source phase accumulator; at exactly 100Hz: 0,.6 | .2,.8 | .4",
+    "measured_display_hz": 99.943,
+    "production_requirement": "prepared source alphas are drift-free; final publication still needs absolute host presentation deadlines",
+    "rationale": "fixed 100:60 sequence is suitable for replay proof but can drift against 99.943Hz over long runs",
+    "current_alpha_source": "SDL precise refresh ratio when near requested target, otherwise configured target"
+  },
+  "dev140_history_optimization": {
+    "status": "IMPLEMENTED BEFORE LOCAL TEST",
+    "old_shape": "full std::array<gx::PnMtx, gx::MaxPnMtx> snapshot per draw",
+    "new_shape": "one Mat3x4<float> active currentPnMtx position matrix per non-indexed draw",
+    "rationale": "indexed draws snap; only currentPnMtx can affect the replayed non-indexed draw, so full PN palette copies were unnecessary producer overhead"
+  },
+  "audio_frontier_audit": {
+    "status": "NO TRIVIAL HOST-OUTPUT FIX",
+    "current_platform": "Broadway-visible DSP Audio DMA source/control latches are modeled, but native mixer/output timing is explicitly not implemented",
+    "reason_not_patched": "Nintendo AX DSP microcode is not executed; directly sending the Audio DMA buffer to a host device would not reproduce the missing DSP mix",
+    "safe_next_direction": "implement or integrate an AX/DSP HLE service rather than pretending the DMA latch alone is mixed PCM"
+  },
+  "dev140a_runtime_result": {
+    "log": "launch(20260922-142116).log",
+    "revision": "0376ed7916a1",
+    "user_observation": "looked pretty slow",
+    "status": "FAILED PERFORMANCE GATE",
+    "producer_windows": 92,
+    "producer_median_fps": 30.0,
+    "producer_min_fps": 20.32913843175218,
+    "windows_below_55fps": 80,
+    "heavy_prep_samples_ms": [
+      6.26,
+      7.684
+    ],
+    "renderer_framebuffer": "640x480 scale 1",
+    "report_bug": "old-format-only FPS parser and missing-data pass; corrected",
+    "causality": "preparation cost is substantial; stage attribution and same-scene baseline still required"
+  },
+  "bbox_flip_priority": {
+    "status": "PLAYER TEST PASSED: NO VISIBLE FLIP STALL",
+    "baseline_log": "launch(20260922-143225).log",
+    "baseline_producer_median_fps": 60.0,
+    "flip_display_stalls_seconds": [
+      6.76393,
+      6.728044
+    ],
+    "map_samples_ms": "approximately 19-20",
+    "candidate": "fresh bbox copy/map/wait on render worker; repeated presentation yields until next XFB publication",
+    "causal_limit": "Player improvement confirmed; separate runs and sparse timing samples, not a controlled all-query benchmark",
+    "test_launcher": "M14-LLVM-ASYNC-PRESENTER-RUN.cmd",
+    "same_build_control": "OPENSPM_M14_BBOX_PRIORITY=0",
+    "cloud_checks": [
+      "full adapter chain idempotency",
+      "source migration regressions",
+      "emitted queue behavior including disabled path",
+      "bbox.cpp and aurora.cpp syntax compilation"
+    ],
+    "result_log": "launch(20260922-184816).log",
+    "tested_revision": "9eb8ab83b906",
+    "result_producer_median_fps": 60.0,
+    "result_max_display_ms": 108.947,
+    "result_first_map_ms": 19.093,
+    "result_subsequent_sampled_map_ms": [
+      0.071,
+      0.459
+    ],
+    "remaining": "slight jitter and short hitches; dev140a preparation regression remains separate"
+  },
+  "visible_interpolation": {
+    "status": "IMPLEMENTED; WINDOWS VISUAL/PERFORMANCE TEST PENDING",
+    "launcher": "M14-LLVM-INTERPOLATED-RUN.cmd",
+    "baseline": "M14-LLVM-ASYNC-PRESENTER-RUN.cmd",
+    "default_target_hz": 100,
+    "simulation_hz": 60,
+    "supported_target_hz": [
+      61,
+      120
+    ],
+    "identity_control": "M14-LLVM-INTERPOLATED-RUN.cmd AUTO 100 identity",
+    "design": [
+      "cacheable write-time CPU upload mirrors",
+      "translation-only pose interpolation",
+      "actual GXCopyDisp boundary and conversion",
+      "private replay bbox storage",
+      "conservative mutable-resource fallback",
+      "owned timed XFB image queue bounded to eight"
+    ],
+    "plan": "docs/archive/M14-VISIBLE-INTERPOLATION-PLAN-2026-09-22.md",
+    "not_yet_proven": [
+      "Windows preparation speedup",
+      "MSVC linking",
+      "GPU image equivalence",
+      "visibly smoother scrolling at preserved source FPS"
+    ]
+  }
+}

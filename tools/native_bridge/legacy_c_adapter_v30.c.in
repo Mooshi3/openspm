@@ -1,0 +1,164 @@
+/*
+ * M14 local-module bridge v30 / LLVM SelectThread context-resume re-entry.
+ *
+ * dev39 proved the VI wake path itself is healthy during seq_logo stage 1:
+ * __VIRetraceHandler repeatedly changes RunQueueBits from zero to 0x00800000
+ * and Nintendo code consumes that bit again.  The permanent post-relF stall
+ * therefore is not a missing VI interrupt or a fundamentally broken scheduler.
+ *
+ * Revolution OS thread switches are non-local. SelectThread calls
+ * OSSaveContext(current_thread), and OSLoadContext/rfi later resumes the thread
+ * at the instruction immediately after that linked call. Generated-C can enter
+ * that interior PC directly. LLVM needs a compiler partition at the same saved
+ * continuation, just as dev38 required one for SelectThread's 0x8027551C idle
+ * continuation.
+ *
+ * derive_v19_llvm_seams.py now fail-closed scans the verified R8PE01 rev-2 DOL
+ * for the unique SelectThread -> OSSaveContext(0x8026E5E4) BL and emits both
+ * its call PC and PC+4 resume address into the player-local partition map/header.
+ *
+ * v30 changes no guest scheduler state. It only proves the generated LLVM region
+ * geometry at OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY and records whether that
+ * non-local resume entry is actually queried at runtime.
+ *
+ * Historical marker retained for source-contract ancestry:
+ * m14-dev39-llvm-stage1-scheduler-probe
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev39_scheduler_probe_base
+#include "legacy_c_adapter_v29.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V40_LOG_LIMIT UINT32_C(12)
+
+static openspm_native_create_fn g_m14_v40_underlying_create;
+static openspm_native_destroy_fn g_m14_v40_underlying_destroy;
+static PPCHostCall g_m14_v40_underlying_host_call;
+static uint32_t g_m14_v40_query_logs;
+static uint32_t g_m14_v40_entry_hits;
+static uint32_t g_m14_v40_bad_geometry;
+
+static void bridge_v40_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static bool bridge_host_call_v40(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance;
+    bool handled;
+    if (cpu == NULL || g_m14_v40_underlying_host_call == NULL)
+        return false;
+    instance = bridge_from_cpu(cpu);
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t entry_pc = (uint32_t)cpu->pc;
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        const int relevant =
+            entry_pc == OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY ||
+            (OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY >= start &&
+             OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY < end);
+        handled = g_m14_v40_underlying_host_call(cpu, address);
+        if (entry_pc == OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY)
+            ++g_m14_v40_entry_hits;
+        if (relevant && g_m14_v40_query_logs < OPENSPM_M14_V40_LOG_LIMIT) {
+            char message[384];
+            const int exact_start =
+                start == OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY;
+            if (entry_pc == OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY && !exact_start)
+                ++g_m14_v40_bad_geometry;
+            (void)snprintf(
+                message, sizeof(message),
+                "M14 LLVM scheduler context reentry query #%u pc=0x%08X range=[0x%08X,0x%08X) save_call=0x%08X exact_start=%s blocked=%s rid=0x%02X entry_hits=%u bad_geometry=%u.",
+                (unsigned)(g_m14_v40_query_logs + 1u),
+                (unsigned)entry_pc, (unsigned)start, (unsigned)end,
+                (unsigned)OPENSPM_LOCAL_SCHEDULER_CONTEXT_SAVE_CALL,
+                exact_start ? "yes" : "no",
+                handled ? "yes" : "no", (unsigned)cpu->external_rid,
+                (unsigned)g_m14_v40_entry_hits,
+                (unsigned)g_m14_v40_bad_geometry);
+            bridge_v40_log(instance, message);
+            ++g_m14_v40_query_logs;
+        }
+        return handled;
+    }
+
+    return g_m14_v40_underlying_host_call(cpu, address);
+}
+
+static int OPENSPM_CALL bridge_create_v40(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v40_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v40_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v40_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_v40;
+    g_m14_v40_query_logs = 0u;
+    g_m14_v40_entry_hits = 0u;
+    g_m14_v40_bad_geometry = 0u;
+
+    {
+        char message[320];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM scheduler context-resume partition active: SelectThread OSSaveContext call=0x%08X saved PC+4=0x%08X is a hard compiler boundary; Nintendo context state remains authoritative.",
+            (unsigned)OPENSPM_LOCAL_SCHEDULER_CONTEXT_SAVE_CALL,
+            (unsigned)OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY);
+        bridge_v40_log(instance, message);
+    }
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v40(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[256];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM scheduler context reentry stats queries=%u entry_hits=%u bad_geometry=%u.",
+            (unsigned)g_m14_v40_query_logs,
+            (unsigned)g_m14_v40_entry_hits,
+            (unsigned)g_m14_v40_bad_geometry);
+        bridge_v40_log(instance, message);
+        instance->cpu.host_call = g_m14_v40_underlying_host_call;
+    }
+    if (g_m14_v40_underlying_destroy != NULL)
+        g_m14_v40_underlying_destroy(opaque);
+    g_m14_v40_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev39_scheduler_probe_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v40_underlying_create = out_api->create;
+    g_m14_v40_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev40-llvm-scheduler-context-reentry";
+    out_api->create = bridge_create_v40;
+    out_api->destroy = bridge_destroy_v40;
+#endif
+    return OPENSPM_OK;
+}

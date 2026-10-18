@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_striker.dll in the mods folder.
+id = "openspm.sample.striker"
+name = "Koopa Striker"
+version = "1.0"
+author = "OpenSPM samples"
+description = "Play as the Koopa Striker: crouch to set a shell down and kick it."
+requires = ["openspm.content>=1"]

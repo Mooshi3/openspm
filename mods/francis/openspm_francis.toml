@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_francis.dll in the mods folder.
+id = "openspm.sample.francis"
+name = "Francis"
+version = "1.0"
+author = "OpenSPM samples"
+description = "Play as Francis: big, slow, and his tongue hits the enemy in front (crouch or F5)."
+requires = ["openspm.content>=1", "openspm.guest_memory>=1", "openspm.guest_call>=1"]

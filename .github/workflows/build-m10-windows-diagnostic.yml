@@ -1,0 +1,120 @@
+name: Build M10 Windows diagnostic frontend
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-m10-windows-diagnostic.yml"
+      - "ci/m10_windows_instrument.py"
+      - "ci/recompcore-portable-rel-discovery.patch"
+      - "ci/recompcore-hidapi-nonfatal.patch"
+  workflow_dispatch:
+
+# Runtime fix revision: hidapi-nonfatal-v1
+permissions:
+  contents: read
+
+concurrency:
+  group: m10-windows-diagnostic
+  cancel-in-progress: true
+
+jobs:
+  build-diagnostic:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Windows build environment
+        run: choco install ninja --no-progress -y
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch exact ModernGekko source recursively
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init ModernGekko
+          git -C ModernGekko remote add origin https://github.com/ExpansionPak/ModernGekko.git
+          git -C ModernGekko fetch --depth=1 origin 5417826c31187d4dadf8588c7aa25bf107782936
+          git -C ModernGekko checkout --detach FETCH_HEAD
+          git -C ModernGekko submodule update --init --recursive --force
+          test "$(git -C ModernGekko rev-parse HEAD)" = 5417826c31187d4dadf8588c7aa25bf107782936
+          test "$(git -C ModernGekko/vendor/dolphin rev-parse HEAD)" = 55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac
+
+      - name: Apply ABI3 compatibility and runtime patches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('ModernGekko/include/moderngekko/cpu_state.h')
+          s = p.read_text()
+          assert s.count('#define MODERNGEKKO_CPU_ABI_VERSION 4u') == 1
+          assert s.count('    int64_t cycle_budget;\n') == 1
+          s = s.replace('#define MODERNGEKKO_CPU_ABI_VERSION 4u', '#define MODERNGEKKO_CPU_ABI_VERSION 3u', 1)
+          s = s.replace('    int64_t cycle_budget;\n', '', 1)
+          p.write_text(s)
+          PY
+          PATCH="$GITHUB_WORKSPACE/ci/recompcore-portable-rel-discovery.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$PATCH"
+          HIDAPI_PATCH="$GITHUB_WORKSPACE/ci/recompcore-hidapi-nonfatal.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$HIDAPI_PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$HIDAPI_PATCH"
+
+      - name: Add startup breadcrumbs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python ci/m10_windows_instrument.py
+          git -C ModernGekko diff -- src/runtime/dolphin_runtime.cpp include/moderngekko/cpu_state.h > diagnostic-moderngekko.patch
+          git -C ModernGekko/vendor/dolphin diff > diagnostic-recompcore.patch
+          git -C ModernGekko diff --check
+          git -C ModernGekko/vendor/dolphin diff --check
+
+      - name: Reuse green M10 compiler cache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: spm-m10-windows-5417826c-55c7b023
+          variant: sccache
+          max-size: 2G
+
+      - name: Configure diagnostic ModernGekko
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S ModernGekko -B ModernGekko/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=ON \
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF \
+            -DMODERNGEKKO_ENABLE_DISC_TOOL=OFF \
+            2>&1 | tee diagnostic-configure.log
+
+      - name: Build diagnostic Windows frontend
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build ModernGekko/build --target moderngekko-run -j2 \
+            2>&1 | tee diagnostic-build.log
+
+      - name: Package diagnostic frontend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $runner = Get-ChildItem ModernGekko/build -Recurse -Filter moderngekko-run.exe | Select-Object -First 1
+          if (!$runner) { throw 'moderngekko-run.exe not found' }
+          Copy-Item $runner.FullName dist/moderngekko-run.exe
+          Copy-Item ModernGekko/vendor/dolphin/Data/Sys dist/Sys -Recurse
+          Copy-Item diagnostic-moderngekko.patch,diagnostic-recompcore.patch,diagnostic-configure.log,diagnostic-build.log dist/
+          Get-FileHash dist/moderngekko-run.exe -Algorithm SHA256 | Format-List | Out-File dist/SHA256.txt
+
+      - name: Upload diagnostic frontend
+        uses: actions/upload-artifact@v4
+        with:
+          name: spm-m10-windows-diagnostic-frontend
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,302 @@
+/*
+ * M14 local-module bridge v15 / LLVM-native v19 seam overlay.
+ *
+ * This file is intentionally inactive for the normal generated-C player path.
+ * It exists for the opt-in DolRecomp LLVM object build. The complete proven
+ * v13/v20/v19 bridge remains underneath, including GX transport, fixed-phase VI,
+ * host-derived MFTB, NAND/input semantics, and the v19 physical display-list
+ * recorder implementation.
+ *
+ * Generated C implements v19 by injecting before-call and durable return-label
+ * hooks into player-local chunk source. LLVM native objects cannot be text-
+ * rewritten that way. Current DolRecomp solves the architectural problem for us:
+ * every LLVM native region asks CPUState::host_call whether [start,end) is safe
+ * before entering. A blocked region materializes architectural state and returns
+ * to the public dispatcher.
+ *
+ * The player-local seam generator partitions LLVM at GXBeginDisplayList /
+ * GXEndDisplayList and at every caller PC+4 continuation. This overlay then:
+ *   1. blocks those tiny regions in the native-region query;
+ *   2. handles the v19 pre/post seam once at the exact materialized guest PC;
+ *   3. grants a one-shot permit for that PC's next native-region query; and
+ *   4. returns false so the real guest instruction/function executes normally.
+ *
+ * The permit is consumed only if no ordinary OpenSPM host target and no other
+ * v19 seam lies in the queried region. This fails closed if LLVM partitioning
+ * ever drifts instead of accidentally skipping a required display-list hook.
+ *
+ * For A/B telemetry the four real SPM frame-loop entries use the same one-shot
+ * mechanism to call the existing v13 phase/cadence counters under LLVM. They are
+ * diagnostic seams only and do not change guest state.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev20_phase_llvm_base
+#include "legacy_c_adapter_v13.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#include "openspm_local_v19_llvm_seams.h"
+
+#define OPENSPM_M14_LLVM_PHASE_BEFORE UINT32_C(0x801A8A9C)
+#define OPENSPM_M14_LLVM_PHASE_DISP   UINT32_C(0x801A7D1C)
+#define OPENSPM_M14_LLVM_PHASE_MAIN   UINT32_C(0x801A7AAC)
+#define OPENSPM_M14_LLVM_PHASE_DONE   UINT32_C(0x801A8B64)
+
+static openspm_native_create_fn g_m14_v23_underlying_create;
+static openspm_native_destroy_fn g_m14_v23_underlying_destroy;
+static PPCHostCall g_m14_v23_underlying_host_call;
+static uint32_t g_m14_v23_permit_pc;
+static uint32_t g_m14_v23_permit_armed;
+static uint32_t g_m14_v23_logged;
+static uint64_t g_m14_v23_region_queries;
+static uint64_t g_m14_v23_region_blocks;
+static uint64_t g_m14_v23_permits;
+static uint64_t g_m14_v23_seam_hits;
+
+static int bridge_v23_contains(const uint32_t *values,
+                               uint32_t count,
+                               uint32_t address) {
+    uint32_t i;
+    for (i = 0u; i < count; ++i)
+        if (values[i] == address) return 1;
+    return 0;
+}
+
+static int bridge_v23_is_begin_return(uint32_t address) {
+    return bridge_v23_contains(OPENSPM_LOCAL_V19_BEGIN_RETURNS,
+                               OPENSPM_LOCAL_V19_BEGIN_COUNT, address);
+}
+
+static int bridge_v23_is_end_return(uint32_t address) {
+    return bridge_v23_contains(OPENSPM_LOCAL_V19_END_RETURNS,
+                               OPENSPM_LOCAL_V19_END_COUNT, address);
+}
+
+static int bridge_v23_phase_id(uint32_t address, uint32_t *out_phase) {
+    if (out_phase == NULL) return 0;
+    switch (address) {
+    case OPENSPM_M14_LLVM_PHASE_BEFORE: *out_phase = 0u; return 1;
+    case OPENSPM_M14_LLVM_PHASE_DISP:   *out_phase = 1u; return 1;
+    case OPENSPM_M14_LLVM_PHASE_MAIN:   *out_phase = 2u; return 1;
+    case OPENSPM_M14_LLVM_PHASE_DONE:   *out_phase = 3u; return 1;
+    default: return 0;
+    }
+}
+
+static int bridge_v23_is_seam(uint32_t address) {
+    uint32_t phase;
+    return address == OPENSPM_LOCAL_V19_GX_BEGIN ||
+           address == OPENSPM_LOCAL_V19_GX_END ||
+           bridge_v23_is_begin_return(address) ||
+           bridge_v23_is_end_return(address) ||
+           bridge_v23_phase_id(address, &phase);
+}
+
+static int bridge_v23_range_has_seam(uint32_t start,
+                                     uint32_t end,
+                                     uint32_t ignored) {
+    uint32_t i;
+    static const uint32_t phases[] = {
+        OPENSPM_M14_LLVM_PHASE_BEFORE,
+        OPENSPM_M14_LLVM_PHASE_DISP,
+        OPENSPM_M14_LLVM_PHASE_MAIN,
+        OPENSPM_M14_LLVM_PHASE_DONE,
+    };
+    if (end <= start) return 0;
+#define OPENSPM_V23_CHECK(value) \
+    do { \
+        const uint32_t openspm_v23_value = (uint32_t)(value); \
+        if (openspm_v23_value != ignored && openspm_v23_value >= start && \
+            openspm_v23_value < end) return 1; \
+    } while (0)
+    OPENSPM_V23_CHECK(OPENSPM_LOCAL_V19_GX_BEGIN);
+    OPENSPM_V23_CHECK(OPENSPM_LOCAL_V19_GX_END);
+    for (i = 0u; i < OPENSPM_LOCAL_V19_BEGIN_COUNT; ++i)
+        OPENSPM_V23_CHECK(OPENSPM_LOCAL_V19_BEGIN_RETURNS[i]);
+    for (i = 0u; i < OPENSPM_LOCAL_V19_END_COUNT; ++i)
+        OPENSPM_V23_CHECK(OPENSPM_LOCAL_V19_END_RETURNS[i]);
+    for (i = 0u; i < (uint32_t)(sizeof(phases) / sizeof(phases[0])); ++i)
+        OPENSPM_V23_CHECK(phases[i]);
+#undef OPENSPM_V23_CHECK
+    return 0;
+}
+
+static void bridge_v23_arm_permit(uint32_t address) {
+    g_m14_v23_permit_pc = address;
+    g_m14_v23_permit_armed = 1u;
+}
+
+static void bridge_v23_log_once(CPUState *cpu) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    if (g_m14_v23_logged || cpu == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    host->log(host->context, OPENSPM_LOG_INFO,
+              "M14 DolRecomp LLVM native execution active: v19 GX begin/end and durable return seams use materialized one-shot region interception; C bridge semantics preserved.");
+    g_m14_v23_logged = 1u;
+}
+
+static bool bridge_host_call_v23(CPUState *cpu, u32 address) {
+    uint32_t phase = 0u;
+
+    if (cpu == NULL) return false;
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        const uint32_t permit = g_m14_v23_permit_armed ? g_m14_v23_permit_pc : 0u;
+        int underlying_blocked = 0;
+        int contains_permit = 0;
+        int seam_blocked;
+
+        ++g_m14_v23_region_queries;
+        if (g_m14_v23_underlying_host_call != NULL)
+            underlying_blocked = g_m14_v23_underlying_host_call(cpu, address) ? 1 : 0;
+        else
+            cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+
+        /* Preserve the CPU runtime's query handshake even if a future base
+           bridge delegates differently. */
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+
+        if (g_m14_v23_permit_armed && permit >= start && permit < end)
+            contains_permit = 1;
+        seam_blocked = bridge_v23_range_has_seam(start, end,
+                                                  contains_permit ? permit : 0u);
+
+        if (underlying_blocked || seam_blocked) {
+            ++g_m14_v23_region_blocks;
+            return true;
+        }
+        if (contains_permit) {
+            g_m14_v23_permit_armed = 0u;
+            g_m14_v23_permit_pc = 0u;
+            ++g_m14_v23_permits;
+        }
+        return false;
+    }
+
+    if (address == OPENSPM_LOCAL_V19_GX_BEGIN) {
+        ++g_m14_v23_seam_hits;
+        bridge_v23_log_once(cpu);
+        if (!openspm_m14_display_list_begin_before_native_v19(
+                cpu, cpu->gpr[3], cpu->gpr[4]))
+            return true;
+        bridge_v23_arm_permit((uint32_t)address);
+        return false;
+    }
+
+    if (address == OPENSPM_LOCAL_V19_GX_END) {
+        ++g_m14_v23_seam_hits;
+        bridge_v23_log_once(cpu);
+        if (!openspm_m14_display_list_end_before_native_v19(cpu))
+            return true;
+        bridge_v23_arm_permit((uint32_t)address);
+        return false;
+    }
+
+    if (bridge_v23_is_begin_return((uint32_t)address)) {
+        ++g_m14_v23_seam_hits;
+        if (!openspm_m14_display_list_begin_after_return_v19(cpu))
+            return true;
+        bridge_v23_arm_permit((uint32_t)address);
+        return false;
+    }
+
+    if (bridge_v23_is_end_return((uint32_t)address)) {
+        ++g_m14_v23_seam_hits;
+        if (!openspm_m14_display_list_end_after_return_v19(cpu))
+            return true;
+        bridge_v23_arm_permit((uint32_t)address);
+        return false;
+    }
+
+    if (bridge_v23_phase_id((uint32_t)address, &phase)) {
+        ++g_m14_v23_seam_hits;
+        openspm_m14_note_frame_phase_v20(cpu, phase);
+        if ((uint32_t)address == OPENSPM_M14_LLVM_PHASE_MAIN)
+            openspm_m14_note_spmario_main_v20(cpu);
+        bridge_v23_arm_permit((uint32_t)address);
+        return false;
+    }
+
+    return g_m14_v23_underlying_host_call != NULL
+               ? g_m14_v23_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v23(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v23_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v23_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+    instance = (openspm_bridge_instance *)*out_instance;
+
+    g_m14_v23_underlying_host_call = instance->cpu.host_call;
+    g_m14_v23_permit_pc = 0u;
+    g_m14_v23_permit_armed = 0u;
+    g_m14_v23_logged = 0u;
+    g_m14_v23_region_queries = 0u;
+    g_m14_v23_region_blocks = 0u;
+    g_m14_v23_permits = 0u;
+    g_m14_v23_seam_hits = 0u;
+    instance->cpu.host_call = bridge_host_call_v23;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v23(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL && instance->runtime->host->log != NULL &&
+        g_m14_v23_region_queries != 0u) {
+        char message[384];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM seam stats queries=%llu blocked=%llu permits=%llu seam_hits=%llu permit_pending=%u permit_pc=0x%08X.",
+                       (unsigned long long)g_m14_v23_region_queries,
+                       (unsigned long long)g_m14_v23_region_blocks,
+                       (unsigned long long)g_m14_v23_permits,
+                       (unsigned long long)g_m14_v23_seam_hits,
+                       (unsigned)g_m14_v23_permit_armed,
+                       (unsigned)g_m14_v23_permit_pc);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v23_underlying_host_call;
+    g_m14_v23_underlying_host_call = NULL;
+    g_m14_v23_permit_pc = 0u;
+    g_m14_v23_permit_armed = 0u;
+    if (g_m14_v23_underlying_destroy != NULL)
+        g_m14_v23_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev20_phase_llvm_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v23_underlying_create = out_api->create;
+    g_m14_v23_underlying_destroy = out_api->destroy;
+    out_api->create = bridge_create_v23;
+    out_api->destroy = bridge_destroy_v23;
+#endif
+    return OPENSPM_OK;
+}

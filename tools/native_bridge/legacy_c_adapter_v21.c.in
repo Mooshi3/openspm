@@ -1,0 +1,243 @@
+/*
+ * M14 local-module bridge v21 / native PC system-UI seam.
+ *
+ * The first LLVM run past DSP/audio bootstrap reaches SPM's normal frame loop
+ * but remains at seq=0/stage=0. Exact player-owned R8PE01 bytes show
+ * spmarioMain() has exactly one direct linked call to homebuttonMain():
+ *
+ *   0x801A7ABC: bl 0x8023F994
+ *   0x801A7AC0: continuation
+ *
+ * and skips seqMain plus the normal game-update stack whenever that Wii HOME
+ * shell service reports the overlay active.
+ *
+ * The first v21 runtime proved an important LLVM detail: merely blocking the
+ * callee's native region is insufficient because this direct call can be
+ * absorbed into its caller's native lowering. However the existing LLVM seam
+ * machinery already materializes 0x801A7ABC as an ordinary host-call boundary
+ * on every attempted frame. Intercept the boundary we actually observe.
+ *
+ * Runtime 024059 then proved the completed HOME call itself worked, but the
+ * continuation at 0x801A7AC0 was immediately bounced back out by the older v23
+ * phase seam: the queried native range [0x801A7AAC,0x801A7CAC) still contains
+ * the spmarioMain phase entry at 0x801A7AAC, so v23 correctly blocks that range
+ * unless its one-shot permit is armed. The compiler already admits linked-call
+ * PC+4 continuations as cold entries; grant exactly one permit for the existing
+ * spmarioMain phase seam when completing HOME so 0x801A7AC0 can execute.
+ *
+ * On Wii homebuttonMain services Nintendo's HOME Menu shell. OpenSPM is a PC
+ * port and should ultimately own pause/system UI itself. Until that native UI
+ * exists, the policy is "HOME overlay inactive". At the exact verified callsite
+ * reproduce the architectural completed-call state: r3=0, LR=PC+4, PC=PC+4.
+ * The clean player DOL is never modified.
+ *
+ * Keep the original callee-region interception below as a fail-safe if a future
+ * compiler layout materializes the callee directly. Both paths fail closed
+ * unless the exact call instruction and verified R8PE01 function prologue match.
+ * Generated-C rollback remains untouched.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev29_dsp_base
+#include "legacy_c_adapter_v20.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_HOMEBUTTON_CALL UINT32_C(0x801A7ABC)
+#define OPENSPM_M14_HOMEBUTTON_RETURN UINT32_C(0x801A7AC0)
+#define OPENSPM_M14_HOMEBUTTON_CALL_RAW UINT32_C(0x48097ED9)
+#define OPENSPM_M14_HOMEBUTTON_MAIN UINT32_C(0x8023F994)
+#define OPENSPM_M14_HOMEBUTTON_STWU UINT32_C(0x9421FF60)
+#define OPENSPM_M14_HOMEBUTTON_MFLR UINT32_C(0x7C0802A6)
+#define OPENSPM_M14_HOMEBUTTON_STW_LR UINT32_C(0x900100A4)
+#define OPENSPM_M14_HOMEBUTTON_ADDI UINT32_C(0x396100A0)
+
+static openspm_native_create_fn g_m14_v30_underlying_create;
+static openspm_native_destroy_fn g_m14_v30_underlying_destroy;
+static PPCHostCall g_m14_v30_underlying_host_call;
+static uint64_t g_m14_v30_home_hits;
+static uint32_t g_m14_v30_home_logged;
+static uint32_t g_m14_v30_home_mismatch_logged;
+
+static void bridge_v30_log(CPUState *cpu,
+                           openspm_log_level level,
+                           const char *message) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    if (cpu == NULL || message == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, level, message);
+}
+
+static int bridge_v30_home_signature_matches(CPUState *cpu) {
+    if (cpu == NULL ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_HOMEBUTTON_CALL, 4u) ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_HOMEBUTTON_MAIN, 16u))
+        return 0;
+    return mem_read32(cpu, OPENSPM_M14_HOMEBUTTON_CALL) ==
+               OPENSPM_M14_HOMEBUTTON_CALL_RAW &&
+           mem_read32(cpu, OPENSPM_M14_HOMEBUTTON_MAIN + 0u) ==
+               OPENSPM_M14_HOMEBUTTON_STWU &&
+           mem_read32(cpu, OPENSPM_M14_HOMEBUTTON_MAIN + 4u) ==
+               OPENSPM_M14_HOMEBUTTON_MFLR &&
+           mem_read32(cpu, OPENSPM_M14_HOMEBUTTON_MAIN + 8u) ==
+               OPENSPM_M14_HOMEBUTTON_STW_LR &&
+           mem_read32(cpu, OPENSPM_M14_HOMEBUTTON_MAIN + 12u) ==
+               OPENSPM_M14_HOMEBUTTON_ADDI;
+}
+
+static void bridge_v30_log_mismatch_once(CPUState *cpu) {
+    if (g_m14_v30_home_mismatch_logged) return;
+    bridge_v30_log(
+        cpu, OPENSPM_LOG_INFO,
+        "M14 LLVM native HOME-system-UI seam refused: R8PE01 call/prologue signature changed; leaving guest behavior untouched.");
+    g_m14_v30_home_mismatch_logged = 1u;
+}
+
+static void bridge_v30_log_active_once(CPUState *cpu) {
+    if (g_m14_v30_home_logged) return;
+    bridge_v30_log(
+        cpu, OPENSPM_LOG_INFO,
+        "M14 LLVM native system-UI seam active: verified spmarioMain->homebuttonMain call reports HOME overlay inactive; OpenSPM will own PC pause/system UI.");
+    g_m14_v30_home_logged = 1u;
+}
+
+static void bridge_v30_arm_spmario_resume(void) {
+    /* v23's diagnostic phase seam blocks any native region containing the
+       spmarioMain entry until its one-shot permit is consumed. HOME completion
+       resumes at 0x801A7AC0 inside that same region, so permit the existing
+       phase seam exactly once. The linked-call continuation itself is already a
+       legal LLVM cold entry due to the compiler-side PC+4 entry repair. */
+    bridge_v23_arm_permit(OPENSPM_M14_LLVM_PHASE_MAIN);
+}
+
+static bool bridge_host_call_v30(CPUState *cpu, u32 address) {
+    if (cpu == NULL) return false;
+
+    /* Runtime 022137 proved this exact call instruction is already materialized
+       as an ordinary LLVM host-call boundary. Complete the call semantically at
+       that boundary instead of relying on a second native-region query for the
+       directly lowered callee. */
+    if ((uint32_t)address == OPENSPM_M14_HOMEBUTTON_CALL) {
+        if (!bridge_v30_home_signature_matches(cpu)) {
+            bridge_v30_log_mismatch_once(cpu);
+            return g_m14_v30_underlying_host_call != NULL
+                       ? g_m14_v30_underlying_host_call(cpu, address)
+                       : false;
+        }
+        cpu->gpr[3] = 0u;
+        cpu->lr = OPENSPM_M14_HOMEBUTTON_RETURN;
+        cpu->pc = OPENSPM_M14_HOMEBUTTON_RETURN;
+        bridge_v30_arm_spmario_resume();
+        ++g_m14_v30_home_hits;
+        bridge_v30_log_active_once(cpu);
+        return true;
+    }
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        int underlying_blocked = 0;
+
+        if (g_m14_v30_underlying_host_call != NULL)
+            underlying_blocked =
+                g_m14_v30_underlying_host_call(cpu, address) ? 1 : 0;
+        else
+            cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        if (underlying_blocked) return true;
+        return end > start && OPENSPM_M14_HOMEBUTTON_MAIN >= start &&
+               OPENSPM_M14_HOMEBUTTON_MAIN < end;
+    }
+
+    /* Fail-safe for a future LLVM layout which materializes the callee entry
+       itself rather than the verified caller boundary. In that case the BL has
+       already executed, so return through the architectural LR. */
+    if ((uint32_t)address == OPENSPM_M14_HOMEBUTTON_MAIN) {
+        if (!bridge_v30_home_signature_matches(cpu)) {
+            bridge_v30_log_mismatch_once(cpu);
+            return g_m14_v30_underlying_host_call != NULL
+                       ? g_m14_v30_underlying_host_call(cpu, address)
+                       : false;
+        }
+        cpu->gpr[3] = 0u;
+        cpu->pc = cpu->lr;
+        if ((uint32_t)cpu->pc == OPENSPM_M14_HOMEBUTTON_RETURN)
+            bridge_v30_arm_spmario_resume();
+        ++g_m14_v30_home_hits;
+        bridge_v30_log_active_once(cpu);
+        return true;
+    }
+
+    return g_m14_v30_underlying_host_call != NULL
+               ? g_m14_v30_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v30(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_v30_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v30_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v30_underlying_host_call = instance->cpu.host_call;
+    g_m14_v30_home_hits = 0u;
+    g_m14_v30_home_logged = 0u;
+    g_m14_v30_home_mismatch_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v30;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v30(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v30_home_hits != 0u &&
+        instance->runtime != NULL && instance->runtime->host != NULL &&
+        instance->runtime->host->log != NULL) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM native system-UI stats home_inactive_frames=%llu.",
+                       (unsigned long long)g_m14_v30_home_hits);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v30_underlying_host_call;
+    if (g_m14_v30_underlying_destroy != NULL)
+        g_m14_v30_underlying_destroy(opaque);
+    g_m14_v30_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev29_dsp_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v30_underlying_create = out_api->create;
+    g_m14_v30_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev32-llvm-native-system-ui-resume";
+    out_api->create = bridge_create_v30;
+    out_api->destroy = bridge_destroy_v30;
+#endif
+    return OPENSPM_OK;
+}

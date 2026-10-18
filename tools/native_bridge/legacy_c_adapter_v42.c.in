@@ -1,0 +1,178 @@
+/*
+ * M14 dev70 LLVM wedding/eff_sub liveness diagnostic over dev69/dev68.
+ *
+ * The player-confirmed dev69 run still hangs indefinitely at 0x80065128 during
+ * the wedding scene while VI remains healthy.  The existing dev67 snapshot
+ * proves this is a counted loop inside the game's effect subsystem, but omitted
+ * the induction register and the r13 small-data global that supplies the loop
+ * bound.  This wrapper adds observation only: no guest register, memory, queue,
+ * timer, renderer or callback semantics are changed.
+ *
+ * The retained dev69 implementation lives in
+ * legacy_c_adapter_v42_dev69.c.in and is wrapped at the public module ABI.
+ * Later observation-only performance probes (currently dev111) are layered
+ * there because the exact dispDraw nested boundary and frame-phase hooks it
+ * owns are the lowest-overhead places to observe callback and Mario motion
+ * cadence without changing guest semantics.
+ *
+ * Opt-in audio (OPENSPM_AUDIO=1, docs/AUDIO-PLAN.md stage 2) is attached here
+ * too, from m14_audio_bridge.h: with the variable unset nothing is wrapped.
+ *
+ * Source-contract anchors retained through the included bridge chain:
+ * m14-dev49-llvm-pc-display-list-return
+ * m14-dev51-llvm-test-ready-gx-input
+ * m14-dev52-llvm-frame-phase-continuation
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev70_base
+#include "legacy_c_adapter_v42_dev69.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+
+#include "m14_audio_bridge.h"
+
+#define OPENSPM_M14_DEV70_HANG_PC UINT32_C(0x80065128)
+#define OPENSPM_M14_DEV70_EFFSUB_SDA_DISP UINT32_C(0x00007F60)
+
+static openspm_native_create_fn g_m14_dev70_underlying_create;
+static openspm_native_run_fn g_m14_dev70_underlying_run;
+static openspm_native_destroy_fn g_m14_dev70_underlying_destroy;
+static uint64_t g_m14_dev70_hang_consecutive;
+
+static void bridge_dev70_log_effsub_snapshot(openspm_bridge_instance *instance,
+                                              uint64_t consecutive) {
+    CPUState *cpu;
+    uint32_t sda_slot;
+    uint32_t effect_ptr = 0u;
+    uint32_t effect_words[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    uint32_t r3_count = 0u;
+    int slot_valid;
+    int effect_valid = 0;
+    int r3_count_valid = 0;
+    char message[2048];
+    uint32_t i;
+
+    if (instance == NULL) return;
+    cpu = &instance->cpu;
+
+    /* 0x806D80A0 at the stationary PC decodes as lwz r3,-0x7F60(r13).
+       Read only through the existing guest-memory helpers and validate every
+       address first. */
+    sda_slot = (uint32_t)cpu->gpr[13] - OPENSPM_M14_DEV70_EFFSUB_SDA_DISP;
+    slot_valid = bridge_m14_context_address_valid(cpu, sda_slot, UINT32_C(4));
+    if (slot_valid) {
+        effect_ptr = mem_read32(cpu, sda_slot);
+        if (effect_ptr <= UINT32_MAX - UINT32_C(32) &&
+            bridge_m14_context_address_valid(cpu, effect_ptr, UINT32_C(32))) {
+            effect_valid = 1;
+            for (i = 0u; i < 8u; ++i)
+                effect_words[i] = mem_read32(cpu, effect_ptr + i * UINT32_C(4));
+        }
+    }
+
+    if ((uint32_t)cpu->gpr[3] <= UINT32_MAX - UINT32_C(8) &&
+        bridge_m14_context_address_valid(cpu,
+            (uint32_t)cpu->gpr[3] + UINT32_C(4), UINT32_C(4))) {
+        r3_count_valid = 1;
+        r3_count = mem_read32(cpu, (uint32_t)cpu->gpr[3] + UINT32_C(4));
+    }
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev70 eff_sub loop diagnostic count=%llu pc=0x%08X lr=0x%08X ctr=0x%08X r13=0x%08X r21=0x%08X r22=0x%08X r23=0x%08X r24=0x%08X r25=0x%08X r26=0x%08X r27=0x%08X r28=0x%08X sda_slot=0x%08X slot_valid=%d effect_ptr=0x%08X effect_valid=%d effect_words=[%08X %08X %08X %08X %08X %08X %08X %08X] r3=0x%08X r3_plus4_valid=%d r3_plus4=0x%08X cr=0x%08X xer=0x%08X downcount=%lld; observation only.",
+        (unsigned long long)consecutive,
+        (unsigned)cpu->pc, (unsigned)cpu->lr, (unsigned)cpu->ctr,
+        (unsigned)cpu->gpr[13], (unsigned)cpu->gpr[21],
+        (unsigned)cpu->gpr[22], (unsigned)cpu->gpr[23],
+        (unsigned)cpu->gpr[24], (unsigned)cpu->gpr[25],
+        (unsigned)cpu->gpr[26], (unsigned)cpu->gpr[27],
+        (unsigned)cpu->gpr[28], (unsigned)sda_slot, slot_valid,
+        (unsigned)effect_ptr, effect_valid,
+        (unsigned)effect_words[0], (unsigned)effect_words[1],
+        (unsigned)effect_words[2], (unsigned)effect_words[3],
+        (unsigned)effect_words[4], (unsigned)effect_words[5],
+        (unsigned)effect_words[6], (unsigned)effect_words[7],
+        (unsigned)cpu->gpr[3], r3_count_valid, (unsigned)r3_count,
+        (unsigned)cpu->cr, (unsigned)cpu->xer, (long long)cpu->downcount);
+    bridge_v44_log(instance, message);
+}
+
+static int OPENSPM_CALL bridge_create_dev70(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    int result;
+    if (g_m14_dev70_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev70_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK)
+        return result;
+    g_m14_dev70_hang_consecutive = 0u;
+    if (out_instance != NULL && *out_instance != NULL) {
+        bridge_v44_log((openspm_bridge_instance *)*out_instance,
+            "M14 LLVM dev70 eff_sub wedding-hang diagnostic active: 0x80065128 now records r13/r21-r28 and the validated small-data effect pointer/count; guest state is unchanged.");
+        /* No-op unless OPENSPM_AUDIO=1. */
+        bridge_m14_audio_attach((openspm_bridge_instance *)*out_instance);
+    }
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev70(void *opaque) {
+    bridge_m14_audio_detach((openspm_bridge_instance *)opaque);
+    if (g_m14_dev70_underlying_destroy != NULL)
+        g_m14_dev70_underlying_destroy(opaque);
+}
+
+static int OPENSPM_CALL bridge_run_dev70(void *opaque,
+                                        uint64_t soft_cycle_budget,
+                                        openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    int result;
+    if (g_m14_dev70_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    /* Opt-in audio interrupts at this top-level safepoint (off: returns at once). */
+    result = bridge_m14_audio_service(instance);
+    if (result != OPENSPM_OK)
+        return result;
+    result = g_m14_dev70_underlying_run(opaque, soft_cycle_budget, out_exit);
+    if (instance != NULL &&
+        (uint32_t)instance->cpu.pc == OPENSPM_M14_DEV70_HANG_PC) {
+        ++g_m14_dev70_hang_consecutive;
+        if (g_m14_dev70_hang_consecutive == UINT64_C(64) ||
+            g_m14_dev70_hang_consecutive == UINT64_C(128) ||
+            g_m14_dev70_hang_consecutive == UINT64_C(1024)) {
+            bridge_dev70_log_effsub_snapshot(instance,
+                                             g_m14_dev70_hang_consecutive);
+        }
+    } else {
+        g_m14_dev70_hang_consecutive = 0u;
+    }
+    return result;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev70_base(requested_abi, out_api);
+    if (result != OPENSPM_OK)
+        return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev70_underlying_create = out_api->create;
+    g_m14_dev70_underlying_run = out_api->run;
+    g_m14_dev70_underlying_destroy = out_api->destroy;
+    out_api->module_version = OPENSPM_M14_EXPERIMENT_VERSION;
+    out_api->create = bridge_create_dev70;
+    out_api->run = bridge_run_dev70;
+    out_api->destroy = bridge_destroy_dev70;
+#endif
+    return OPENSPM_OK;
+}
+

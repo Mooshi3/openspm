@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "game_id": "R8PE01",
+  "revision": 2,
+  "purpose": "Game functions OpenSPM mods may hook (docs/HOOKS.md). Only entries with enabled=true become host targets in the native module (one rebuild when that changes); the rest are listed for review. expect is the first instruction word, checked at build and at boot.",
+  "hooks": [
+    {
+      "name": "spsndSFXOn",
+      "address": "0x8023950C",
+      "expect": "0x3880FFFF",
+      "args": [
+        "const char *name"
+      ],
+      "returns": "s32 player",
+      "enabled": false,
+      "why": "proof hook: every sound effect the game starts (thunk into __spsndSFXOn 0x80238C34)"
+    },
+    {
+      "name": "marioSetCharacter",
+      "address": "0x80146ED4",
+      "expect": "0x9421FFF0",
+      "args": [
+        "s32 character"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "characters v2: asserts 0 <= id < 4; ids 4+ are OpenSPM's"
+    },
+    {
+      "name": "_marioChangeCharacter",
+      "address": "0x80146F68",
+      "expect": "0x9421FFE0",
+      "args": [
+        "s32 character"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "characters v2: stores the id (MarioWork+0x38), reloads the model (0x80121CE0) and applies characterProperties (0x801220C4); called only by marioSetCharacter and one other site"
+    },
+    {
+      "name": "marioApplyCharacterProperties",
+      "address": "0x801220C4",
+      "expect": "0x9421FFE0",
+      "args": [],
+      "returns": "void",
+      "enabled": false,
+      "why": "characters v2: copies characterProperties[id] (0x803E8228, 20 bytes: hitbox width, height, walk, dash, +16) into MarioWork (+0x194/+0x19C width, +0x198/+0x1A0 height, +0x14C walk, +0x150 dash, +0x158); a post hook sets a character's own values. 13 callers"
+    },
+    {
+      "name": "marioLoadCharacterModel",
+      "address": "0x80121CE0",
+      "expect": "0x9421FFE0",
+      "args": [
+        "s32 variant (0 normal, 1 big)"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "characters v2: loads the anim poses named 0x803E8148[id * 2 + variant] (p_wii_* / p_big_*) into MarioWork+0x24C and +0x250; a pre hook points a new id at its own model"
+    },
+    {
+      "name": "marioGetCharacterWidth",
+      "address": "0x80122300",
+      "expect": "0x3C80804D",
+      "args": [],
+      "returns": "f32 characterProperties[id] +0",
+      "enabled": false,
+      "why": "characters v2: hitbox width of the current character (7 callers); float result, needs hooks v2 (fret). Measure call rate before enabling"
+    },
+    {
+      "name": "marioGetCharacterHeight",
+      "address": "0x80122324",
+      "expect": "0x3C60804D",
+      "args": [],
+      "returns": "f32 characterProperties[id] +4",
+      "enabled": false,
+      "why": "characters v2: hitbox height of the current character (3 callers); float result, needs hooks v2 (fret)"
+    },
+    {
+      "name": "marioFairyUse",
+      "address": "0x80130B70",
+      "expect": "0x9421FFE0",
+      "args": [
+        "s32 pixl item id"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "Pixls v2: asserts 220 <= id < 232; added Pixls are OpenSPM's"
+    },
+    {
+      "name": "pixlFollowerSetup",
+      "address": "0x8011CF60",
+      "expect": "0x9421FF70",
+      "args": [
+        "see docs/CONTENT-API.md"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "Pixls v2: the follower setup, replacing the 'no game Pixl selected' trick"
+    },
+    {
+      "name": "marioChgMot",
+      "address": "0x80142D48",
+      "expect": "0x9421FFD0",
+      "args": [
+        "u16 motion",
+        "s32 arg"
+      ],
+      "returns": "void",
+      "enabled": false,
+      "why": "movement: every move change (81 callers): saves the old move (MarioWork+0x2E), stores the new one (+0x2C), runs the old move's exit function (0x803E8718[old].exit) and asks for the new move to run at once; a pre hook redirects a change (a character's own jump, float, spin dash)"
+    },
+    {
+      "name": "marioMotionMain",
+      "address": "0x80142CD4",
+      "expect": "0x9421FFF0",
+      "args": [],
+      "returns": "void",
+      "enabled": false,
+      "why": "movement: once a frame runs 0x803E8718[MarioWork+0x2C].main (and again after a change); a pre hook runs a character's own per-frame movement before the game's"
+    }
+  ]
+}

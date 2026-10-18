@@ -1,0 +1,166 @@
+/*
+ * M14 local-module bridge v19 / RVL post-MTMSR cold-resume recovery.
+ *
+ * The first Broadway-parity LLVM boot no longer raises a guest exception, but
+ * live-frontier telemetry proved the main thread can enter 0x80271E48 and then
+ * remain forever inside the OSEnableInterrupts native range.  That PC is the
+ * instruction immediately following MTMSR in Revolution OSInterrupt.
+ *
+ * Why generated-C survived this and LLVM does not:
+ *   - early M14 intentionally side-exited privileged/control instructions;
+ *   - bridge v5 completed MTMSR and resumed at CIA+4;
+ *   - generated-C can dispatch every instruction address directly;
+ *   - LLVM only permits selected region leaders as native cold entries;
+ *   - a non-leader cold entry falls into ppc_fallback_instruction();
+ *   - RecompCore expects that callback to be a full interpreter, while OpenSPM
+ *     intentionally supplies only its narrow migration fallback;
+ *   - an ordinary instruction such as the post-MTMSR EXTRWI therefore leaves
+ *     PC unchanged and LLVM's internal fallback retry loop never exits.
+ *
+ * Keep the existing 14,414 generated objects/cache intact for this diagnostic
+ * recovery.  The three RVL OSInterrupt post-MTMSR tails are tiny and have exact
+ * architectural semantics: extract the previous EE bit and BLR.  Finish those
+ * tails at the existing host-call-before-dispatch boundary.  No renderer,
+ * scheduler, GX or normal generated-C behavior is changed.
+ *
+ * This is deliberately narrow migration scaffolding.  Once LLVM boot parity is
+ * established, the compiler-side long-term fix is to make externally resumable
+ * PCs legal cold native entries without requiring an interpreter callback.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev27_llvm_frontier_base
+#include "legacy_c_adapter_v18.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_RVL_OSDISABLE_POST_MTMSR UINT32_C(0x80271E34)
+#define OPENSPM_M14_RVL_OSENABLE_POST_MTMSR  UINT32_C(0x80271E48)
+#define OPENSPM_M14_RVL_OSRESTORE_POST_MTMSR UINT32_C(0x80271E6C)
+#define OPENSPM_M14_MSR_EE_MASK              UINT32_C(0x00008000)
+
+static openspm_native_create_fn g_m14_v27_underlying_create;
+static openspm_native_destroy_fn g_m14_v27_underlying_destroy;
+static PPCHostCall g_m14_v27_underlying_host_call;
+static uint64_t g_m14_v27_control_tail_hits;
+static uint32_t g_m14_v27_control_tail_logged;
+
+static void bridge_v27_log_control_tail(openspm_bridge_instance *instance,
+                                        uint32_t address) {
+    const openspm_host_api *host;
+    char message[256];
+    if (g_m14_v27_control_tail_logged || instance == NULL ||
+        instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM RVL cold-resume recovery active: completed post-MTMSR OSInterrupt tail at 0x%08X directly; generated object cache unchanged.",
+        (unsigned)address);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+    g_m14_v27_control_tail_logged = 1u;
+}
+
+static int bridge_v27_finish_control_tail(CPUState *cpu, uint32_t address) {
+    openspm_bridge_instance *instance;
+    uint32_t previous_msr;
+
+    if (cpu == NULL) return 0;
+    switch (address) {
+        case OPENSPM_M14_RVL_OSDISABLE_POST_MTMSR:
+        case OPENSPM_M14_RVL_OSENABLE_POST_MTMSR:
+            /* Both helpers keep their pre-MTMSR value in r3.  The remaining
+             * EXTRWI returns old MSR[EE], then BLR returns through LR. */
+            previous_msr = (uint32_t)cpu->gpr[3];
+            break;
+        case OPENSPM_M14_RVL_OSRESTORE_POST_MTMSR:
+            /* OSRestoreInterrupts keeps the pre-MTMSR value in r4. */
+            previous_msr = (uint32_t)cpu->gpr[4];
+            break;
+        default:
+            return 0;
+    }
+
+    cpu->gpr[3] = (previous_msr & OPENSPM_M14_MSR_EE_MASK) != 0u ? 1u : 0u;
+    cpu->pc = (uint32_t)cpu->lr & ~UINT32_C(3);
+    /* Charge the two guest instructions we complete here: EXTRWI + BLR. */
+    cpu->downcount -= 2;
+    ++g_m14_v27_control_tail_hits;
+    instance = bridge_from_cpu(cpu);
+    bridge_v27_log_control_tail(instance, address);
+    return 1;
+}
+
+static bool bridge_host_call_v27(CPUState *cpu, u32 address) {
+    /* Native-region queries still belong to v18/v15/v7.  Only ordinary guest
+     * dispatch at the exact post-MTMSR continuation coordinates is consumed. */
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY &&
+        bridge_v27_finish_control_tail(cpu, (uint32_t)address))
+        return true;
+    return g_m14_v27_underlying_host_call != NULL
+               ? g_m14_v27_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v27(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_v27_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v27_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v27_underlying_host_call = instance->cpu.host_call;
+    g_m14_v27_control_tail_hits = 0u;
+    g_m14_v27_control_tail_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v27;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v27(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL && instance->runtime->host->log != NULL &&
+        g_m14_v27_control_tail_hits != 0u) {
+        char message[224];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM RVL cold-resume stats post_mtmsr_tails=%llu.",
+                       (unsigned long long)g_m14_v27_control_tail_hits);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v27_underlying_host_call;
+    if (g_m14_v27_underlying_destroy != NULL)
+        g_m14_v27_underlying_destroy(opaque);
+    g_m14_v27_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev27_llvm_frontier_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v27_underlying_create = out_api->create;
+    g_m14_v27_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev28-llvm-rvl-cold-resume";
+    out_api->create = bridge_create_v27;
+    out_api->destroy = bridge_destroy_v27;
+#endif
+    return OPENSPM_OK;
+}

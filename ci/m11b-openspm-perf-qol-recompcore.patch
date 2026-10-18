@@ -1,0 +1,240 @@
+diff --git a/Source/Core/Core/Config/OpenSPMSettings.h b/Source/Core/Core/Config/OpenSPMSettings.h
+--- a/Source/Core/Core/Config/OpenSPMSettings.h
++++ b/Source/Core/Core/Config/OpenSPMSettings.h
+@@ -17,4 +17,8 @@ enum class AspectRatio : u32
+ 
+ AspectRatio GetAspectRatio();
+ void SetAspectRatio(AspectRatio mode);
++
++bool GetFastForward();
++void SetFastForward(bool enabled);
++void ToggleFastForward();
+ }  // namespace OpenSPM
+diff --git a/Source/Core/Core/Config/OpenSPMSettings.cpp b/Source/Core/Core/Config/OpenSPMSettings.cpp
+--- a/Source/Core/Core/Config/OpenSPMSettings.cpp
++++ b/Source/Core/Core/Config/OpenSPMSettings.cpp
+@@ -2,7 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "Core/Config/OpenSPMSettings.h"
+ 
++#include <atomic>
++
+ #include "Common/Config/Config.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Core.h"
+@@ -18,6 +20,8 @@ namespace OpenSPM
+ {
+ namespace
+ {
++std::atomic_bool s_fast_forward{false};
++
+ AspectRatio NormalizeAspectRatio(u32 raw)
+ {
+   if (raw > static_cast<u32>(AspectRatio::Ultra32_9))
+@@ -69,4 +73,19 @@ void SetAspectRatio(AspectRatio requested_mode)
+     });
+   }
+ }
++
++bool GetFastForward()
++{
++  return s_fast_forward.load(std::memory_order_relaxed);
++}
++
++void SetFastForward(bool enabled)
++{
++  s_fast_forward.store(enabled, std::memory_order_relaxed);
++}
++
++void ToggleFastForward()
++{
++  SetFastForward(!GetFastForward());
++}
+ }  // namespace OpenSPM
+diff --git a/Source/Core/DolphinQt/MenuBar.cpp b/Source/Core/DolphinQt/MenuBar.cpp
+--- a/Source/Core/DolphinQt/MenuBar.cpp
++++ b/Source/Core/DolphinQt/MenuBar.cpp
+@@ -650,6 +650,22 @@ void MenuBar::AddOpenSPMMenu()
+   add_aspect(tr("16:9"), OpenSPM::AspectRatio::Wide16_9);
+   add_aspect(tr("21:9"), OpenSPM::AspectRatio::Ultra21_9);
+   add_aspect(tr("32:9"), OpenSPM::AspectRatio::Ultra32_9);
++
++  openspm_menu->addSeparator();
++  QAction* const fast_forward = openspm_menu->addAction(tr("Fast Forward (Toggle)"));
++  fast_forward->setCheckable(true);
++  fast_forward->setChecked(OpenSPM::GetFastForward());
++  connect(fast_forward, &QAction::toggled, this,
++          [](bool enabled) { OpenSPM::SetFastForward(enabled); });
++
++  openspm_menu->addSeparator();
++  openspm_menu->addAction(tr("Configure Game Controls..."), this,
++                          [this] { emit ConfigureControllers(); });
++  QAction* const hotkeys = openspm_menu->addAction(tr("Configure Runtime Hotkeys..."), this,
++                                                   [this] { emit ConfigureHotkeys(); });
++  hotkeys->setToolTip(
++      tr("Current bindings are supplied by the temporary host adapter and can be replaced by "
++         "a future native OpenSPM input backend."));
+ }
+ 
+ void MenuBar::AddOptionsMenu()
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.cpp b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+--- a/Source/Core/DolphinQt/HotkeyScheduler.cpp
++++ b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+@@ -20,7 +20,8 @@
+ #include "Core/Achievements/AchievementManager.h"
+ #include "Core/Config/FreeLookSettings.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/OpenSPMSettings.h"
+ #include "Core/Config/UISettings.h"
+ #include "Core/Core.h"
+ #include "Core/FreeLookManager.h"
+@@ -491,15 +492,18 @@ void HotkeyScheduler::Run()
+       if (IsHotkey(HK_TOGGLE_TEXTURES))
+         Config::SetCurrent(Config::GFX_HIRES_TEXTURES, !Config::Get(Config::GFX_HIRES_TEXTURES));
+ 
+-      Core::SetIsThrottlerTempDisabled(IsHotkey(HK_TOGGLE_THROTTLE, true));
++      const bool openspm_fast_forward_hold = IsHotkey(HK_TOGGLE_THROTTLE, true);
++      const bool openspm_fast_forward =
++          OpenSPM::GetFastForward() || openspm_fast_forward_hold;
++      Core::SetIsThrottlerTempDisabled(openspm_fast_forward);
+ 
+-      if (IsHotkey(HK_TOGGLE_THROTTLE, true) && !Config::Get(Config::MAIN_AUDIO_MUTED) &&
++      if (openspm_fast_forward && !Config::Get(Config::MAIN_AUDIO_MUTED) &&
+           Config::Get(Config::MAIN_AUDIO_MUTE_ON_DISABLED_SPEED_LIMIT))
+       {
+         Config::SetCurrent(Config::MAIN_AUDIO_MUTED, true);
+         AudioCommon::UpdateSoundStream(system);
+       }
+-      else if (!IsHotkey(HK_TOGGLE_THROTTLE, true) && Config::Get(Config::MAIN_AUDIO_MUTED) &&
++      else if (!openspm_fast_forward && Config::Get(Config::MAIN_AUDIO_MUTED) &&
+                Config::GetActiveLayerForConfig(Config::MAIN_AUDIO_MUTED) ==
+                    Config::LayerType::CurrentRun)
+       {
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -181,6 +181,12 @@ private:
+   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
+   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
+ 
++  // OpenSPM transitional-runtime diagnostics. These are backend counters, not part of the
++  // portable OpenSPM feature API.
++  bool m_openspm_perf_enabled = false;
++  u64 m_fallback_jit_runs = 0;
++  u64 m_host_call_runs = 0;
++
+   // D4 guard state: parallel to m_module->chunk_ranges.
+   std::vector<u8> m_chunk_state;
+   mutable std::vector<u8> m_chunk_host_call_state;
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -139,6 +139,7 @@ void StaticRecompCore::Init()
+   g_static_recomp_core = this;
+   RefreshConfig();
+   m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
++  m_openspm_perf_enabled = std::getenv("OPENSPM_PERF") != nullptr;
+   const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
+   std::istringstream fallback_ranges(fallback_override ? fallback_override :
+                                                          Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
+@@ -190,11 +191,14 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu "
++               "fallback_jit_runs=%llu host_calls=%llu\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
+-               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
++               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles,
++               (unsigned long long)m_fallback_jit_runs, (unsigned long long)m_host_call_runs);
+   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
+                                                     m_dispatch_samples.end());
+diff --git a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+--- a/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -13,5 +13,6 @@
+ #include "Core/HW/SystemTimers.h"
+ 
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <memory>
+@@ -54,6 +55,43 @@ void StaticRecompCore::Run()
+   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
+   FilePtr dispatch_trace = OpenDispatchTrace();
+ 
++  using PerfClock = std::chrono::steady_clock;
++  auto perf_last_report = PerfClock::now();
++  u64 perf_last_native = m_native_dispatches;
++  u64 perf_last_bursts = m_bursts;
++  u64 perf_last_fallback_steps = m_fallback_steps;
++  u64 perf_last_fallback_jit = m_fallback_jit_runs;
++  u64 perf_last_host_calls = m_host_call_runs;
++  u64 perf_last_hook_fallback = m_hook_fallback_instructions;
++  const auto report_openspm_perf = [&](bool force) {
++    if (!m_openspm_perf_enabled)
++      return;
++    const auto now = PerfClock::now();
++    const double seconds = std::chrono::duration<double>(now - perf_last_report).count();
++    if (!force && seconds < 1.0)
++      return;
++    const u64 native = m_native_dispatches - perf_last_native;
++    const u64 bursts = m_bursts - perf_last_bursts;
++    const double dispatches_per_burst = bursts ? static_cast<double>(native) / bursts : 0.0;
++    std::fprintf(stderr,
++                 "[OPENSPM-PERF] dt=%.3f native=%llu bursts=%llu dispatch_per_burst=%.2f "
++                 "fallback_jit=%llu fallback_steps=%llu host_calls=%llu hook_fb=%llu\n",
++                 seconds, static_cast<unsigned long long>(native),
++                 static_cast<unsigned long long>(bursts), dispatches_per_burst,
++                 static_cast<unsigned long long>(m_fallback_jit_runs - perf_last_fallback_jit),
++                 static_cast<unsigned long long>(m_fallback_steps - perf_last_fallback_steps),
++                 static_cast<unsigned long long>(m_host_call_runs - perf_last_host_calls),
++                 static_cast<unsigned long long>(m_hook_fallback_instructions - perf_last_hook_fallback));
++    std::fflush(stderr);
++    perf_last_report = now;
++    perf_last_native = m_native_dispatches;
++    perf_last_bursts = m_bursts;
++    perf_last_fallback_steps = m_fallback_steps;
++    perf_last_fallback_jit = m_fallback_jit_runs;
++    perf_last_host_calls = m_host_call_runs;
++    perf_last_hook_fallback = m_hook_fallback_instructions;
++  };
++
+   m_guest.ram = memory.GetRAM();
+   m_guest.ram_size = memory.GetRamSizeReal();
+   m_guest.exram = memory.GetEXRAM();
+@@ -118,5 +156,6 @@ void StaticRecompCore::Run()
+   while (*state_ptr == CPU::State::Running)
+   {
+     core_timing.Advance();
++    report_openspm_perf(false);
+     const std::string current_game_id = SConfig::GetInstance().GetGameID();
+     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
+@@ -216,6 +255,7 @@ void StaticRecompCore::Run()
+         if (m_guest.host_call && IsHostCallAddress(ppc.pc))
+         {
+           SyncIn();
++          ++m_host_call_runs;
+           bool handled = m_guest.host_call(&m_guest, m_guest.pc);
+           if (!handled && m_guest.pc < m_guest.ram_size)
+             handled = m_guest.host_call(&m_guest, m_guest.pc | 0x80000000u);
+@@ -248,6 +288,7 @@ void StaticRecompCore::Run()
+         }
+         else if (m_fallback_jit)
+         {
++          ++m_fallback_jit_runs;
+           m_fallback_jit->Run();
+         }
+         else
+@@ -264,4 +305,5 @@ void StaticRecompCore::Run()
+       }
+     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
+   }
++  report_openspm_perf(true);
+ }

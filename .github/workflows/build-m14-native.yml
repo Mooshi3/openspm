@@ -1,0 +1,251 @@
+name: Build OpenSPM M14 native core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [m14-native-execution]
+    paths:
+      - CMakeLists.txt
+      - include/openspm/**
+      - core/**
+      - backend/native/**
+      - launcher/**
+      - renderer/aurora/**
+      - tools/m14_lab/**
+      - tools/native_bridge/**
+      - tools/release/**
+      - RUN-M14-HOME-TEST.ps1
+      - RUN-M14-HOME-TEST.cmd
+      - tests/m14_*.c
+      - .github/workflows/build-m14-native.yml
+
+concurrency:
+  # v2 key intentionally supersedes the first M14 key: one cancelled early run
+  # remained wedged in that old group and blocked later validation runs.
+  group: m14-native-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  aurora-patch-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout OpenSPM
+        uses: actions/checkout@v4
+        with:
+          path: openspm
+      - name: Checkout pinned MIT Aurora
+        uses: actions/checkout@v4
+        with:
+          repository: encounter/aurora
+          ref: 749d6ee7a22bdfab78c8ece9047bca5d79aa72ca
+          path: aurora
+      - name: Verify OpenSPM Aurora raw-GX and raster transforms
+        run: |
+          python openspm/renderer/aurora/apply_patches.py aurora
+          python openspm/renderer/aurora/apply_raster_patch.py aurora --check-only
+
+  portable-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure, build and test portable M14 core
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure
+      - name: Release packager and public-candidate audit contracts
+        run: python3 tools/release/test_make_release_zip.py
+      - name: Test launcher presets match the launch script
+        run: python3 tools/test_launcher/test_openspm_test_launcher.py
+      - name: Content code patches (build list == boot list)
+        run: python3 tools/native_bridge/test_code_patches.py
+      - name: Table reference checker (content table relocation rules)
+        run: python3 tools/content/test_table_refs.py
+      - name: Hook registry (generated tables in sync, host targets)
+        run: python3 tools/native_bridge/test_openspm_hooks.py
+      - name: CMake-free module build contract
+        run: cd tools/native_bridge && python3 test_direct_module_build.py
+      - name: Native module cache stamp
+        run: cd tools/native_bridge && python3 test_module_stamp.py
+      - name: First-run game preparation
+        run: cd tools/native_bridge && python3 test_prepare_game.py
+
+  windows-native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Parse home-test PowerShell driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [void][scriptblock]::Create((Get-Content -Raw RUN-M14-HOME-TEST.ps1))
+
+      - name: Configure native Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build native Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmake --build build -j2 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Test native Windows runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          ctest --test-dir build --output-on-failure 2>&1 | Tee-Object -FilePath test.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Verify native backend and launchers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $backend = Get-ChildItem build -Recurse -Filter openspm_native_backend.dll | Select-Object -First 1
+          if (!$backend) { throw 'openspm_native_backend.dll was not built' }
+          $exports = & dumpbin /exports $backend.FullName
+          $exports | Set-Content exports.log
+          if (-not ($exports -match 'openspm_backend_query')) { throw 'native backend query export missing' }
+
+          $launcher = Get-ChildItem build -Recurse -Filter OpenSPM.exe | Select-Object -First 1
+          if (!$launcher) { throw 'OpenSPM.exe was not built' }
+          & $launcher.FullName --version 2>&1 | Tee-Object -FilePath launcher-version.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          $nativeLauncher = Get-ChildItem build -Recurse -Filter OpenSPMNative.exe | Select-Object -First 1
+          if (!$nativeLauncher) { throw 'OpenSPMNative.exe was not built' }
+          & $nativeLauncher.FullName --version 2>&1 | Tee-Object -FilePath native-launcher-version.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspm-m14-windows-diagnostics
+          path: |
+            configure.log
+            build.log
+            test.log
+            exports.log
+            launcher-version.log
+            native-launcher-version.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-aurora-renderer:
+    needs: aurora-patch-contract
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout OpenSPM
+        uses: actions/checkout@v4
+        with:
+          path: openspm
+      - name: Checkout pinned MIT Aurora
+        uses: actions/checkout@v4
+        with:
+          repository: encounter/aurora
+          ref: 749d6ee7a22bdfab78c8ece9047bca5d79aa72ca
+          path: aurora
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Apply audited Aurora adaptations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python openspm/renderer/aurora/apply_patches.py aurora 2>&1 | Tee-Object -FilePath aurora-patch.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python openspm/renderer/aurora/apply_raster_patch.py aurora 2>&1 | Tee-Object -FilePath aurora-raster.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Configure native renderer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $aurora = (Resolve-Path aurora).Path
+          cmake -S openspm -B build-renderer -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DOPENSPM_BUILD_AURORA_RENDERER=ON `
+            "-DOPENSPM_AURORA_SOURCE_DIR=$aurora" `
+            -DAURORA_DAWN_PROVIDER=package `
+            -DAURORA_SDL3_PROVIDER=package 2>&1 | Tee-Object -FilePath renderer-configure.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build native candidate skeleton
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cmake --build build-renderer --target OpenSPMNative openspm_native_backend openspm_renderer -j2 2>&1 | Tee-Object -FilePath renderer-build.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Verify strict candidate layout and renderer export
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $launcher = Get-Item build-renderer/OpenSPMNative.exe -ErrorAction Stop
+          $backend = Get-Item build-renderer/runtime/openspm_native_backend.dll -ErrorAction Stop
+          $renderer = Get-Item build-renderer/runtime/openspm_renderer.dll -ErrorAction Stop
+
+          & $launcher.FullName --version 2>&1 | Tee-Object -FilePath native-candidate-version.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          $backendExports = & dumpbin /exports $backend.FullName
+          $backendExports | Set-Content native-backend-exports.log
+          if (-not ($backendExports -match 'openspm_backend_query')) { throw 'native backend query export missing' }
+
+          $rendererExports = & dumpbin /exports $renderer.FullName
+          $rendererExports | Set-Content renderer-exports.log
+          if (-not ($rendererExports -match 'openspm_renderer_query')) { throw 'renderer query export missing' }
+
+          $runtimeDlls = @(Get-ChildItem build-renderer/runtime -Filter *.dll)
+          if ($runtimeDlls.Count -lt 3) {
+            throw 'candidate runtime did not stage Aurora/SDL/Dawn runtime dependencies'
+          }
+          $runtimeDlls | Select-Object Name,Length | Format-Table | Out-String | Set-Content candidate-runtime-files.log
+
+      - name: Stage and audit public-code-only candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force candidate/runtime | Out-Null
+          Copy-Item build-renderer/OpenSPMNative.exe candidate/OpenSPMNative.exe
+          Copy-Item build-renderer/runtime/* candidate/runtime/ -Recurse
+          python openspm/tools/release/audit_public_candidate.py candidate --require-layout 2>&1 | Tee-Object -FilePath candidate-audit.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload public-code-only candidate skeleton
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspm-m14-native-candidate-skeleton
+          path: candidate/**
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload renderer diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspm-m14-aurora-renderer-diagnostics
+          path: |
+            aurora-patch.log
+            aurora-raster.log
+            renderer-configure.log
+            renderer-build.log
+            renderer-exports.log
+            native-backend-exports.log
+            native-candidate-version.log
+            candidate-runtime-files.log
+            candidate-audit.log
+          if-no-files-found: ignore
+          retention-days: 7

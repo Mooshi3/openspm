@@ -1,0 +1,8 @@
+M11C runtime fastpath build trigger.
+
+Data-driven targets from M11B:
+- remove dormant guest-mod interception checks when no guest hooks are active
+- bypass generic REL translation for proven DOL-to-DOL native dispatches
+- deliver aspect changes to the game module on the emulated CPU thread
+- log game-side perspective/ortho projection changes
+- retain M11B perf telemetry and M10 diagnostics

@@ -1,0 +1,151 @@
+/*
+ * M14 local-module bridge v23 / nonblocking LLVM frame-phase telemetry.
+ *
+ * Runtime 030817 proved the remaining spmarioMain frontier was self-inflicted
+ * by v15's diagnostic phase seam rather than by SPM or DolRecomp.  The native
+ * range [0x801A7AAC,0x801A7CAC) contains OPENSPM_M14_LLVM_PHASE_MAIN.  v15
+ * therefore blocks that whole range on every native re-entry until a one-shot
+ * permit is armed.  A permit is consumed by the first re-entry after the phase;
+ * any later call from spmarioMain returns into the same range and gets blocked
+ * again.  v22 could hop across continuations that happened to be direct BLs,
+ * but the first ordinary continuation (0x801A7B58: cmpwi r3,-1) exposed the
+ * diagnostic gate again.
+ *
+ * Phase/cadence counters are telemetry only and must never gate guest control
+ * flow.  Before delegating a native-region query, arm v15's existing one-shot
+ * permit when that queried range contains one of the four frame-phase PCs.
+ * v15 then ignores exactly that phase seam for this query.  Its real v19 GX
+ * begin/end and durable-return seams remain fully fail-closed: if the same range
+ * contains any such seam, bridge_v23_range_has_seam still blocks it normally.
+ * Lower-layer region blocks are also preserved unchanged.
+ *
+ * Keep v22's bounded direct-BL rescue for now as independent migration
+ * scaffolding; this change specifically removes the accidental phase-region
+ * gate and does not claim the compiler continuation audit is complete.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev32_bl_rescue_base
+#include "legacy_c_adapter_v22.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_v33_underlying_create;
+static openspm_native_destroy_fn g_m14_v33_underlying_destroy;
+static PPCHostCall g_m14_v33_underlying_host_call;
+static uint64_t g_m14_v33_phase_query_permits;
+static uint32_t g_m14_v33_logged;
+
+static uint32_t bridge_v33_phase_in_range(uint32_t start, uint32_t end) {
+    static const uint32_t phases[] = {
+        OPENSPM_M14_LLVM_PHASE_BEFORE,
+        OPENSPM_M14_LLVM_PHASE_DISP,
+        OPENSPM_M14_LLVM_PHASE_MAIN,
+        OPENSPM_M14_LLVM_PHASE_DONE,
+    };
+    uint32_t i;
+    if (end <= start) return 0u;
+    for (i = 0u; i < (uint32_t)(sizeof(phases) / sizeof(phases[0])); ++i)
+        if (phases[i] >= start && phases[i] < end)
+            return phases[i];
+    return 0u;
+}
+
+static void bridge_v33_log_once(CPUState *cpu) {
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    if (g_m14_v33_logged || cpu == NULL) return;
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    host->log(host->context, OPENSPM_LOG_INFO,
+              "M14 LLVM frame-phase telemetry is nonblocking: diagnostic spmario/frame phase PCs no longer gate native-region re-entry; v19 GX seams remain fail-closed.");
+    g_m14_v33_logged = 1u;
+}
+
+static bool bridge_host_call_v33(CPUState *cpu, u32 address) {
+    if (cpu == NULL) return false;
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        const uint32_t phase = bridge_v33_phase_in_range(start, end);
+
+        /* v15's permit suppresses only the matching seam address.  Real GX
+           seams and all lower-layer blockers in the range remain visible. */
+        if (phase != 0u) {
+            bridge_v23_arm_permit(phase);
+            ++g_m14_v33_phase_query_permits;
+            bridge_v33_log_once(cpu);
+        }
+        return g_m14_v33_underlying_host_call != NULL
+                   ? g_m14_v33_underlying_host_call(cpu, address)
+                   : false;
+    }
+
+    return g_m14_v33_underlying_host_call != NULL
+               ? g_m14_v33_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v33(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v33_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v33_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v33_underlying_host_call = instance->cpu.host_call;
+    g_m14_v33_phase_query_permits = 0u;
+    g_m14_v33_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v33;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v33(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v33_phase_query_permits != 0u &&
+        instance->runtime != NULL && instance->runtime->host != NULL &&
+        instance->runtime->host->log != NULL) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM nonblocking phase stats permitted_queries=%llu.",
+                       (unsigned long long)g_m14_v33_phase_query_permits);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v33_underlying_host_call;
+    if (g_m14_v33_underlying_destroy != NULL)
+        g_m14_v33_underlying_destroy(opaque);
+    g_m14_v33_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev32_bl_rescue_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v33_underlying_create = out_api->create;
+    g_m14_v33_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev33-llvm-nonblocking-frame-phases";
+    out_api->create = bridge_create_v33;
+    out_api->destroy = bridge_destroy_v33;
+#endif
+    return OPENSPM_OK;
+}

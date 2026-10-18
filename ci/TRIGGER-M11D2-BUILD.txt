@@ -1,0 +1,1 @@
+Trigger M11D2 run 2. Runtime-only workflow no longer invokes generated-module first-fault instrumentation; reuse exact green M11C DLL and first-fault launchers.

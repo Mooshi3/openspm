@@ -1,0 +1,349 @@
+/*
+ * M14 local-module bridge v36 / dev46 main-thread transition truth probe.
+ *
+ * dev45 proved that the post-frame dead-state VI path is healthy. The scratch
+ * __VIRetraceHandler reaches OSWakeupThread, removes the VI waiter from the
+ * real retraceQueue, sets RunQueueBits, and reaches the handler tail. The
+ * waiter then runs and returns to VIWaitForRetrace before the outer run() probe
+ * samples state again. The VI/scheduler wake path is therefore not the cause of
+ * the permanent idle.
+ *
+ * The remaining transition is the persistent main thread itself:
+ *   current_thread 0x80507718, pc 0x80304724 -> no current thread, scheduler
+ *   idle 0x8027551C.
+ * dev44's OSSleepThread query ring saw only the VI waiter, so dev46 inspects the
+ * actual OSThread control block rather than assuming which blocking primitive
+ * was used. It snapshots the thread before and after the first stage-1
+ * transition to idle, using the verified Dolphin/Revolution OSThread layout
+ * (OSContext 0x2C8 bytes, state at +0x2C8). It also dumps small raw PPC windows
+ * around the last persistent PC/LR/CTR directly from player-owned guest memory.
+ *
+ * If the resulting state is WAITING, a one-shot bounded scan of the game's
+ * 0x80400000-0x80600000 data window reports words that look like OSThreadQueue
+ * head/tail pairs referencing the sleeping thread. This is diagnostic only: no
+ * queue, thread, register, or guest memory state is changed.
+ *
+ * Historical source-contract ancestry:
+ * m14-dev45-llvm-vi-wake-tail-truth
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev45_wake_tail_base
+#include "legacy_c_adapter_v35.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_DEV46_THREAD_CONTEXT_SIZE UINT32_C(0x2C8)
+#define OPENSPM_M14_DEV46_THREAD_STATE_OFF UINT32_C(0x2C8)
+#define OPENSPM_M14_DEV46_THREAD_SUSPEND_OFF UINT32_C(0x2CC)
+#define OPENSPM_M14_DEV46_THREAD_PRIORITY_OFF UINT32_C(0x2D0)
+#define OPENSPM_M14_DEV46_THREAD_BASE_PRIORITY_OFF UINT32_C(0x2D4)
+#define OPENSPM_M14_DEV46_THREAD_EXIT_OFF UINT32_C(0x2D8)
+#define OPENSPM_M14_DEV46_THREAD_QUEUE_NEXT_OFF UINT32_C(0x2DC)
+#define OPENSPM_M14_DEV46_THREAD_QUEUE_PREV_OFF UINT32_C(0x2E0)
+#define OPENSPM_M14_DEV46_THREAD_LINK_NEXT_OFF UINT32_C(0x2E4)
+#define OPENSPM_M14_DEV46_THREAD_LINK_PREV_OFF UINT32_C(0x2E8)
+#define OPENSPM_M14_DEV46_THREAD_ACTIVE_NEXT_OFF UINT32_C(0x2EC)
+#define OPENSPM_M14_DEV46_THREAD_ACTIVE_PREV_OFF UINT32_C(0x2F0)
+#define OPENSPM_M14_DEV46_THREAD_STACK_BASE_OFF UINT32_C(0x2F4)
+#define OPENSPM_M14_DEV46_THREAD_STACK_END_OFF UINT32_C(0x2F8)
+#define OPENSPM_M14_DEV46_CONTEXT_GPR1_OFF UINT32_C(0x010)
+#define OPENSPM_M14_DEV46_CONTEXT_GPR3_OFF UINT32_C(0x018)
+#define OPENSPM_M14_DEV46_CONTEXT_LR_OFF UINT32_C(0x084)
+#define OPENSPM_M14_DEV46_CONTEXT_CTR_OFF UINT32_C(0x088)
+#define OPENSPM_M14_DEV46_CONTEXT_SRR0_OFF UINT32_C(0x198)
+#define OPENSPM_M14_DEV46_CONTEXT_SRR1_OFF UINT32_C(0x19C)
+#define OPENSPM_M14_DEV46_QUEUE_SCAN_START UINT32_C(0x80400000)
+#define OPENSPM_M14_DEV46_QUEUE_SCAN_END UINT32_C(0x80600000)
+#define OPENSPM_M14_DEV46_QUEUE_HIT_LIMIT UINT32_C(16)
+
+/* Dolphin/Revolution OSThread states used by the retail SDK. */
+#define OPENSPM_M14_DEV46_THREAD_READY UINT32_C(1)
+#define OPENSPM_M14_DEV46_THREAD_RUNNING UINT32_C(2)
+#define OPENSPM_M14_DEV46_THREAD_WAITING UINT32_C(4)
+#define OPENSPM_M14_DEV46_THREAD_MORIBUND UINT32_C(8)
+
+typedef struct openspm_m14_dev46_thread_snapshot {
+    uint32_t valid;
+    uint32_t address;
+    uint32_t state;
+    uint32_t attributes;
+    uint32_t suspend_count;
+    uint32_t priority;
+    uint32_t base_priority;
+    uint32_t exit_value;
+    uint32_t queue_next;
+    uint32_t queue_prev;
+    uint32_t link_next;
+    uint32_t link_prev;
+    uint32_t active_next;
+    uint32_t active_prev;
+    uint32_t stack_base;
+    uint32_t stack_end;
+    uint32_t saved_sp;
+    uint32_t saved_r3;
+    uint32_t saved_lr;
+    uint32_t saved_ctr;
+    uint32_t saved_srr0;
+    uint32_t saved_srr1;
+} openspm_m14_dev46_thread_snapshot;
+
+static openspm_native_create_fn g_m14_dev46_underlying_create;
+static openspm_native_run_fn g_m14_dev46_underlying_run;
+static openspm_native_destroy_fn g_m14_dev46_underlying_destroy;
+static uint32_t g_m14_dev46_logged;
+
+static const char *bridge_dev46_state_name(uint32_t state) {
+    switch (state) {
+        case OPENSPM_M14_DEV46_THREAD_READY: return "READY";
+        case OPENSPM_M14_DEV46_THREAD_RUNNING: return "RUNNING";
+        case OPENSPM_M14_DEV46_THREAD_WAITING: return "WAITING";
+        case OPENSPM_M14_DEV46_THREAD_MORIBUND: return "MORIBUND";
+        default: return "OTHER";
+    }
+}
+
+static void bridge_dev46_capture_thread(CPUState *cpu,
+                                        uint32_t address,
+                                        openspm_m14_dev46_thread_snapshot *out) {
+    uint32_t state_attr;
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->address = address;
+    if (cpu == NULL || address == 0u ||
+        !bridge_m14_context_address_valid(
+            cpu, address,
+            OPENSPM_M14_DEV46_THREAD_STACK_END_OFF + UINT32_C(4)))
+        return;
+
+    state_attr = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_STATE_OFF);
+    out->state = state_attr >> 16;
+    out->attributes = state_attr & UINT32_C(0xFFFF);
+    out->suspend_count = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_SUSPEND_OFF);
+    out->priority = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_PRIORITY_OFF);
+    out->base_priority = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_BASE_PRIORITY_OFF);
+    out->exit_value = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_EXIT_OFF);
+    out->queue_next = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_QUEUE_NEXT_OFF);
+    out->queue_prev = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_QUEUE_PREV_OFF);
+    out->link_next = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_LINK_NEXT_OFF);
+    out->link_prev = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_LINK_PREV_OFF);
+    out->active_next = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_ACTIVE_NEXT_OFF);
+    out->active_prev = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_ACTIVE_PREV_OFF);
+    out->stack_base = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_STACK_BASE_OFF);
+    out->stack_end = mem_read32(cpu, address + OPENSPM_M14_DEV46_THREAD_STACK_END_OFF);
+    out->saved_sp = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_GPR1_OFF);
+    out->saved_r3 = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_GPR3_OFF);
+    out->saved_lr = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_LR_OFF);
+    out->saved_ctr = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_CTR_OFF);
+    out->saved_srr0 = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_SRR0_OFF);
+    out->saved_srr1 = mem_read32(cpu, address + OPENSPM_M14_DEV46_CONTEXT_SRR1_OFF);
+    out->valid = 1u;
+}
+
+static void bridge_dev46_log_thread(openspm_bridge_instance *instance,
+                                    const char *label,
+                                    const openspm_m14_dev46_thread_snapshot *s) {
+    char message[1024];
+    if (instance == NULL || label == NULL || s == NULL) return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM main-thread truth %s thread=0x%08X valid=%s state=%u/%s attr=0x%04X suspend=%u pri=%u base_pri=%u exit=0x%08X qlink=0x%08X/0x%08X link=0x%08X/0x%08X active=0x%08X/0x%08X stack=0x%08X..0x%08X saved_sp=0x%08X saved_r3=0x%08X saved_lr=0x%08X saved_ctr=0x%08X saved_srr0=0x%08X saved_srr1=0x%08X.",
+        label, (unsigned)s->address, s->valid ? "yes" : "no",
+        (unsigned)s->state, bridge_dev46_state_name(s->state),
+        (unsigned)s->attributes, (unsigned)s->suspend_count,
+        (unsigned)s->priority, (unsigned)s->base_priority,
+        (unsigned)s->exit_value,
+        (unsigned)s->queue_next, (unsigned)s->queue_prev,
+        (unsigned)s->link_next, (unsigned)s->link_prev,
+        (unsigned)s->active_next, (unsigned)s->active_prev,
+        (unsigned)s->stack_base, (unsigned)s->stack_end,
+        (unsigned)s->saved_sp, (unsigned)s->saved_r3,
+        (unsigned)s->saved_lr, (unsigned)s->saved_ctr,
+        (unsigned)s->saved_srr0, (unsigned)s->saved_srr1);
+    bridge_v44_log(instance, message);
+}
+
+static void bridge_dev46_dump_code(openspm_bridge_instance *instance,
+                                   CPUState *cpu,
+                                   const char *label,
+                                   uint32_t center) {
+    uint32_t start;
+    uint32_t row;
+    if (instance == NULL || cpu == NULL || label == NULL || center < UINT32_C(0x30))
+        return;
+    start = (center - UINT32_C(0x30)) & ~UINT32_C(3);
+    if (!bridge_m14_context_address_valid(cpu, start, UINT32_C(0x60))) return;
+    for (row = 0u; row < 3u; ++row) {
+        const uint32_t pc = start + row * UINT32_C(0x20);
+        char message[640];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM main-thread PPC %s center=0x%08X row=0x%08X raw=%08X %08X %08X %08X %08X %08X %08X %08X.",
+            label, (unsigned)center, (unsigned)pc,
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x00)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x04)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x08)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x0C)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x10)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x14)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x18)),
+            (unsigned)mem_read32(cpu, pc + UINT32_C(0x1C)));
+        bridge_v44_log(instance, message);
+    }
+}
+
+static void bridge_dev46_scan_queue_refs(openspm_bridge_instance *instance,
+                                         CPUState *cpu,
+                                         uint32_t thread) {
+    uint32_t address;
+    uint32_t hits = 0u;
+    char summary[256];
+    if (instance == NULL || cpu == NULL || thread == 0u) return;
+    if (!bridge_m14_context_address_valid(
+            cpu, OPENSPM_M14_DEV46_QUEUE_SCAN_START,
+            OPENSPM_M14_DEV46_QUEUE_SCAN_END - OPENSPM_M14_DEV46_QUEUE_SCAN_START))
+        return;
+
+    for (address = OPENSPM_M14_DEV46_QUEUE_SCAN_START;
+         address + UINT32_C(8) <= OPENSPM_M14_DEV46_QUEUE_SCAN_END;
+         address += UINT32_C(4)) {
+        const uint32_t first = mem_read32(cpu, address);
+        const uint32_t second = mem_read32(cpu, address + UINT32_C(4));
+        if (first == thread || second == thread) {
+            char message[384];
+            (void)snprintf(
+                message, sizeof(message),
+                "M14 LLVM main-thread queue-ref candidate #%u addr=0x%08X words=0x%08X/0x%08X thread=0x%08X.",
+                (unsigned)(hits + 1u), (unsigned)address,
+                (unsigned)first, (unsigned)second, (unsigned)thread);
+            bridge_v44_log(instance, message);
+            if (++hits >= OPENSPM_M14_DEV46_QUEUE_HIT_LIMIT) break;
+        }
+    }
+    (void)snprintf(summary, sizeof(summary),
+                   "M14 LLVM main-thread queue-ref scan complete range=[0x%08X,0x%08X) hits=%u%s.",
+                   (unsigned)OPENSPM_M14_DEV46_QUEUE_SCAN_START,
+                   (unsigned)OPENSPM_M14_DEV46_QUEUE_SCAN_END,
+                   (unsigned)hits,
+                   hits >= OPENSPM_M14_DEV46_QUEUE_HIT_LIMIT ? "+" : "");
+    bridge_v44_log(instance, summary);
+}
+
+static int OPENSPM_CALL bridge_run_dev46(void *opaque,
+                                        uint64_t soft_cycle_budget,
+                                        openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    openspm_m14_v43_vi_snapshot before;
+    openspm_m14_v43_vi_snapshot after;
+    openspm_m14_dev46_thread_snapshot thread_before;
+    openspm_m14_dev46_thread_snapshot thread_after;
+    uint32_t before_lr;
+    uint32_t before_ctr;
+    uint32_t before_sp;
+    uint32_t before_r3;
+    uint32_t before_thread;
+    int result;
+
+    if (instance == NULL || g_m14_dev46_underlying_run == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    bridge_v43_snapshot(instance, &before);
+    before_lr = (uint32_t)instance->cpu.lr;
+    before_ctr = (uint32_t)instance->cpu.ctr;
+    before_sp = (uint32_t)instance->cpu.gpr[1];
+    before_r3 = (uint32_t)instance->cpu.gpr[3];
+    before_thread = before.current_thread;
+    bridge_dev46_capture_thread(&instance->cpu, before_thread, &thread_before);
+
+    result = g_m14_dev46_underlying_run(opaque, soft_cycle_budget, out_exit);
+    bridge_v43_snapshot(instance, &after);
+
+    if (!g_m14_dev46_logged && before.valid && after.valid &&
+        before.seq == 0u && before.stage == 1u &&
+        before_thread != 0u && before.pc != OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        after.pc == OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        after.current_thread == 0u) {
+        char message[768];
+        g_m14_dev46_logged = 1u;
+        bridge_dev46_capture_thread(&instance->cpu, before_thread, &thread_after);
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM main-thread transition captured tick=%u->%u thread=0x%08X pc=0x%08X->0x%08X lr=0x%08X ctr=0x%08X sp=0x%08X r3=0x%08X context=0x%08X->0x%08X runq=0x%08X->0x%08X hint=0x%08X->0x%08X result=%d exit=%u/detail=%u/source=0x%08llX.",
+            (unsigned)before.retrace_ticks, (unsigned)after.retrace_ticks,
+            (unsigned)before_thread, (unsigned)before.pc, (unsigned)after.pc,
+            (unsigned)before_lr, (unsigned)before_ctr,
+            (unsigned)before_sp, (unsigned)before_r3,
+            (unsigned)before.current_context, (unsigned)after.current_context,
+            (unsigned)before.runqueue_bits, (unsigned)after.runqueue_bits,
+            (unsigned)before.runqueue_hint, (unsigned)after.runqueue_hint,
+            result,
+            out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+            out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+            (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+        bridge_v44_log(instance, message);
+        bridge_dev46_log_thread(instance, "BEFORE", &thread_before);
+        bridge_dev46_log_thread(instance, "AFTER", &thread_after);
+        bridge_dev46_dump_code(instance, &instance->cpu, "PC", before.pc);
+        bridge_dev46_dump_code(instance, &instance->cpu, "LR", before_lr);
+        bridge_dev46_dump_code(instance, &instance->cpu, "CTR", before_ctr);
+        if (thread_after.valid &&
+            thread_after.state == OPENSPM_M14_DEV46_THREAD_WAITING)
+            bridge_dev46_scan_queue_refs(instance, &instance->cpu, before_thread);
+    }
+
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_dev46(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    int result;
+    if (g_m14_dev46_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev46_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    g_m14_dev46_logged = 0u;
+    if (out_instance != NULL && *out_instance != NULL)
+        bridge_v44_log((openspm_bridge_instance *)*out_instance,
+            "M14 LLVM main-thread transition truth probe active: first seq=0/stage=1 persistent-thread loss snapshots the real OSThread TCB and player-owned PPC windows; guest state unchanged.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev46(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 LLVM main-thread transition truth stats captured=%u.",
+                       (unsigned)g_m14_dev46_logged);
+        bridge_v44_log(instance, message);
+    }
+    if (g_m14_dev46_underlying_destroy != NULL)
+        g_m14_dev46_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev45_wake_tail_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev46_underlying_create = out_api->create;
+    g_m14_dev46_underlying_run = out_api->run;
+    g_m14_dev46_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev46-llvm-main-thread-transition-truth";
+    out_api->create = bridge_create_dev46;
+    out_api->run = bridge_run_dev46;
+    out_api->destroy = bridge_destroy_dev46;
+#endif
+    return OPENSPM_OK;
+}

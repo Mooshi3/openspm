@@ -1,0 +1,238 @@
+/*
+ * M14 local-module bridge v35 / LLVM VI wake-tail truth probe.
+ *
+ * dev44 isolated the permanent post-frame stall to a very narrow semantic
+ * divergence. Once seq_logo stage 1 falls into SelectThread idle, the real
+ * VI retraceCount continues to increment every host retrace, but the known
+ * VIWaitForRetrace waiter remains linked on retraceQueue and RunQueueBits stays
+ * zero. Before the stall the same handler drains that queue and sets the real
+ * run-queue bit. The next question is therefore not whether VI runs, but whether
+ * the dead-state scratch __VIRetraceHandler actually reaches OSWakeupThread.
+ *
+ * v35 is observation-only. It wraps the native-region query callback already
+ * installed by v34 and records regions that contain three revision-2 SDK
+ * coordinates proven by the existing M14/generated-code work:
+ *   __VIRetraceHandler = 0x80280600
+ *   OSWakeupThread     = 0x802761CC
+ *   handler return     = 0x80280E0C
+ *
+ * No region is blocked and no guest state is modified. At an OSWakeupThread
+ * query the live LR exposes the real call return address, so the player log can
+ * also prove the caller without importing a callsite from another revision.
+ * We keep separate bounded counters before and after dev44's post-frame-idle
+ * capture arms. A dead-state handler-start/tail with no dead-state wake entry
+ * proves the handler skipped/escaped before OSWakeupThread; a wake entry with an
+ * unchanged queue moves the bug inside OSWakeupThread/OSThread state itself.
+ *
+ * Historical source-contract ancestry:
+ * m14-dev44-llvm-postframe-idle-truth
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev44_postframe_idle_base
+#include "legacy_c_adapter_v34.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V35_VI_HANDLER UINT32_C(0x80280600)
+#define OPENSPM_M14_V35_OS_WAKEUP_THREAD UINT32_C(0x802761CC)
+#define OPENSPM_M14_V35_VI_HANDLER_RETURN UINT32_C(0x80280E0C)
+#define OPENSPM_M14_V35_PRE_LOG_LIMIT UINT32_C(8)
+#define OPENSPM_M14_V35_DEAD_LOG_LIMIT UINT32_C(24)
+
+/* dev35 (legacy_c_adapter_v25.c.in) already owns the historical v35 symbol
+   namespace. Keep this dev45 diagnostic in a unique namespace because all
+   bridge layers are textually included into one translation unit. */
+static openspm_native_create_fn g_m14_dev45_underlying_create;
+static openspm_native_destroy_fn g_m14_dev45_underlying_destroy;
+static PPCHostCall g_m14_dev45_underlying_host_call;
+static openspm_bridge_instance *g_m14_dev45_instance;
+static uint32_t g_m14_dev45_pre_logs;
+static uint32_t g_m14_dev45_dead_logs;
+static uint32_t g_m14_dev45_handler_pre;
+static uint32_t g_m14_dev45_handler_dead;
+static uint32_t g_m14_dev45_wake_pre;
+static uint32_t g_m14_dev45_wake_dead;
+static uint32_t g_m14_dev45_tail_pre;
+static uint32_t g_m14_dev45_tail_dead;
+
+static int bridge_dev45_range_contains(uint32_t start, uint32_t end,
+                                       uint32_t address) {
+    return end > start && address >= start && address < end;
+}
+
+static void bridge_dev45_log_query(CPUState *cpu,
+                                   const char *kind,
+                                   uint32_t start,
+                                   uint32_t end,
+                                   int dead) {
+    openspm_bridge_instance *instance = g_m14_dev45_instance;
+    uint32_t seq = UINT32_MAX;
+    uint32_t stage = UINT32_MAX;
+    uint32_t queue = cpu != NULL ? (uint32_t)cpu->gpr[3] : 0u;
+    uint32_t head = 0u;
+    uint32_t tail = 0u;
+    uint32_t context = 0u;
+    uint32_t thread = 0u;
+    uint32_t runq = 0u;
+    uint32_t hint = 0u;
+    uint32_t count = 0u;
+    uint32_t r13 = cpu != NULL ? (uint32_t)cpu->gpr[13] : 0u;
+    uint32_t runq_addr = r13 - OPENSPM_M14_V39_RUNQUEUE_BITS_DELTA;
+    uint32_t hint_addr = r13 - OPENSPM_M14_V39_RUNQUEUE_HINT_DELTA;
+    uint32_t count_addr = 0u;
+    int count_valid = 0;
+    char message[1024];
+
+    if (cpu == NULL || instance == NULL || kind == NULL) return;
+    bridge_v44_stage(cpu, &seq, &stage);
+    if (seq != 0u || stage != 1u) return;
+
+    if (bridge_m14_context_address_valid(cpu, queue, 8u)) {
+        head = mem_read32(cpu, queue);
+        tail = mem_read32(cpu, queue + UINT32_C(4));
+    }
+    if (bridge_m14_context_address_valid(cpu, OPENSPM_M14_OS_CURRENT_CONTEXT, 4u))
+        context = mem_read32(cpu, OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (bridge_m14_context_address_valid(cpu, OPENSPM_M14_V39_OS_CURRENT_THREAD, 4u))
+        thread = mem_read32(cpu, OPENSPM_M14_V39_OS_CURRENT_THREAD);
+    if (bridge_m14_context_address_valid(cpu, runq_addr, 4u))
+        runq = mem_read32(cpu, runq_addr);
+    if (bridge_m14_context_address_valid(cpu, hint_addr, 4u))
+        hint = mem_read32(cpu, hint_addr);
+    if (bridge_v43_resolve_expr(instance,
+                                OPENSPM_LOCAL_VI_RETRACE_COUNT_MODE,
+                                OPENSPM_LOCAL_VI_RETRACE_COUNT_VALUE,
+                                &count_addr) &&
+        bridge_m14_context_address_valid(cpu, count_addr, 4u)) {
+        count = mem_read32(cpu, count_addr);
+        count_valid = 1;
+    }
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM VI wake-tail %s %s#%u tick=%u pc=0x%08X range=[0x%08X,0x%08X) lr=0x%08X sp=0x%08X r3=0x%08X queue_head=0x%08X queue_tail=0x%08X count%s=0x%08X context=0x%08X thread=0x%08X runq=0x%08X hint=0x%08X cpu=%s.",
+        dead ? "DEAD" : "PRE", kind,
+        (unsigned)(dead ? g_m14_dev45_dead_logs + 1u : g_m14_dev45_pre_logs + 1u),
+        (unsigned)g_m14_retrace_ticks,
+        (unsigned)cpu->pc, (unsigned)start, (unsigned)end,
+        (unsigned)cpu->lr, (unsigned)cpu->gpr[1], (unsigned)queue,
+        (unsigned)head, (unsigned)tail,
+        count_valid ? "" : "-unavailable", (unsigned)count,
+        (unsigned)context, (unsigned)thread,
+        (unsigned)runq, (unsigned)hint,
+        cpu == &instance->cpu ? "persistent" : "scratch");
+    bridge_v44_log(instance, message);
+    if (dead) ++g_m14_dev45_dead_logs;
+    else ++g_m14_dev45_pre_logs;
+}
+
+static bool bridge_host_call_dev45(CPUState *cpu, u32 address) {
+    uint32_t start;
+    uint32_t end;
+    int dead;
+    int hit_handler;
+    int hit_wake;
+    int hit_tail;
+
+    if (cpu == NULL || g_m14_dev45_underlying_host_call == NULL)
+        return false;
+
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return g_m14_dev45_underlying_host_call(cpu, address);
+
+    start = (uint32_t)cpu->external_addr;
+    end = (uint32_t)cpu->external_value;
+    dead = g_m14_v44_idle_active != 0u;
+    hit_handler = bridge_dev45_range_contains(start, end, OPENSPM_M14_V35_VI_HANDLER);
+    hit_wake = bridge_dev45_range_contains(start, end, OPENSPM_M14_V35_OS_WAKEUP_THREAD);
+    hit_tail = bridge_dev45_range_contains(start, end, OPENSPM_M14_V35_VI_HANDLER_RETURN);
+
+    if (hit_handler) {
+        if (dead) ++g_m14_dev45_handler_dead; else ++g_m14_dev45_handler_pre;
+        if ((dead && g_m14_dev45_dead_logs < OPENSPM_M14_V35_DEAD_LOG_LIMIT) ||
+            (!dead && g_m14_dev45_pre_logs < OPENSPM_M14_V35_PRE_LOG_LIMIT))
+            bridge_dev45_log_query(cpu, "HANDLER", start, end, dead);
+    }
+    if (hit_wake) {
+        if (dead) ++g_m14_dev45_wake_dead; else ++g_m14_dev45_wake_pre;
+        if ((dead && g_m14_dev45_dead_logs < OPENSPM_M14_V35_DEAD_LOG_LIMIT) ||
+            (!dead && g_m14_dev45_pre_logs < OPENSPM_M14_V35_PRE_LOG_LIMIT))
+            bridge_dev45_log_query(cpu, "WAKE", start, end, dead);
+    }
+    if (hit_tail) {
+        if (dead) ++g_m14_dev45_tail_dead; else ++g_m14_dev45_tail_pre;
+        if ((dead && g_m14_dev45_dead_logs < OPENSPM_M14_V35_DEAD_LOG_LIMIT) ||
+            (!dead && g_m14_dev45_pre_logs < OPENSPM_M14_V35_PRE_LOG_LIMIT))
+            bridge_dev45_log_query(cpu, "TAIL", start, end, dead);
+    }
+
+    return g_m14_dev45_underlying_host_call(cpu, address);
+}
+
+static int OPENSPM_CALL bridge_create_dev45(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_dev45_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev45_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev45_instance = instance;
+    g_m14_dev45_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_dev45;
+    g_m14_dev45_pre_logs = g_m14_dev45_dead_logs = 0u;
+    g_m14_dev45_handler_pre = g_m14_dev45_handler_dead = 0u;
+    g_m14_dev45_wake_pre = g_m14_dev45_wake_dead = 0u;
+    g_m14_dev45_tail_pre = g_m14_dev45_tail_dead = 0u;
+    bridge_v44_log(instance,
+        "M14 LLVM VI wake-tail truth probe active: native-region queries around __VIRetraceHandler/OSWakeupThread/handler-return are compared before and after post-frame idle; guest state unchanged.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev45(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[512];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM VI wake-tail truth stats handler_pre=%u handler_dead=%u wake_pre=%u wake_dead=%u tail_pre=%u tail_dead=%u pre_logs=%u dead_logs=%u.",
+            (unsigned)g_m14_dev45_handler_pre, (unsigned)g_m14_dev45_handler_dead,
+            (unsigned)g_m14_dev45_wake_pre, (unsigned)g_m14_dev45_wake_dead,
+            (unsigned)g_m14_dev45_tail_pre, (unsigned)g_m14_dev45_tail_dead,
+            (unsigned)g_m14_dev45_pre_logs, (unsigned)g_m14_dev45_dead_logs);
+        bridge_v44_log(instance, message);
+        instance->cpu.host_call = g_m14_dev45_underlying_host_call;
+    }
+    if (g_m14_dev45_underlying_destroy != NULL)
+        g_m14_dev45_underlying_destroy(opaque);
+    g_m14_dev45_underlying_host_call = NULL;
+    g_m14_dev45_instance = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev44_postframe_idle_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev45_underlying_create = out_api->create;
+    g_m14_dev45_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev45-llvm-vi-wake-tail-truth";
+    out_api->create = bridge_create_dev45;
+    out_api->destroy = bridge_destroy_dev45;
+#endif
+    return OPENSPM_OK;
+}

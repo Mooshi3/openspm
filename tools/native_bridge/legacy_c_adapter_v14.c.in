@@ -1,0 +1,389 @@
+/*
+ * M14 generated-C bridge v14 / module-local GX service coalescer.
+ *
+ * Runtime 171255 localized the real slowdown. SPM's own top-level loop is
+ * healthy at ~60 Hz while DEMOBeforeRender + spmarioDisp + spmarioMain finish
+ * inside one 16.667 ms VI interval. In the heavy Chapter 1 windows, however,
+ * spmarioDisp + spmarioMain alone reaches roughly 18-25 ms. DEMODoneRender then
+ * reaches its authentic VIWaitForRetrace after the next retrace was already
+ * missed, so the original Wii loop correctly waits for the following retrace
+ * and quantizes to ~30 Hz.
+ *
+ * The same trace shows spmarioDisp wall time tracking Broadway GX write-gather
+ * volume very closely. dev16 already preserves the hardware 32-byte WPAR line,
+ * but every completed line still crosses the generated-module/backend service
+ * boundary separately, where backend dev23 runs its command framer and Aurora
+ * receives another small submit. Draw-heavy gameplay emits tens of thousands of
+ * WPAR stores per produced frame, making that migration seam a prime native-only
+ * tax which does not exist on Wii or in a mature static recompilation.
+ *
+ * Keep dev16's exact 32-byte gather implementation byte-for-byte underneath.
+ * This wrapper only swaps the resolved OpenSPM GX service submit callback for a
+ * module-local 4 KiB coalescer. Existing hard ordering boundaries are preserved:
+ * external non-WPAR reads/writes, sync/eieio/isync, known hosted semantic calls,
+ * direct M14 hostcall service calls (including presentation and v19 display-list
+ * transitions), and teardown all first drain the original 32-byte line and then
+ * drain this coalescer before proceeding. A full 4 KiB queue also drains itself,
+ * so FIFO progress never depends on reaching a semantic fence.
+ *
+ * No GX bytes are removed, reordered, decoded, or synthesized here. The backend
+ * still owns command framing, DrawDone/token semantics, display-list recording,
+ * guest-array lifetime, and renderer submission. This changes only call
+ * granularity across the module/backend migration boundary.
+ *
+ * Terminal FIFO errors obey dev7's no-replay contract. The first failed real
+ * backend submit is latched, both the coalescer and current Broadway gather are
+ * abandoned, and later calls return the same error without replaying bytes.
+ *
+ * CMake's active-bridge guard intentionally looks for the inherited fixed-phase
+ * contract marker, retained here verbatim for source-level fail-closed checking:
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev20_phase_coalesce_base
+#include "legacy_c_adapter_v13.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_M14_V22_FIFO_BATCH_BYTES UINT32_C(4096)
+
+static uint8_t g_m14_v22_fifo_batch[OPENSPM_M14_V22_FIFO_BATCH_BYTES];
+static uint32_t g_m14_v22_fifo_batch_size;
+static uint32_t g_m14_v22_fifo_batch_max;
+static uint64_t g_m14_v22_input_submits;
+static uint64_t g_m14_v22_backend_submits;
+static uint64_t g_m14_v22_submitted_bytes;
+static uint64_t g_m14_v22_hard_flushes;
+static int g_m14_v22_fifo_error;
+static openspm_bridge_instance *g_m14_v22_instance;
+static openspm_gx_fifo_submit_fn g_m14_v22_underlying_fifo_submit;
+static void *g_m14_v22_underlying_fifo_context;
+static openspm_m14_hostcall_handle_fn g_m14_v22_underlying_hostcall;
+static void *g_m14_v22_underlying_hostcall_context;
+static openspm_native_create_fn g_m14_v22_underlying_create;
+static openspm_native_destroy_fn g_m14_v22_underlying_destroy;
+
+static void bridge_v22_log(openspm_bridge_instance *instance,
+                           openspm_log_level level,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, level, message);
+}
+
+static void bridge_v22_abandon_fifo(void) {
+    g_m14_v22_fifo_batch_size = 0u;
+    g_m14_v8_wg_size = 0u;
+    g_m14_v8_wg_pending_stores = 0u;
+}
+
+static void bridge_v22_request_fifo_failure(openspm_bridge_instance *instance,
+                                            uint32_t source_address,
+                                            int result,
+                                            uint32_t size) {
+    char message[320];
+    if (g_m14_v22_fifo_error == OPENSPM_OK)
+        g_m14_v22_fifo_error = result;
+    bridge_v22_abandon_fifo();
+    (void)snprintf(message, sizeof(message),
+                   "M14 GX coalesced submit failure pc=0x%08X size=%u result=%d input_submits=%llu backend_submits=%llu; pending GX bytes abandoned, no replay.",
+                   (unsigned)source_address,
+                   (unsigned)size,
+                   result,
+                   (unsigned long long)g_m14_v22_input_submits,
+                   (unsigned long long)g_m14_v22_backend_submits);
+    bridge_v22_log(instance, OPENSPM_LOG_WARN, message);
+    bridge_request_fallback(instance, source_address,
+                            result == OPENSPM_ERROR_NOT_FOUND ? 3u : 4u);
+}
+
+static int bridge_v22_flush_batch(openspm_bridge_instance *instance,
+                                  uint32_t source_address,
+                                  int hard_boundary) {
+    uint32_t size;
+    int result;
+
+    if (g_m14_v22_fifo_error != OPENSPM_OK)
+        return g_m14_v22_fifo_error;
+    if (hard_boundary) ++g_m14_v22_hard_flushes;
+    if (g_m14_v22_fifo_batch_size == 0u) return OPENSPM_OK;
+    if (g_m14_v22_underlying_fifo_submit == NULL)
+        return OPENSPM_ERROR_UNSUPPORTED;
+
+    size = g_m14_v22_fifo_batch_size;
+    result = g_m14_v22_underlying_fifo_submit(
+        g_m14_v22_underlying_fifo_context,
+        g_m14_v22_fifo_batch,
+        size);
+    if (result != OPENSPM_OK) {
+        bridge_v22_request_fifo_failure(instance, source_address, result, size);
+        return result;
+    }
+
+    ++g_m14_v22_backend_submits;
+    g_m14_v22_submitted_bytes += size;
+    g_m14_v22_fifo_batch_size = 0u;
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_v22_submit_coalesced(void *context,
+                                                     const uint8_t *bytes,
+                                                     uint32_t size) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)context;
+    uint32_t consumed = 0u;
+
+    if (size != 0u && bytes == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+    if (size == 0u) return OPENSPM_OK;
+    if (g_m14_v22_fifo_error != OPENSPM_OK)
+        return g_m14_v22_fifo_error;
+    if (instance == NULL) instance = g_m14_v22_instance;
+    ++g_m14_v22_input_submits;
+
+    while (consumed < size) {
+        uint32_t available = OPENSPM_M14_V22_FIFO_BATCH_BYTES -
+                             g_m14_v22_fifo_batch_size;
+        uint32_t remaining = size - consumed;
+        uint32_t chunk = remaining < available ? remaining : available;
+
+        if (chunk != 0u) {
+            memcpy(g_m14_v22_fifo_batch + g_m14_v22_fifo_batch_size,
+                   bytes + consumed, chunk);
+            g_m14_v22_fifo_batch_size += chunk;
+            consumed += chunk;
+            if (g_m14_v22_fifo_batch_size > g_m14_v22_fifo_batch_max)
+                g_m14_v22_fifo_batch_max = g_m14_v22_fifo_batch_size;
+        }
+
+        if (g_m14_v22_fifo_batch_size == OPENSPM_M14_V22_FIFO_BATCH_BYTES) {
+            const uint32_t source = instance != NULL
+                                        ? (uint32_t)instance->cpu.pc : 0u;
+            const int result = bridge_v22_flush_batch(instance, source, 0);
+            if (result != OPENSPM_OK) return result;
+        }
+    }
+    return OPENSPM_OK;
+}
+
+/* Move any partial dev16 Broadway line through the coalescing submit callback,
+ * then force all queued bytes across the real backend service before the caller
+ * crosses a guest-visible ordering/semantic boundary. */
+static int bridge_v22_hard_flush(openspm_bridge_instance *instance,
+                                 uint32_t source_address) {
+    int result;
+    if (g_m14_v22_fifo_error != OPENSPM_OK)
+        return g_m14_v22_fifo_error;
+    if (!g_m14_v8_have_gx_fifo) return OPENSPM_OK;
+
+    result = bridge_flush_wg_v8(instance, source_address);
+    if (result != OPENSPM_OK) return result;
+    return bridge_v22_flush_batch(instance, source_address, 1);
+}
+
+static u64 bridge_external_read_v22(CPUState *cpu, u32 address, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const uint32_t source = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    if (g_m14_v8_have_gx_fifo &&
+        bridge_v22_hard_flush(instance, source) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source;
+        return 0u;
+    }
+    return bridge_external_read_v8(cpu, address, width);
+}
+
+static void bridge_external_write_v22(CPUState *cpu,
+                                      u32 address,
+                                      u64 value,
+                                      u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const uint32_t source = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    const int wpar =
+        address >= OPENSPM_M14_WGPIPE_BASE &&
+        address < OPENSPM_M14_WGPIPE_BASE + OPENSPM_M14_WGPIPE_SIZE &&
+        (width == 1u || width == 2u || width == 4u || width == 8u);
+
+    /* WPAR stores remain on dev16's exact 32-byte gather path. Everything else
+       preserves dev16's old flush-before-external-write ordering. */
+    if (!wpar && g_m14_v8_have_gx_fifo &&
+        bridge_v22_hard_flush(instance, source) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source;
+        return;
+    }
+    bridge_external_write_v8(cpu, address, value, width);
+}
+
+static void bridge_instruction_fallback_v22(CPUState *cpu,
+                                             u32 raw,
+                                             u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    const uint32_t opcode = raw >> 26;
+    const uint32_t xo = (raw >> 1) & UINT32_C(0x3FF);
+    int ordering = 0;
+
+    if (opcode == OPENSPM_PPC_OPCODE_SYSTEM && xo == OPENSPM_PPC_XO_ISYNC)
+        ordering = 1;
+    if (opcode == OPENSPM_PPC_OPCODE_X &&
+        (xo == OPENSPM_PPC_XO_SYNC || xo == OPENSPM_PPC_XO_EIEIO))
+        ordering = 1;
+
+    if (ordering && g_m14_v8_have_gx_fifo &&
+        bridge_v22_hard_flush(instance, source_address) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source_address;
+        return;
+    }
+
+    /* Preserve dev17's host-derived MFTB interception as well as all dev16
+       cache/order semantics underneath. */
+    bridge_instruction_fallback_v9(cpu, raw, source_address);
+}
+
+static bool bridge_host_call_v22(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY &&
+        bridge_is_m14_host_target((uint32_t)address) &&
+        g_m14_v8_have_gx_fifo) {
+        const uint32_t source = cpu != NULL ? (uint32_t)cpu->pc : (uint32_t)address;
+        if (bridge_v22_hard_flush(instance, source) != OPENSPM_OK)
+            return true;
+    }
+    return bridge_host_call_v8(cpu, address);
+}
+
+static int OPENSPM_CALL bridge_v22_hostcall_handle(
+    void *context,
+    uint32_t target_address,
+    openspm_m14_hostcall_state *state) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)context;
+    uint32_t source;
+    int result;
+
+    if (instance == NULL) instance = g_m14_v22_instance;
+    source = instance != NULL ? (uint32_t)instance->cpu.pc : target_address;
+    result = bridge_v22_hard_flush(instance, source);
+    if (result != OPENSPM_OK) return result;
+    if (g_m14_v22_underlying_hostcall == NULL)
+        return OPENSPM_ERROR_UNSUPPORTED;
+    return g_m14_v22_underlying_hostcall(
+        g_m14_v22_underlying_hostcall_context,
+        target_address,
+        state);
+}
+
+static void bridge_v22_reset_state(void) {
+    g_m14_v22_fifo_batch_size = 0u;
+    g_m14_v22_fifo_batch_max = 0u;
+    g_m14_v22_input_submits = 0u;
+    g_m14_v22_backend_submits = 0u;
+    g_m14_v22_submitted_bytes = 0u;
+    g_m14_v22_hard_flushes = 0u;
+    g_m14_v22_fifo_error = OPENSPM_OK;
+    g_m14_v22_instance = NULL;
+    g_m14_v22_underlying_fifo_submit = NULL;
+    g_m14_v22_underlying_fifo_context = NULL;
+    g_m14_v22_underlying_hostcall = NULL;
+    g_m14_v22_underlying_hostcall_context = NULL;
+}
+
+static int OPENSPM_CALL bridge_create_v22(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_v22_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    bridge_v22_reset_state();
+    result = g_m14_v22_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v22_instance = instance;
+
+    if (g_m14_v8_have_gx_fifo && g_m14_v8_gx_fifo.submit != NULL) {
+        g_m14_v22_underlying_fifo_submit = g_m14_v8_gx_fifo.submit;
+        g_m14_v22_underlying_fifo_context = g_m14_v8_gx_fifo.context;
+        g_m14_v8_gx_fifo.context = instance;
+        g_m14_v8_gx_fifo.submit = bridge_v22_submit_coalesced;
+
+        /* Install fence-aware wrappers only after all underlying create layers
+           have finished selecting their proven callbacks. */
+        instance->cpu.external_read = bridge_external_read_v22;
+        instance->cpu.external_write = bridge_external_write_v22;
+        instance->cpu.instruction_fallback = bridge_instruction_fallback_v22;
+        instance->cpu.host_call = bridge_host_call_v22;
+
+        bridge_v22_log(instance, OPENSPM_LOG_INFO,
+                       "M14 native GX line coalescer active: exact 32-byte Broadway gathers batch up to 4 KiB before backend submission; semantic flush boundaries preserved.");
+    }
+
+    if (g_m14_have_hostcall && g_m14_hostcall.handle != NULL) {
+        g_m14_v22_underlying_hostcall = g_m14_hostcall.handle;
+        g_m14_v22_underlying_hostcall_context = g_m14_hostcall.context;
+        g_m14_hostcall.context = instance;
+        g_m14_hostcall.handle = bridge_v22_hostcall_handle;
+    }
+
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v22(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    char message[448];
+
+    if (instance != NULL && g_m14_v8_have_gx_fifo) {
+        if (g_m14_v22_fifo_error == OPENSPM_OK)
+            (void)bridge_v22_hard_flush(instance, instance->cpu.pc);
+        else
+            bridge_v22_abandon_fifo();
+    }
+
+    if (instance != NULL && g_m14_v22_input_submits != 0u) {
+        (void)snprintf(message, sizeof(message),
+                       "M14 GX line coalescer stats input_submits=%llu backend_submits=%llu bytes=%llu max_batch=%u hard_flushes=%llu fifo_error=%d.",
+                       (unsigned long long)g_m14_v22_input_submits,
+                       (unsigned long long)g_m14_v22_backend_submits,
+                       (unsigned long long)g_m14_v22_submitted_bytes,
+                       (unsigned)g_m14_v22_fifo_batch_max,
+                       (unsigned long long)g_m14_v22_hard_flushes,
+                       g_m14_v22_fifo_error);
+        bridge_v22_log(instance, OPENSPM_LOG_INFO, message);
+    }
+
+    /* Restore service pointers before the proven destroy chain runs. On a
+       terminal FIFO failure both queues were explicitly abandoned above, so the
+       underlying dev16 destroy cannot replay rejected bytes. */
+    if (g_m14_v22_underlying_fifo_submit != NULL) {
+        g_m14_v8_gx_fifo.context = g_m14_v22_underlying_fifo_context;
+        g_m14_v8_gx_fifo.submit = g_m14_v22_underlying_fifo_submit;
+    }
+    if (g_m14_v22_underlying_hostcall != NULL) {
+        g_m14_hostcall.context = g_m14_v22_underlying_hostcall_context;
+        g_m14_hostcall.handle = g_m14_v22_underlying_hostcall;
+    }
+
+    if (g_m14_v22_underlying_destroy != NULL)
+        g_m14_v22_underlying_destroy(opaque);
+    bridge_v22_reset_state();
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev20_phase_coalesce_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    if (out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    g_m14_v22_underlying_create = out_api->create;
+    g_m14_v22_underlying_destroy = out_api->destroy;
+    out_api->create = bridge_create_v22;
+    out_api->destroy = bridge_destroy_v22;
+
+    /* Migration-performance wrapper only; public ABI/provenance stays v20. */
+    return OPENSPM_OK;
+}

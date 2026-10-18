@@ -1,0 +1,577 @@
+/*
+ * M14 local-module bridge v41 / dev58 playable-LLVM production repair.
+ *
+ * dev53 remains the correctness base: spmarioMain may contain the HOME caller
+ * seam, while homebuttonMain itself is still intercepted, and stale-PC region
+ * queries use external_addr as the authoritative generated-region start.
+ *
+ * The first fully playable dev57 LLVM run exposed two production regressions
+ * that are unrelated to the computed-entry bring-up work:
+ *
+ *   1. ppc_native_region_available() was still re-running the complete dev50
+ *      semantic classifier on every native function entry. One normal play
+ *      session accumulated more than two billion region queries and tens of
+ *      billions of binary-search comparisons. Region admission is immutable
+ *      for ordinary generated regions, so dev58 memoizes only positive/safe
+ *      [start,end) answers. Anything containing a dynamic v19 seam, frame-phase
+ *      telemetry point or relF allocator seam remains uncached, and blocked
+ *      results are never cached.
+ *
+ *   2. dev48/dev51 made LLVM playable by replacing the complete retail
+ *      GXBeginDisplayList/GXEndDisplayList bodies with a synchronous PC-native
+ *      approximation. That knowingly superseded the runtime-proven v19
+ *      continuation-safe contract. The playable dev57 run reproduced the old
+ *      global blue/striped material corruption which v19 had eliminated.
+ *      dev58 therefore restores the existing v19 pre-call/durable-return hooks
+ *      above dev48: the real recompiled SDK CPU-side GXData save/restore code is
+ *      allowed to execute, while OpenSPM still owns only the physical bounded
+ *      display-list recorder at the durable caller continuations.
+ *
+ * The one-shot permit is fail-closed: it is valid only for the exact partition
+ * rooted at the just-handled display-list seam and is refused if the same
+ * generated region contains another display-list seam. Frame-phase telemetry is
+ * deliberately NOT a v19 blocker; phase regions only bypass memoization and
+ * continue through dev50's nonblocking telemetry path. If the old Wii
+ * transport-only stall at 0x80291E20 is still present, the player log will expose
+ * that exact frontier; do not paper over it by reintroducing the whole-function
+ * dev48 shortcut.
+ *
+ * A 1/4096 sampled Misra-Gries sketch records ordinary non-query callback PCs.
+ * dev57 reported ~889 million such classifications, so if admission memoization
+ * alone does not restore 60 Hz the next hot callback will be visible without a
+ * per-call logging tax.
+ *
+ * Historical source-contract markers retained for CMake/archaeology:
+ * m14-dev49-llvm-pc-display-list-return
+ * m14-dev50-llvm-production-router
+ * m14-dev51-llvm-test-ready-gx-input
+ * m14-dev52-llvm-frame-phase-continuation
+ * m14-dev53-llvm-home-region-admission
+ * m14-dev58-llvm-admission-cache-v19-restore
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev51_test_ready_base
+#include "legacy_c_adapter_v40.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_dev53_underlying_create;
+static openspm_native_destroy_fn g_m14_dev53_underlying_destroy;
+static PPCHostCall g_m14_dev53_underlying_host_call;
+static openspm_bridge_instance *g_m14_dev53_instance;
+static uint64_t g_m14_dev53_main_region_admissions;
+static uint64_t g_m14_dev53_stale_pc_direct_blocks;
+static uint32_t g_m14_dev53_main_logged;
+static uint32_t g_m14_dev53_stale_logged;
+
+static void bridge_dev53_log_main_once(CPUState *cpu,
+                                       uint32_t start, uint32_t end) {
+    char message[448];
+    if (g_m14_dev53_main_logged || g_m14_dev53_instance == NULL || cpu == NULL)
+        return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev53 HOME admission correction active: allowing spmarioMain native range [0x%08X,0x%08X) containing caller seam 0x%08X; only homebuttonMain callee 0x%08X remains a region blocker (query pc=0x%08X).",
+        (unsigned)start, (unsigned)end,
+        (unsigned)OPENSPM_M14_HOMEBUTTON_CALL,
+        (unsigned)OPENSPM_M14_HOMEBUTTON_MAIN,
+        (unsigned)cpu->pc);
+    bridge_v44_log(g_m14_dev53_instance, message);
+    g_m14_dev53_main_logged = 1u;
+}
+
+static void bridge_dev53_log_stale_once(CPUState *cpu,
+                                        uint32_t start, uint32_t end,
+                                        const openspm_local_llvm_hostcall_seam *seam) {
+    char message[448];
+    if (g_m14_dev53_stale_logged || g_m14_dev53_instance == NULL ||
+        cpu == NULL || seam == NULL)
+        return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM dev53 authoritative-start direct seam: stale query pc=0x%08X range=[0x%08X,0x%08X) exact call=0x%08X target=0x%08X; blocking native entry so the ordinary semantic hostcall can run.",
+        (unsigned)cpu->pc, (unsigned)start, (unsigned)end,
+        (unsigned)seam->call_pc, (unsigned)seam->target);
+    bridge_v44_log(g_m14_dev53_instance, message);
+    g_m14_dev53_stale_logged = 1u;
+}
+
+static bool bridge_host_call_dev53(CPUState *cpu, u32 address) {
+    uint32_t start;
+    uint32_t end;
+
+    if (cpu == NULL || g_m14_dev53_underlying_host_call == NULL)
+        return false;
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return g_m14_dev53_underlying_host_call(cpu, address);
+
+    start = (uint32_t)cpu->external_addr;
+    end = (uint32_t)cpu->external_value;
+
+    /* v21's proven contract: the caller's linked instruction is allowed to live
+       in the spmarioMain native region. Blocking the callee is what forces the
+       linked-native call to materialize the caller boundary. */
+    if (start == OPENSPM_M14_LLVM_PHASE_MAIN && end > start &&
+        bridge_dev50_range_contains(start, end, OPENSPM_M14_HOMEBUTTON_CALL) &&
+        !bridge_dev50_range_contains(start, end, OPENSPM_M14_HOMEBUTTON_MAIN)) {
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        ++g_m14_dev50_region_queries;
+        ++g_m14_dev53_main_region_admissions;
+        bridge_dev53_log_main_once(cpu, start, end);
+        return false;
+    }
+
+    /* external_addr/external_value describe the region being admitted. cpu->pc
+       may still name the previous materialized point. */
+    if ((uint32_t)cpu->pc != start && end > start) {
+        const openspm_local_llvm_hostcall_seam *seam =
+            bridge_v36_find_seam(start);
+        if (seam != NULL && seam->call_pc == start) {
+            cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+            ++g_m14_dev50_region_queries;
+            ++g_m14_dev50_direct_blocks;
+            ++g_m14_dev53_stale_pc_direct_blocks;
+            bridge_dev53_log_stale_once(cpu, start, end, seam);
+            return true;
+        }
+    }
+
+    return g_m14_dev53_underlying_host_call(cpu, address);
+}
+
+static int OPENSPM_CALL bridge_create_dev53(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev53_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev53_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev53_instance = instance;
+    g_m14_dev53_underlying_host_call = instance->cpu.host_call;
+    g_m14_dev53_main_region_admissions = 0u;
+    g_m14_dev53_stale_pc_direct_blocks = 0u;
+    g_m14_dev53_main_logged = 0u;
+    g_m14_dev53_stale_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_dev53;
+
+    bridge_v44_log(instance,
+        "M14 LLVM dev53 corrected production region admission active: spmarioMain is no longer blocked by its embedded HOME callsite; stale-PC direct seams use authoritative region-start matching; dev50 lean router and dev51 GX/input semantics remain active.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev53(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[320];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev53 admission stats spmario_ranges_allowed=%llu stale_pc_direct_blocks=%llu.",
+            (unsigned long long)g_m14_dev53_main_region_admissions,
+            (unsigned long long)g_m14_dev53_stale_pc_direct_blocks);
+        bridge_v44_log(instance, message);
+        if (instance->cpu.host_call == bridge_host_call_dev53)
+            instance->cpu.host_call = g_m14_dev53_underlying_host_call;
+    }
+
+    g_m14_dev53_instance = NULL;
+    g_m14_dev53_underlying_host_call = NULL;
+    if (g_m14_dev53_underlying_destroy != NULL)
+        g_m14_dev53_underlying_destroy(opaque);
+}
+
+/* ------------------------------------------------------------------------- */
+/* dev58: production admission memoization + runtime-proven v19 GX contract. */
+
+#define OPENSPM_M14_DEV58_CACHE_BITS 16u
+#define OPENSPM_M14_DEV58_CACHE_SIZE (UINT32_C(1) << OPENSPM_M14_DEV58_CACHE_BITS)
+#define OPENSPM_M14_DEV58_CACHE_MASK (OPENSPM_M14_DEV58_CACHE_SIZE - UINT32_C(1))
+#define OPENSPM_M14_DEV58_HH_SLOTS 8u
+#define OPENSPM_M14_DEV58_HH_SAMPLE_MASK UINT64_C(0xFFF)
+
+typedef struct openspm_m14_dev58_region_cache_entry {
+    uint32_t start;
+    uint32_t end;
+    uint32_t valid;
+} openspm_m14_dev58_region_cache_entry;
+
+typedef struct openspm_m14_dev58_heavy_hitter {
+    uint32_t address;
+    uint64_t count;
+} openspm_m14_dev58_heavy_hitter;
+
+static openspm_native_create_fn g_m14_dev58_underlying_create;
+static openspm_native_destroy_fn g_m14_dev58_underlying_destroy;
+static PPCHostCall g_m14_dev58_underlying_host_call;
+static openspm_bridge_instance *g_m14_dev58_instance;
+static openspm_m14_dev58_region_cache_entry
+    g_m14_dev58_region_cache[OPENSPM_M14_DEV58_CACHE_SIZE];
+static openspm_m14_dev58_heavy_hitter
+    g_m14_dev58_hh[OPENSPM_M14_DEV58_HH_SLOTS];
+static uint32_t g_m14_dev58_v19_permit_pc;
+static uint32_t g_m14_dev58_v19_permit_armed;
+static uint64_t g_m14_dev58_queries;
+static uint64_t g_m14_dev58_cache_hits;
+static uint64_t g_m14_dev58_cache_misses;
+static uint64_t g_m14_dev58_cache_inserts;
+static uint64_t g_m14_dev58_cache_collisions;
+static uint64_t g_m14_dev58_cache_bypasses;
+static uint64_t g_m14_dev58_v19_blocks;
+static uint64_t g_m14_dev58_v19_permits;
+static uint64_t g_m14_dev58_v19_pre_begin;
+static uint64_t g_m14_dev58_v19_post_begin;
+static uint64_t g_m14_dev58_v19_pre_end;
+static uint64_t g_m14_dev58_v19_post_end;
+static uint64_t g_m14_dev58_ordinary_seen;
+
+static uint32_t bridge_dev58_region_hash(uint32_t start, uint32_t end) {
+    uint32_t value = (start >> 2) ^ (end * UINT32_C(0x9E3779B9));
+    value ^= value >> 16;
+    value *= UINT32_C(0x7FEB352D);
+    value ^= value >> 15;
+    return value & OPENSPM_M14_DEV58_CACHE_MASK;
+}
+
+static int bridge_dev58_region_has_relf_seam(uint32_t start, uint32_t end) {
+    return bridge_dev50_range_contains(start, end, OPENSPM_M14_RELF_ALLOC_CALL) ||
+           bridge_dev50_range_contains(start, end, OPENSPM_M14_RELF_ALLOC_RETURN) ||
+           bridge_dev50_range_contains(start, end, OPENSPM_LOCAL_RELF_BSS_ALLOC_CALL) ||
+           bridge_dev50_range_contains(start, end, OPENSPM_LOCAL_RELF_BSS_ALLOC_RETURN);
+}
+
+static int bridge_dev58_range_has_dl_seam(uint32_t start, uint32_t end,
+                                          uint32_t ignored) {
+    uint32_t i;
+    if (end <= start) return 0;
+#define OPENSPM_DEV58_DL_CHECK(value) \
+    do { \
+        const uint32_t openspm_dev58_value = (uint32_t)(value); \
+        if (openspm_dev58_value != ignored && \
+            openspm_dev58_value >= start && openspm_dev58_value < end) \
+            return 1; \
+    } while (0)
+    OPENSPM_DEV58_DL_CHECK(OPENSPM_LOCAL_V19_GX_BEGIN);
+    OPENSPM_DEV58_DL_CHECK(OPENSPM_LOCAL_V19_GX_END);
+    for (i = 0u; i < OPENSPM_LOCAL_V19_BEGIN_COUNT; ++i)
+        OPENSPM_DEV58_DL_CHECK(OPENSPM_LOCAL_V19_BEGIN_RETURNS[i]);
+    for (i = 0u; i < OPENSPM_LOCAL_V19_END_COUNT; ++i)
+        OPENSPM_DEV58_DL_CHECK(OPENSPM_LOCAL_V19_END_RETURNS[i]);
+#undef OPENSPM_DEV58_DL_CHECK
+    return 0;
+}
+
+static int bridge_dev58_cacheable(uint32_t start, uint32_t end) {
+    if (end <= start) return 0;
+    /* Do not memoize any dynamic seam. Unlike the blocking policy below, this
+       intentionally includes the four nonblocking frame-phase telemetry PCs. */
+    if (bridge_v23_range_has_seam(start, end, 0u)) return 0;
+    if (bridge_dev58_region_has_relf_seam(start, end)) return 0;
+    return 1;
+}
+
+static int bridge_dev58_cache_lookup(uint32_t start, uint32_t end) {
+    openspm_m14_dev58_region_cache_entry *entry =
+        &g_m14_dev58_region_cache[bridge_dev58_region_hash(start, end)];
+    return entry->valid && entry->start == start && entry->end == end;
+}
+
+static void bridge_dev58_cache_insert(uint32_t start, uint32_t end) {
+    openspm_m14_dev58_region_cache_entry *entry =
+        &g_m14_dev58_region_cache[bridge_dev58_region_hash(start, end)];
+    if (entry->valid && (entry->start != start || entry->end != end))
+        ++g_m14_dev58_cache_collisions;
+    if (!entry->valid || entry->start != start || entry->end != end)
+        ++g_m14_dev58_cache_inserts;
+    entry->start = start;
+    entry->end = end;
+    entry->valid = 1u;
+}
+
+static void bridge_dev58_hh_sample(uint32_t address) {
+    uint32_t i;
+    uint32_t empty = OPENSPM_M14_DEV58_HH_SLOTS;
+    for (i = 0u; i < OPENSPM_M14_DEV58_HH_SLOTS; ++i) {
+        if (g_m14_dev58_hh[i].count != 0u &&
+            g_m14_dev58_hh[i].address == address) {
+            ++g_m14_dev58_hh[i].count;
+            return;
+        }
+        if (empty == OPENSPM_M14_DEV58_HH_SLOTS &&
+            g_m14_dev58_hh[i].count == 0u)
+            empty = i;
+    }
+    if (empty != OPENSPM_M14_DEV58_HH_SLOTS) {
+        g_m14_dev58_hh[empty].address = address;
+        g_m14_dev58_hh[empty].count = 1u;
+        return;
+    }
+    /* Misra-Gries: sampled heavy hitters survive; one-off addresses decay. */
+    for (i = 0u; i < OPENSPM_M14_DEV58_HH_SLOTS; ++i)
+        --g_m14_dev58_hh[i].count;
+}
+
+static void bridge_dev58_note_ordinary(uint32_t address) {
+    ++g_m14_dev58_ordinary_seen;
+    if ((g_m14_dev58_ordinary_seen & OPENSPM_M14_DEV58_HH_SAMPLE_MASK) == 0u)
+        bridge_dev58_hh_sample(address);
+}
+
+static void bridge_dev58_arm_v19(uint32_t pc) {
+    g_m14_dev58_v19_permit_pc = pc;
+    g_m14_dev58_v19_permit_armed = 1u;
+}
+
+static void bridge_dev58_clear_v19(void) {
+    g_m14_dev58_v19_permit_pc = 0u;
+    g_m14_dev58_v19_permit_armed = 0u;
+}
+
+static bool bridge_dev58_region_query(CPUState *cpu) {
+    uint32_t start;
+    uint32_t end;
+    int cacheable;
+    bool blocked;
+
+    if (cpu == NULL) return false;
+    start = (uint32_t)cpu->external_addr;
+    end = (uint32_t)cpu->external_value;
+    ++g_m14_dev58_queries;
+
+    /* A display-list seam is first blocked so the public dispatcher materializes
+       the exact guest PC and calls this host bridge. The seam handler then arms
+       one permit for that same partition. */
+    if (g_m14_dev58_v19_permit_armed &&
+        start == g_m14_dev58_v19_permit_pc && end > start) {
+        if (bridge_dev58_range_has_dl_seam(start, end,
+                                           g_m14_dev58_v19_permit_pc)) {
+            cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+            ++g_m14_dev58_v19_blocks;
+            return true;
+        }
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        bridge_dev58_clear_v19();
+        ++g_m14_dev58_v19_permits;
+        return false;
+    }
+
+    /* Only the display-list seam set is a control-flow blocker here. Phase
+       telemetry shares the historical v23 seam helper but remains nonblocking. */
+    if (bridge_dev58_range_has_dl_seam(start, end, 0u)) {
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        ++g_m14_dev58_v19_blocks;
+        ++g_m14_dev58_cache_bypasses;
+        return true;
+    }
+
+    cacheable = bridge_dev58_cacheable(start, end);
+    if (cacheable && bridge_dev58_cache_lookup(start, end)) {
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        ++g_m14_dev58_cache_hits;
+        return false;
+    }
+
+    if (cacheable)
+        ++g_m14_dev58_cache_misses;
+    else
+        ++g_m14_dev58_cache_bypasses;
+
+    blocked = g_m14_dev58_underlying_host_call != NULL
+                  ? g_m14_dev58_underlying_host_call(
+                        cpu, PPC_HOST_CALL_NATIVE_REGION_QUERY)
+                  : false;
+    if (!blocked && cacheable &&
+        cpu->external_rid == PPC_NATIVE_REGION_QUERY_HANDLED)
+        bridge_dev58_cache_insert(start, end);
+    return blocked;
+}
+
+static bool bridge_host_call_dev58(CPUState *cpu, u32 address) {
+    const uint32_t guest = (uint32_t)address;
+
+    if (cpu == NULL) return false;
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return bridge_dev58_region_query(cpu);
+
+    bridge_dev58_note_ordinary(guest);
+
+    /* Restore the runtime-proven v19 ordering above dev51/dev48. Returning false
+       after the pre-hook is intentional: the one-shot region permit lets the
+       real recompiled SDK body execute natively. */
+    if (guest == OPENSPM_LOCAL_V19_GX_BEGIN) {
+        ++g_m14_dev58_v19_pre_begin;
+        if (!openspm_m14_display_list_begin_before_native_v19(
+                cpu, cpu->gpr[3], cpu->gpr[4]))
+            return true;
+        bridge_dev58_arm_v19(guest);
+        return false;
+    }
+    if (guest == OPENSPM_LOCAL_V19_GX_END) {
+        ++g_m14_dev58_v19_pre_end;
+        if (!openspm_m14_display_list_end_before_native_v19(cpu))
+            return true;
+        bridge_dev58_arm_v19(guest);
+        return false;
+    }
+    if (bridge_v23_is_begin_return(guest)) {
+        ++g_m14_dev58_v19_post_begin;
+        if (!openspm_m14_display_list_begin_after_return_v19(cpu))
+            return true;
+        bridge_dev58_arm_v19(guest);
+        return false;
+    }
+    if (bridge_v23_is_end_return(guest)) {
+        ++g_m14_dev58_v19_post_end;
+        if (!openspm_m14_display_list_end_after_return_v19(cpu))
+            return true;
+        bridge_dev58_arm_v19(guest);
+        return false;
+    }
+
+    return g_m14_dev58_underlying_host_call != NULL
+               ? g_m14_dev58_underlying_host_call(cpu, address)
+               : false;
+}
+
+static void bridge_dev58_log_hh(openspm_bridge_instance *instance) {
+    uint32_t i;
+    char message[768];
+    size_t used = 0u;
+    int wrote;
+    if (instance == NULL) return;
+    wrote = snprintf(message, sizeof(message),
+                     "M14 LLVM ordinary hostcall sample total=%llu rate=1/4096 heavy=",
+                     (unsigned long long)g_m14_dev58_ordinary_seen);
+    if (wrote < 0) return;
+    used = (size_t)wrote < sizeof(message) ? (size_t)wrote : sizeof(message) - 1u;
+    for (i = 0u; i < OPENSPM_M14_DEV58_HH_SLOTS && used + 40u < sizeof(message); ++i) {
+        if (g_m14_dev58_hh[i].count == 0u) continue;
+        wrote = snprintf(message + used, sizeof(message) - used,
+                         " 0x%08X:%llu",
+                         (unsigned)g_m14_dev58_hh[i].address,
+                         (unsigned long long)g_m14_dev58_hh[i].count);
+        if (wrote <= 0) break;
+        used += (size_t)wrote;
+    }
+    bridge_v44_log(instance, message);
+}
+
+static int OPENSPM_CALL bridge_create_dev58(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev58_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev58_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev58_instance = instance;
+    g_m14_dev58_underlying_host_call = instance->cpu.host_call;
+    memset(g_m14_dev58_region_cache, 0, sizeof(g_m14_dev58_region_cache));
+    memset(g_m14_dev58_hh, 0, sizeof(g_m14_dev58_hh));
+    bridge_dev58_clear_v19();
+    g_m14_dev58_queries = 0u;
+    g_m14_dev58_cache_hits = 0u;
+    g_m14_dev58_cache_misses = 0u;
+    g_m14_dev58_cache_inserts = 0u;
+    g_m14_dev58_cache_collisions = 0u;
+    g_m14_dev58_cache_bypasses = 0u;
+    g_m14_dev58_v19_blocks = 0u;
+    g_m14_dev58_v19_permits = 0u;
+    g_m14_dev58_v19_pre_begin = 0u;
+    g_m14_dev58_v19_post_begin = 0u;
+    g_m14_dev58_v19_pre_end = 0u;
+    g_m14_dev58_v19_post_end = 0u;
+    g_m14_dev58_ordinary_seen = 0u;
+    instance->cpu.host_call = bridge_host_call_dev58;
+
+    bridge_v44_log(instance,
+        "M14 LLVM dev58 playable-production repair active: positive native-region admissions are memoized; phase/v19/relF dynamic seams remain uncached; only display-list seams are blocked; continuation-safe real GXBeginDisplayList/GXEndDisplayList CPU shadow semantics are restored above the dev48 shortcut; ordinary hostcall heavy hitters are sampled 1/4096.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev58(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[640];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM dev58 stats queries=%llu cache_hits=%llu misses=%llu inserts=%llu collisions=%llu bypasses=%llu v19_blocks=%llu permits=%llu begin=%llu/%llu end=%llu/%llu permit_pending=%u permit_pc=0x%08X.",
+            (unsigned long long)g_m14_dev58_queries,
+            (unsigned long long)g_m14_dev58_cache_hits,
+            (unsigned long long)g_m14_dev58_cache_misses,
+            (unsigned long long)g_m14_dev58_cache_inserts,
+            (unsigned long long)g_m14_dev58_cache_collisions,
+            (unsigned long long)g_m14_dev58_cache_bypasses,
+            (unsigned long long)g_m14_dev58_v19_blocks,
+            (unsigned long long)g_m14_dev58_v19_permits,
+            (unsigned long long)g_m14_dev58_v19_pre_begin,
+            (unsigned long long)g_m14_dev58_v19_post_begin,
+            (unsigned long long)g_m14_dev58_v19_pre_end,
+            (unsigned long long)g_m14_dev58_v19_post_end,
+            (unsigned)g_m14_dev58_v19_permit_armed,
+            (unsigned)g_m14_dev58_v19_permit_pc);
+        bridge_v44_log(instance, message);
+        bridge_dev58_log_hh(instance);
+        if (instance->cpu.host_call == bridge_host_call_dev58)
+            instance->cpu.host_call = g_m14_dev58_underlying_host_call;
+    }
+
+    g_m14_dev58_instance = NULL;
+    g_m14_dev58_underlying_host_call = NULL;
+    bridge_dev58_clear_v19();
+    if (g_m14_dev58_underlying_destroy != NULL)
+        g_m14_dev58_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+static int OPENSPM_CALL openspm_native_module_query_dev53_base(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev51_test_ready_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev53_underlying_create = out_api->create;
+    g_m14_dev53_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev53-llvm-home-region-admission";
+    out_api->create = bridge_create_dev53;
+    out_api->destroy = bridge_destroy_dev53;
+#endif
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev53_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev58_underlying_create = out_api->create;
+    g_m14_dev58_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev58-llvm-admission-cache-v19-restore";
+    out_api->create = bridge_create_dev58;
+    out_api->destroy = bridge_destroy_dev58;
+#endif
+    return OPENSPM_OK;
+}

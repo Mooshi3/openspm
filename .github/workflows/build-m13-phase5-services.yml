@@ -1,0 +1,224 @@
+name: Build OpenSPM M13 phase5 live services
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [m13-phase5-services-work, m13-phase5-services]
+    paths:
+      - CMakeLists.txt
+      - include/openspm/**
+      - core/**
+      - launcher/**
+      - backend/**
+      - mods/**
+      - tests/m13_*.c
+      - ci/m13_inprocess_sysdir.py
+      - ci/m13_phase5_runtime_services.py
+      - ci/m10_windows_instrument.py
+      - ci/m11b_apply.py
+      - ci/m11c_apply.py
+      - ci/m11d_idle_scheduler.py
+      - ci/m11d2_gate_busywait.py
+      - ci/recompcore-portable-rel-discovery.patch
+      - ci/recompcore-hidapi-nonfatal.patch
+      - ci/m11-openspm-ultrawide-recompcore.patch
+      - ci/RUN-M13.cmd
+      - ci/RUN-M13-M12-FALLBACK.cmd
+      - ci/RUN-M13-LEGACY-BACKEND.cmd
+      - .github/workflows/build-m13-phase5-services.yml
+
+concurrency:
+  group: m13-phase5-services-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-services:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Ensure Ninja is available
+        shell: pwsh
+        run: |
+          if (!(Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y
+            if ($LASTEXITCODE) { throw 'Ninja installation failed' }
+          }
+
+      - name: Fetch exact pinned ModernGekko and RecompCore
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init ModernGekko
+          git -C ModernGekko remote add origin https://github.com/ExpansionPak/ModernGekko.git
+          git -C ModernGekko fetch --depth=1 origin 5417826c31187d4dadf8588c7aa25bf107782936
+          git -C ModernGekko checkout --detach FETCH_HEAD
+          git -C ModernGekko submodule update --init --recursive --force
+          test "$(git -C ModernGekko rev-parse HEAD)" = 5417826c31187d4dadf8588c7aa25bf107782936
+          test "$(git -C ModernGekko/vendor/dolphin rev-parse HEAD)" = 55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac
+
+      - name: Reconstruct proven M12 runtime plus phase5 observer seam
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('ModernGekko/include/moderngekko/cpu_state.h')
+          s = p.read_text()
+          assert s.count('#define MODERNGEKKO_CPU_ABI_VERSION 4u') == 1
+          assert s.count('    int64_t cycle_budget;\n') == 1
+          s = s.replace('#define MODERNGEKKO_CPU_ABI_VERSION 4u', '#define MODERNGEKKO_CPU_ABI_VERSION 3u', 1)
+          s = s.replace('    int64_t cycle_budget;\n', '', 1)
+          p.write_text(s)
+
+          p = Path('ModernGekko/src/runtime/dolphin_runtime.cpp')
+          s = p.read_text()
+          anchor = '  Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());'
+          assert s.count(anchor) == 1
+          replacement = '''  Config::SetBase(Config::MAIN_CPU_CORE, SelectCPUCore());
+          const char* m10_mmu_env = std::getenv("M10_MMU");
+          const bool m10_mmu_enabled = !m10_mmu_env || !*m10_mmu_env || *m10_mmu_env != '0';
+          Config::SetBase(Config::MAIN_MMU, m10_mmu_enabled);
+          std::fprintf(stderr, "[M10DIAG] MMU=%s\\n", m10_mmu_enabled ? "ON" : "OFF");
+          std::fflush(stderr);'''
+          p.write_text(s.replace(anchor, replacement, 1))
+          PY
+
+          PATCH="$GITHUB_WORKSPACE/ci/recompcore-portable-rel-discovery.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$PATCH"
+          HIDAPI_PATCH="$GITHUB_WORKSPACE/ci/recompcore-hidapi-nonfatal.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$HIDAPI_PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$HIDAPI_PATCH"
+          OPENSPM_PATCH="$GITHUB_WORKSPACE/ci/m11-openspm-ultrawide-recompcore.patch"
+          git -C ModernGekko/vendor/dolphin apply --check "$OPENSPM_PATCH"
+          git -C ModernGekko/vendor/dolphin apply "$OPENSPM_PATCH"
+          python ci/m11b_apply.py
+          python ci/m11c_apply.py
+          python ci/m11d_idle_scheduler.py
+          python ci/m11d2_gate_busywait.py
+          python ci/m10_windows_instrument.py
+          python ci/m13_inprocess_sysdir.py
+          python ci/m13_phase5_runtime_services.py
+          git -C ModernGekko/vendor/dolphin diff --check
+          git -C ModernGekko diff --check
+          grep -q 'OPENSPM_SYS_DIR' ModernGekko/vendor/dolphin/Source/Core/Common/FileUtil.cpp
+          grep -q 'OPENSPM_IDLE_PC' ModernGekko/src/runtime/dolphin_runtime.cpp
+          grep -q 'RuntimeObserver' ModernGekko/include/moderngekko/runtime.hpp
+          grep -q 'observer.on_present' ModernGekko/src/runtime/dolphin_runtime.cpp
+          grep -q 'GetPerformanceSnapshot' ModernGekko/src/runtime/dolphin_runtime.cpp
+
+      - name: Cache compiled runtime objects
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: openspm-m13-phase5-services-5417826c-55c7b023
+          variant: sccache
+          max-size: 2G
+
+      - name: Configure OpenSPM plus phase5 in-process backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mg = (Resolve-Path ModernGekko).Path
+          cmake -S . -B build-m13p5 -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DBUILD_TESTING=OFF `
+            -DOPENSPM_BUILD_INPROCESS_BACKEND=ON `
+            "-DOPENSPM_MODERNGEKKO_SOURCE_DIR=$mg" `
+            -DMODERNGEKKO_ENABLE_DOLPHIN_RUNTIME=ON `
+            -DMODERNGEKKO_ENABLE_DOLPHIN_TESTS=OFF `
+            -DMODERNGEKKO_ENABLE_DISC_TOOL=OFF
+          if ($LASTEXITCODE) { throw 'M13 phase5 configure failed' }
+
+      - name: Build and test live service ABI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-m13p5 -j2
+          if ($LASTEXITCODE) { throw 'M13 phase5 build failed' }
+          ctest --test-dir build-m13p5 --output-on-failure
+          if ($LASTEXITCODE) { throw 'M13 phase5 tests failed' }
+          $launcher = Get-ChildItem build-m13p5 -Recurse -Filter OpenSPM.exe | Select-Object -First 1
+          & $launcher.FullName --version
+          if ($LASTEXITCODE) { throw 'M13 phase5 launcher smoke test failed' }
+
+      - name: Download exact proven M12 Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spm-m12-native-display-windows-runtime
+          path: m12
+          github-token: ${{ github.token }}
+          run-id: 34176078842
+
+      - name: Verify M12 identity and package phase5 candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedExe = 'c953b63a436b1259797ca07a907d0b905b2459c339796e5e308354358f6722ba'
+          $expectedDll = 'f50dea152b0fff11c6ffdc30555ef33b8cb92828363a863f45a14d0f4a6ec4ce'
+          $m12Exe = Get-ChildItem m12 -Recurse -Filter moderngekko-run.exe | Select-Object -First 1
+          $m12Dll = Get-ChildItem m12 -Recurse -Filter gR8PE01_recomp.dll | Select-Object -First 1
+          if (!$m12Exe -or !$m12Dll) { throw 'M12 payload missing required binary' }
+          if ((Get-FileHash $m12Exe.FullName -Algorithm SHA256).Hash.ToLower() -ne $expectedExe) { throw 'M12 EXE identity changed' }
+          if ((Get-FileHash $m12Dll.FullName -Algorithm SHA256).Hash.ToLower() -ne $expectedDll) { throw 'M12 game DLL identity changed' }
+
+          $launcher = Get-ChildItem build-m13p5 -Recurse -Filter OpenSPM.exe | Select-Object -First 1
+          $legacyBackend = Get-ChildItem build-m13p5 -Recurse -Filter moderngekko_backend.dll | Where-Object { $_.Name -eq 'moderngekko_backend.dll' } | Select-Object -First 1
+          $inprocBackend = Get-ChildItem build-m13p5 -Recurse -Filter moderngekko_backend_inprocess.dll | Select-Object -First 1
+          $debugMod = Get-ChildItem build-m13p5 -Recurse -Filter openspm_debug.dll | Select-Object -First 1
+          if (!$launcher -or !$legacyBackend -or !$inprocBackend -or !$debugMod) { throw 'Phase5 component missing' }
+
+          New-Item -ItemType Directory -Force dist/runtime/legacy,dist/mods,dist/patches,dist/profiles,dist/sdk/include | Out-Null
+          Copy-Item $launcher.FullName dist/OpenSPM.exe
+          Copy-Item $inprocBackend.FullName dist/runtime/moderngekko_backend.dll
+          Copy-Item $legacyBackend.FullName dist/runtime/moderngekko_legacy_backend.dll
+          Copy-Item $debugMod.FullName dist/mods/openspm_debug.dll
+          Copy-Item $m12Exe.FullName dist/runtime/legacy/moderngekko-run.exe
+          Copy-Item $m12Dll.FullName dist/runtime/legacy/gR8PE01_recomp.dll
+          $sys = Get-ChildItem m12 -Directory -Recurse -Filter Sys | Select-Object -First 1
+          if (!$sys) { throw 'M12 Sys directory missing' }
+          Copy-Item $sys.FullName dist/runtime/legacy/Sys -Recurse
+          Copy-Item ci/RUN-M13.cmd dist/RUN-OPENSPM.cmd
+          Copy-Item ci/RUN-M13-LEGACY-BACKEND.cmd dist/RUN-LEGACY-BACKEND.cmd
+          Copy-Item ci/RUN-M13-M12-FALLBACK.cmd dist/RUN-DIRECT-M12-FALLBACK.cmd
+          Copy-Item include/openspm dist/sdk/include/openspm -Recurse
+          'Phase5 candidate: live backend-neutral runtime service, lifecycle events, present events, and performance snapshots are active. Guest simulation ticks and game-specific services are intentionally not claimed yet.' | Set-Content dist/README-M13-PHASE5.txt
+          @"
+          milestone=M13-platform-phase5-live-services-candidate
+          source_commit=${{ github.sha }}
+          openspm_abi=1
+          runtime_service=openspm.runtime-v1
+          runtime_events=core-running,present-end,core-stopped
+          simulation_tick=not-yet-exposed
+          game_services=not-yet-exposed
+          default_backend=runtime/moderngekko_backend.dll
+          legacy_backend=runtime/moderngekko_legacy_backend.dll
+          direct_m12_fallback=runtime/legacy/moderngekko-run.exe
+          moderngekko_commit=5417826c31187d4dadf8588c7aa25bf107782936
+          recompcore_commit=55c7b023fa0f4eba1cf3fdbbb25b1c5ec468d5ac
+          m12_source_run=34176078842
+          m12_exe_sha256=$expectedExe
+          m12_game_dll_sha256=$expectedDll
+          "@ | Set-Content dist/BUILD-PROVENANCE.txt
+          Get-ChildItem dist -File -Recurse | Sort-Object FullName | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $relative = $_.FullName.Substring((Resolve-Path dist).Path.Length + 1).Replace('\','/')
+            "$h  $relative"
+          } | Set-Content dist/SHA256SUMS.txt
+
+      - name: Upload M13 phase5 Windows candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: openspm-m13-phase5-services-windows
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

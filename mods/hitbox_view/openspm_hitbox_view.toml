@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_hitbox_view.dll in the mods folder.
+id = "openspm.sample.hitbox_view"
+name = "Hitbox View"
+version = "1.0"
+author = "OpenSPM samples"
+description = "Debug: F9 outlines hitboxes (green Mario, red enemies, yellow others)."
+requires = ["openspm.guest_memory>=1", "openspm.input>=1", "openspm.overlay>=2"]

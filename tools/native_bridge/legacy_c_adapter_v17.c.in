@@ -1,0 +1,246 @@
+/*
+ * M14 local-module bridge v17 / inline LLVM Broadway gather state.
+ *
+ * v16 proved the safe architectural seam for WPAR stores: a successful store
+ * does not need CPUState materialization. v17 removes even the per-store C call
+ * on the common path. The private OpenSPM-patched DolRecomp emitter appends
+ * bytes directly into dev16's exact 32-byte gather through the pointer symbols
+ * below and calls back into C only when a line becomes full (or for the rare
+ * overflow shape handled by v16).
+ *
+ * These symbols are module-private implementation glue despite external linker
+ * visibility: they are referenced only by player-local LLVM objects in the same
+ * openspm_local_native DLL. The actual storage remains dev16's proven static
+ * state, so semantic-boundary partial flushes, error handling, accounting and
+ * teardown continue to observe the exact same bytes/size/pending-store count.
+ *
+ * The LLVM candidate also wraps run() only to capture the first unhandled guest
+ * exception after the existing bridge has classified it. This is diagnostic
+ * only: it records SRR0/SRR1, the program cause, raw guest instruction and
+ * architectural registers without mutating guest state or exception policy.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev24_llvm_base
+#include "legacy_c_adapter_v16.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+/* LLVM objects load these pointers with cheap RIP-relative data references.
+ * They point at dev16's existing gather state; no second FIFO or byte buffer is
+ * introduced. */
+uint8_t *openspm_m14_llvm_wg_bytes_ptr = g_m14_v8_wg_bytes;
+uint32_t *openspm_m14_llvm_wg_size_ptr = &g_m14_v8_wg_size;
+uint32_t *openspm_m14_llvm_wg_pending_ptr = &g_m14_v8_wg_pending_stores;
+uint32_t *openspm_m14_llvm_wg_have_fifo_ptr = &g_m14_v8_have_gx_fifo;
+
+static openspm_native_create_fn g_m14_v25_underlying_create;
+static openspm_native_run_fn g_m14_v25_underlying_run;
+static openspm_native_destroy_fn g_m14_v25_underlying_destroy;
+static uint64_t g_m14_v25_inline_flushes;
+static uint64_t g_m14_v25_inline_stores;
+static uint64_t g_m14_v25_inline_failures;
+static uint32_t g_m14_v25_reported;
+static uint32_t g_m14_v25_exception_reported;
+
+static void bridge_v25_host_log(
+    openspm_bridge_instance *instance,
+    uint32_t level,
+    const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL)
+        return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL)
+        return;
+    host->log(host->context, level, message);
+}
+
+static void bridge_v25_log_once(openspm_bridge_instance *instance) {
+    if (g_m14_v25_reported)
+        return;
+    bridge_v25_host_log(
+        instance,
+        OPENSPM_LOG_INFO,
+        "M14 LLVM inline WPAR gather active: common Broadway GX stores append directly in native LLVM SSA and call C only at completed 32-byte lines; dev16 buffer/order/flush semantics preserved.");
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL && instance->runtime->host->log != NULL)
+        g_m14_v25_reported = 1u;
+}
+
+static void bridge_v25_log_exception(
+    openspm_bridge_instance *instance,
+    const openspm_native_exit *out_exit) {
+    CPUState *cpu;
+    uint32_t fault_pc;
+    uint32_t raw = 0u;
+    uint32_t raw_valid = 0u;
+    char message[768];
+
+    if (g_m14_v25_exception_reported || instance == NULL || out_exit == NULL)
+        return;
+    if (out_exit->reason != OPENSPM_NATIVE_EXIT_SAFEPOINT ||
+        out_exit->detail == 0u)
+        return;
+
+    cpu = &instance->cpu;
+    fault_pc = (uint32_t)cpu->srr0;
+    if (bridge_m14_context_address_valid(cpu, fault_pc, 4u)) {
+        raw = mem_read32(cpu, fault_pc);
+        raw_valid = 1u;
+    }
+
+    (void)snprintf(
+        message,
+        sizeof(message),
+        "M14 LLVM first guest exception: exit_detail=0x%08X exception=0x%08X vector_pc=0x%08X srr0=0x%08X srr1=0x%08X program=0x%08X fp=%u illegal=%u privileged=%u trap=%u raw_valid=%u raw=0x%08X msr=0x%08X lr=0x%08X ctr=0x%08X cr=0x%08X xer=0x%08X cycles=%llu.",
+        out_exit->detail,
+        (uint32_t)cpu->exception,
+        (uint32_t)cpu->pc,
+        (uint32_t)cpu->srr0,
+        (uint32_t)cpu->srr1,
+        (uint32_t)cpu->program_exception,
+        (cpu->program_exception & PPC_PROGRAM_FP) != 0u,
+        (cpu->program_exception & PPC_PROGRAM_ILLEGAL) != 0u,
+        (cpu->program_exception & PPC_PROGRAM_PRIV) != 0u,
+        (cpu->program_exception & PPC_PROGRAM_TRAP) != 0u,
+        raw_valid,
+        raw,
+        (uint32_t)cpu->msr,
+        (uint32_t)cpu->lr,
+        (uint32_t)cpu->ctr,
+        (uint32_t)cpu->cr,
+        (uint32_t)cpu->xer,
+        (unsigned long long)out_exit->guest_cycles);
+    bridge_v25_host_log(instance, OPENSPM_LOG_INFO, message);
+
+    (void)snprintf(
+        message,
+        sizeof(message),
+        "M14 LLVM first guest exception GPR00-15: r0=%08X r1=%08X r2=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r12=%08X r13=%08X r14=%08X r15=%08X.",
+        (uint32_t)cpu->gpr[0], (uint32_t)cpu->gpr[1],
+        (uint32_t)cpu->gpr[2], (uint32_t)cpu->gpr[3],
+        (uint32_t)cpu->gpr[4], (uint32_t)cpu->gpr[5],
+        (uint32_t)cpu->gpr[6], (uint32_t)cpu->gpr[7],
+        (uint32_t)cpu->gpr[8], (uint32_t)cpu->gpr[9],
+        (uint32_t)cpu->gpr[10], (uint32_t)cpu->gpr[11],
+        (uint32_t)cpu->gpr[12], (uint32_t)cpu->gpr[13],
+        (uint32_t)cpu->gpr[14], (uint32_t)cpu->gpr[15]);
+    bridge_v25_host_log(instance, OPENSPM_LOG_INFO, message);
+
+    (void)snprintf(
+        message,
+        sizeof(message),
+        "M14 LLVM first guest exception GPR16-31: r16=%08X r17=%08X r18=%08X r19=%08X r20=%08X r21=%08X r22=%08X r23=%08X r24=%08X r25=%08X r26=%08X r27=%08X r28=%08X r29=%08X r30=%08X r31=%08X.",
+        (uint32_t)cpu->gpr[16], (uint32_t)cpu->gpr[17],
+        (uint32_t)cpu->gpr[18], (uint32_t)cpu->gpr[19],
+        (uint32_t)cpu->gpr[20], (uint32_t)cpu->gpr[21],
+        (uint32_t)cpu->gpr[22], (uint32_t)cpu->gpr[23],
+        (uint32_t)cpu->gpr[24], (uint32_t)cpu->gpr[25],
+        (uint32_t)cpu->gpr[26], (uint32_t)cpu->gpr[27],
+        (uint32_t)cpu->gpr[28], (uint32_t)cpu->gpr[29],
+        (uint32_t)cpu->gpr[30], (uint32_t)cpu->gpr[31]);
+    bridge_v25_host_log(instance, OPENSPM_LOG_INFO, message);
+
+    g_m14_v25_exception_reported = 1u;
+}
+
+/* Called only after generated LLVM has appended a store that made the proven
+ * dev16 gather exactly 32 bytes. No guest register materialization is required
+ * on success. The pending-store count is captured before bridge_flush_wg_v8()
+ * clears it so the log can quantify how much per-store callback traffic was
+ * avoided. */
+int openspm_m14_flush_wg_llvm(CPUState *cpu, u32 source_pc) {
+    openspm_bridge_instance *instance;
+    uint32_t saved_pc;
+    uint32_t pending;
+    uint32_t fallback_before;
+    int result;
+
+    if (cpu == NULL) return -1;
+    instance = bridge_from_cpu(cpu);
+    bridge_v25_log_once(instance);
+    saved_pc = (uint32_t)cpu->pc;
+    pending = g_m14_v8_wg_pending_stores;
+    fallback_before = instance != NULL ? instance->fallback_requested : 0u;
+    cpu->pc = source_pc;
+    result = bridge_flush_wg_v8(instance, source_pc);
+    if (result != OPENSPM_OK ||
+        (instance != NULL && !fallback_before && instance->fallback_requested)) {
+        ++g_m14_v25_inline_failures;
+        return -1;
+    }
+    cpu->pc = saved_pc;
+    ++g_m14_v25_inline_flushes;
+    g_m14_v25_inline_stores += pending;
+    return 1;
+}
+
+static int OPENSPM_CALL bridge_create_v25(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    if (g_m14_v25_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    g_m14_v25_inline_flushes = 0u;
+    g_m14_v25_inline_stores = 0u;
+    g_m14_v25_inline_failures = 0u;
+    g_m14_v25_reported = 0u;
+    g_m14_v25_exception_reported = 0u;
+    return g_m14_v25_underlying_create(runtime, launch, out_instance);
+}
+
+static int OPENSPM_CALL bridge_run_v25(
+    void *opaque,
+    uint64_t soft_cycle_budget,
+    openspm_native_exit *out_exit) {
+    int result;
+    if (g_m14_v25_underlying_run == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v25_underlying_run(opaque, soft_cycle_budget, out_exit);
+    if (result == OPENSPM_OK)
+        bridge_v25_log_exception((openspm_bridge_instance *)opaque, out_exit);
+    return result;
+}
+
+static void OPENSPM_CALL bridge_destroy_v25(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL && instance->runtime->host->log != NULL &&
+        g_m14_v25_inline_flushes != 0u) {
+        char message[384];
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "M14 LLVM inline WPAR stats completed_lines=%llu inline_stores=%llu failures=%llu; inline_stores avoided per-store C/MMIO materialization callbacks.",
+            (unsigned long long)g_m14_v25_inline_flushes,
+            (unsigned long long)g_m14_v25_inline_stores,
+            (unsigned long long)g_m14_v25_inline_failures);
+        bridge_v25_host_log(instance, OPENSPM_LOG_INFO, message);
+    }
+    if (g_m14_v25_underlying_destroy != NULL)
+        g_m14_v25_underlying_destroy(opaque);
+}
+#endif
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev24_llvm_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v25_underlying_create = out_api->create;
+    g_m14_v25_underlying_run = out_api->run;
+    g_m14_v25_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev26-llvm-first-exception-diag";
+    out_api->create = bridge_create_v25;
+    out_api->run = bridge_run_v25;
+    out_api->destroy = bridge_destroy_v25;
+#endif
+    return OPENSPM_OK;
+}

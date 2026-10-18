@@ -1,0 +1,45 @@
+diff --git a/Source/Core/Core/HW/WiimoteReal/IOhidapi.cpp b/Source/Core/Core/HW/WiimoteReal/IOhidapi.cpp
+index 36c9a23..a961d33 100644
+--- a/Source/Core/Core/HW/WiimoteReal/IOhidapi.cpp
++++ b/Source/Core/Core/HW/WiimoteReal/IOhidapi.cpp
+@@ -93,19 +93,23 @@ WiimoteScannerHidapi::WiimoteScannerHidapi()
+   // https://man.openbsd.org/usbhid.3
+ #define hid_init hidapi_hid_init
+ #endif
+-  int ret = hid_init();
+-  ASSERT_MSG(WIIMOTE, ret == 0, "Couldn't initialise hidapi.");
++  const int ret = hid_init();
++  m_initialized = ret == 0;
++  if (!m_initialized)
++    ERROR_LOG_FMT(WIIMOTE, "Couldn't initialise hidapi; real Wii Remote scanning is disabled.");
+ }
+ 
+ WiimoteScannerHidapi::~WiimoteScannerHidapi()
+ {
+-  if (hid_exit() == -1)
++  if (m_initialized && hid_exit() == -1)
+     ERROR_LOG_FMT(WIIMOTE, "Failed to clean up hidapi.");
+ }
+ 
+ auto WiimoteScannerHidapi::FindAttachedWiimotes() -> FindResults
+ {
+   FindResults results;
++  if (!m_initialized)
++    return results;
+ 
+   hid_device_info* list = hid_enumerate(0x0, 0x0);  // FYI: 0 for all VID/PID.
+   for (hid_device_info* device = list; device != nullptr; device = device->next)
+diff --git a/Source/Core/Core/HW/WiimoteReal/IOhidapi.h b/Source/Core/Core/HW/WiimoteReal/IOhidapi.h
+index f4fe46a..03fa41c 100644
+--- a/Source/Core/Core/HW/WiimoteReal/IOhidapi.h
++++ b/Source/Core/Core/HW/WiimoteReal/IOhidapi.h
+@@ -40,6 +40,9 @@ public:
+ 
+   void Update() override {}                // not needed for hidapi
+   void RequestStopSearching() override {}  // not needed for hidapi
++
++private:
++  bool m_initialized = false;
+ };
+ }  // namespace WiimoteReal
+ 

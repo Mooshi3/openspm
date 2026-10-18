@@ -1,0 +1,3 @@
+M11D runtime lab build trigger.
+Batched runtime-only experiments: analyzer busy-wait detection, known R8PE01 scheduler idle PC, idle counters, cache-affinity A/B, Jit64 control, savestate benchmark launcher.
+Reuses the exact green M11C game DLL; no generated-code rebuild.

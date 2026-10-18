@@ -1,0 +1,290 @@
+/*
+ * M14 local-module bridge v27 / LLVM NAND hosted-completion probe.
+ *
+ * dev36 proved that generic hosted direct-call seams are live, but the first
+ * run still remained forever in seq_logo stage 1 with Revolution OS correctly
+ * idle in SelectThread. Do not mutate NAND/game state here. Instead instrument
+ * the exact chain that should release the wait:
+ *
+ *   LLVM native-region query -> dev36 callsite redirect -> detail-12 v7 path
+ *   -> openspm.m14.hostcall.r8pe01 NANDCheckAsync -> returned guest callback
+ *   -> v7 event execution -> next native run slice.
+ *
+ * This overlay wraps dev36's host_call and the existing M14 hostcall service
+ * function pointer. The underlying v7 callback executor remains the sole owner
+ * of guest completion execution. Logging is bounded and NAND-specific apart
+ * from the first few direct-seam observations.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev36_hostcall_base
+#include "legacy_c_adapter_v26.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_NAND_CHECK_ASYNC UINT32_C(0x8029A500)
+#define OPENSPM_M14_V37_LOG_LIMIT UINT32_C(8)
+
+static openspm_native_create_fn g_m14_v37_underlying_create;
+static openspm_native_run_fn g_m14_v37_underlying_run;
+static openspm_native_destroy_fn g_m14_v37_underlying_destroy;
+static PPCHostCall g_m14_v37_underlying_host_call;
+static openspm_m14_hostcall_handle_fn g_m14_v37_underlying_service_handle;
+static openspm_bridge_instance *g_m14_v37_instance;
+static uint32_t g_m14_v37_redirect_logs;
+static uint32_t g_m14_v37_nand_query_logs;
+static uint32_t g_m14_v37_nand_redirects;
+static uint32_t g_m14_v37_nand_service_calls;
+static uint32_t g_m14_v37_nand_service_completed;
+static uint32_t g_m14_v37_nand_postrun_logged;
+static uint32_t g_m14_v37_last_event_target;
+static uint32_t g_m14_v37_last_event_argc;
+
+static void bridge_v37_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static const openspm_local_llvm_hostcall_seam *
+bridge_v37_nand_seam_in_range(uint32_t start, uint32_t end) {
+    uint32_t i;
+    for (i = 0u; i < OPENSPM_LOCAL_LLVM_HOSTCALL_SEAM_COUNT; ++i) {
+        const openspm_local_llvm_hostcall_seam *seam =
+            &OPENSPM_LOCAL_LLVM_HOSTCALL_SEAMS[i];
+        if (seam->target == OPENSPM_M14_NAND_CHECK_ASYNC &&
+            seam->call_pc >= start && seam->call_pc < end)
+            return seam;
+    }
+    return NULL;
+}
+
+static bool bridge_host_call_v37(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance;
+    const openspm_local_llvm_hostcall_seam *seam;
+    bool handled;
+
+    if (cpu == NULL || g_m14_v37_underlying_host_call == NULL)
+        return false;
+    instance = bridge_from_cpu(cpu);
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        const uint32_t entry_pc = (uint32_t)cpu->pc;
+        const openspm_local_llvm_hostcall_seam *nand =
+            bridge_v37_nand_seam_in_range(start, end);
+        handled = g_m14_v37_underlying_host_call(cpu, address);
+        if (nand != NULL && g_m14_v37_nand_query_logs < OPENSPM_M14_V37_LOG_LIMIT) {
+            char message[320];
+            (void)snprintf(
+                message, sizeof(message),
+                "M14 LLVM NAND region query #%u pc=0x%08X range=[0x%08X,0x%08X) seam=0x%08X exact_entry=%s blocked=%s rid=0x%02X.",
+                (unsigned)(g_m14_v37_nand_query_logs + 1u),
+                (unsigned)entry_pc, (unsigned)start, (unsigned)end,
+                (unsigned)nand->call_pc,
+                entry_pc == nand->call_pc ? "yes" : "no",
+                handled ? "yes" : "no", (unsigned)cpu->external_rid);
+            bridge_v37_log(instance, message);
+            ++g_m14_v37_nand_query_logs;
+        }
+        return handled;
+    }
+
+    seam = bridge_v36_find_seam((uint32_t)address);
+    handled = g_m14_v37_underlying_host_call(cpu, address);
+    if (seam != NULL && g_m14_v37_redirect_logs < OPENSPM_M14_V37_LOG_LIMIT) {
+        char message[320];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM hosted seam observed #%u call=0x%08X target=0x%08X return=0x%08X handled=%s pc=0x%08X lr=0x%08X fallback=%u/detail=%u/address=0x%08X.",
+            (unsigned)(g_m14_v37_redirect_logs + 1u),
+            (unsigned)seam->call_pc, (unsigned)seam->target,
+            (unsigned)seam->return_pc, handled ? "yes" : "no",
+            (unsigned)cpu->pc, (unsigned)cpu->lr,
+            instance != NULL ? (unsigned)instance->fallback_requested : 0u,
+            instance != NULL ? (unsigned)instance->fallback_detail : 0u,
+            instance != NULL ? (unsigned)instance->fallback_address : 0u);
+        bridge_v37_log(instance, message);
+        ++g_m14_v37_redirect_logs;
+    }
+    if (seam != NULL && seam->target == OPENSPM_M14_NAND_CHECK_ASYNC) {
+        char message[320];
+        ++g_m14_v37_nand_redirects;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM NAND seam redirect #%u call=0x%08X -> target=0x%08X return=0x%08X handled=%s fallback=%u/detail=%u/address=0x%08X.",
+            (unsigned)g_m14_v37_nand_redirects,
+            (unsigned)seam->call_pc, (unsigned)seam->target,
+            (unsigned)seam->return_pc, handled ? "yes" : "no",
+            instance != NULL ? (unsigned)instance->fallback_requested : 0u,
+            instance != NULL ? (unsigned)instance->fallback_detail : 0u,
+            instance != NULL ? (unsigned)instance->fallback_address : 0u);
+        bridge_v37_log(instance, message);
+    }
+    return handled;
+}
+
+static int OPENSPM_CALL bridge_v37_hostcall_service(
+    void *context,
+    uint32_t target_address,
+    openspm_m14_hostcall_state *state) {
+    int result;
+    if (g_m14_v37_underlying_service_handle == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    if (target_address == OPENSPM_M14_NAND_CHECK_ASYNC && state != NULL) {
+        char message[384];
+        ++g_m14_v37_nand_service_calls;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM NAND host service enter #%u blocks=0x%08X inodes=0x%08X answer=0x%08X callback=0x%08X command=0x%08X pc=0x%08X lr=0x%08X.",
+            (unsigned)g_m14_v37_nand_service_calls,
+            (unsigned)state->gpr[3], (unsigned)state->gpr[4],
+            (unsigned)state->gpr[5], (unsigned)state->gpr[6],
+            (unsigned)state->gpr[7], (unsigned)state->pc,
+            (unsigned)state->lr);
+        bridge_v37_log(g_m14_v37_instance, message);
+    }
+
+    result = g_m14_v37_underlying_service_handle(context, target_address, state);
+
+    if (target_address == OPENSPM_M14_NAND_CHECK_ASYNC && state != NULL) {
+        char message[448];
+        g_m14_v37_last_event_target = state->event_target;
+        g_m14_v37_last_event_argc = state->event_argc;
+        if (result == OPENSPM_OK)
+            ++g_m14_v37_nand_service_completed;
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM NAND host service exit result=%d r3=0x%08X event=0x%08X argc=%u args=[0x%08X,0x%08X,0x%08X].",
+            result, (unsigned)state->gpr[3], (unsigned)state->event_target,
+            (unsigned)state->event_argc,
+            (unsigned)state->event_args[0], (unsigned)state->event_args[1],
+            (unsigned)state->event_args[2]);
+        bridge_v37_log(g_m14_v37_instance, message);
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_run_v37(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    int result;
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (g_m14_v37_underlying_run == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v37_underlying_run(opaque, soft_cycle_budget, out_exit);
+
+    /* v7 runs state.event_target synchronously before its run() returns. Thus a
+       successful underlying return after the service exposed a nonzero event
+       proves that the callback executor was traversed (or it would have
+       returned the event error instead). Log only once per observed service. */
+    if (g_m14_v37_nand_service_completed > g_m14_v37_nand_postrun_logged) {
+        char message[384];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM NAND post-service run result=%d service_completed=%u event=0x%08X argc=%u cpu_pc=0x%08X fallback=%u/detail=%u/address=0x%08X exit=%u/detail=%u/source=0x%08llX.",
+            result, (unsigned)g_m14_v37_nand_service_completed,
+            (unsigned)g_m14_v37_last_event_target,
+            (unsigned)g_m14_v37_last_event_argc,
+            instance != NULL ? (unsigned)instance->cpu.pc : 0u,
+            instance != NULL ? (unsigned)instance->fallback_requested : 0u,
+            instance != NULL ? (unsigned)instance->fallback_detail : 0u,
+            instance != NULL ? (unsigned)instance->fallback_address : 0u,
+            out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+            out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+            (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+        bridge_v37_log(instance, message);
+        g_m14_v37_nand_postrun_logged = g_m14_v37_nand_service_completed;
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v37(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v37_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v37_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v37_instance = instance;
+    g_m14_v37_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_v37;
+
+    g_m14_v37_underlying_service_handle = NULL;
+    if (g_m14_have_hostcall && g_m14_hostcall.handle != NULL) {
+        g_m14_v37_underlying_service_handle = g_m14_hostcall.handle;
+        g_m14_hostcall.handle = bridge_v37_hostcall_service;
+    }
+    g_m14_v37_redirect_logs = 0u;
+    g_m14_v37_nand_query_logs = 0u;
+    g_m14_v37_nand_redirects = 0u;
+    g_m14_v37_nand_service_calls = 0u;
+    g_m14_v37_nand_service_completed = 0u;
+    g_m14_v37_nand_postrun_logged = 0u;
+    g_m14_v37_last_event_target = 0u;
+    g_m14_v37_last_event_argc = 0u;
+
+    bridge_v37_log(instance,
+        "M14 LLVM NAND completion probe active: region/callsite redirect, host-service output and synchronous v7 callback traversal are bounded-traced; game state is not modified.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v37(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[320];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM NAND completion stats query_logs=%u redirects=%u service_calls=%u service_completed=%u event=0x%08X.",
+            (unsigned)g_m14_v37_nand_query_logs,
+            (unsigned)g_m14_v37_nand_redirects,
+            (unsigned)g_m14_v37_nand_service_calls,
+            (unsigned)g_m14_v37_nand_service_completed,
+            (unsigned)g_m14_v37_last_event_target);
+        bridge_v37_log(instance, message);
+        instance->cpu.host_call = g_m14_v37_underlying_host_call;
+    }
+    if (g_m14_v37_underlying_service_handle != NULL &&
+        g_m14_hostcall.handle == bridge_v37_hostcall_service)
+        g_m14_hostcall.handle = g_m14_v37_underlying_service_handle;
+    if (g_m14_v37_underlying_destroy != NULL)
+        g_m14_v37_underlying_destroy(opaque);
+    g_m14_v37_instance = NULL;
+    g_m14_v37_underlying_host_call = NULL;
+    g_m14_v37_underlying_service_handle = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev36_hostcall_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v37_underlying_create = out_api->create;
+    g_m14_v37_underlying_run = out_api->run;
+    g_m14_v37_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev37-llvm-nand-completion-probe";
+    out_api->create = bridge_create_v37;
+    out_api->run = bridge_run_v37;
+    out_api->destroy = bridge_destroy_v37;
+#endif
+    return OPENSPM_OK;
+}

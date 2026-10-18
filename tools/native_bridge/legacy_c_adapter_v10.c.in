@@ -1,0 +1,159 @@
+/*
+ * M14 generated-C bridge v10 / local-module bridge v18.
+ *
+ * The runtime-proven local-module bridge v17 remains underneath. This wrapper
+ * narrows one over-hosted GX boundary identified by Astra's gameplay audit:
+ * R8PE01 GXBeginDisplayList/GXEndDisplayList must execute their original
+ * CPU-side SDK logic so pre-list dirty-state flushing, GX shadow save/restore,
+ * FIFO switching, and inDispList bookkeeping remain authoritative.
+ *
+ * The player-local direct-call postprocessor therefore lets those two SDK
+ * functions execute natively, then calls the hooks below only for the physical
+ * bounded-RAM recorder seam. Begin starts the neutral recorder after native
+ * GXBeginDisplayList has flushed dirty state to the live FIFO, optionally saved
+ * GXData, and switched its CPU FIFO. Native GXEndDisplayList then executes while
+ * recording remains active, so its GXFlush bytes are retained before it restores
+ * the old FIFO/context. Only after native End returns do we close the neutral
+ * recorder and replace its count with the recorder's aligned/overflow result.
+ * Public OpenSPM still contains no Nintendo game code or assets.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev17_internal
+#include "legacy_c_adapter_v9.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_M14_NATIVE_GX_BEGIN_DL UINT32_C(0x80291DC8)
+#define OPENSPM_M14_NATIVE_GX_END_DL   UINT32_C(0x80291E78)
+
+static uint32_t g_m14_v10_dl_begin_reported;
+static uint32_t g_m14_v10_dl_end_reported;
+
+static void bridge_log_native_dl_v10(openspm_bridge_instance *instance,
+                                     const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_native_dl_physical_call_v10(
+    CPUState *cpu,
+    uint32_t target,
+    uint32_t arg3,
+    uint32_t arg4,
+    uint32_t *out_r3) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    openspm_m14_hostcall_state state;
+    int result;
+
+    if (cpu == NULL || instance == NULL || !g_m14_have_hostcall ||
+        g_m14_hostcall.handle == NULL) {
+        bridge_request_fallback(instance, target, 31u);
+        if (cpu != NULL) cpu->pc = target;
+        return OPENSPM_ERROR_UNSUPPORTED;
+    }
+
+    /* Establish a strict write-gather boundary before changing the neutral
+       recorder state. For Begin this submits any partial bytes from the SDK's
+       pre-list dirty flush to the live renderer. For End the SDK has already
+       flushed the list write-gather pipe before this post-call hook runs. */
+    if (g_m14_v8_have_gx_fifo) {
+        result = bridge_flush_wg_v8(instance, cpu->pc);
+        if (result != OPENSPM_OK) {
+            bridge_request_fallback(instance, target, 32u);
+            cpu->pc = target;
+            return result;
+        }
+    }
+
+    bridge_cpu_to_m14_hostcall_state(cpu, &state);
+    state.gpr[3] = arg3;
+    state.gpr[4] = arg4;
+    /* The backend's legacy compatibility handler returns by assigning pc=lr.
+       This hook is already executing after the native SDK call returned, so make
+       that synthetic return target the current continuation and never copy the
+       handler's pc/lr back into the guest CPU. */
+    state.lr = cpu->pc;
+    state.pc = target;
+    state.event_target = 0u;
+    state.event_argc = 0u;
+
+    result = g_m14_hostcall.handle(g_m14_hostcall.context, target, &state);
+    if (result != OPENSPM_OK || state.event_target != 0u || state.event_argc != 0u) {
+        bridge_request_fallback(instance, target, 33u);
+        cpu->pc = target;
+        return result != OPENSPM_OK ? result : OPENSPM_ERROR_RUNTIME;
+    }
+    if (out_r3 != NULL) *out_r3 = state.gpr[3];
+    return OPENSPM_OK;
+}
+
+/* External linkage is intentional: player-local generated chunk translation
+ * units get tiny declarations inserted at direct callsites by
+ * display_list_native_calls.py. These are module-private implementation symbols,
+ * not OpenSPM public ABI exports. */
+void openspm_m14_display_list_begin_after_native(CPUState *cpu,
+                                                  u32 buffer,
+                                                  u32 capacity) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    if (bridge_native_dl_physical_call_v10(
+            cpu, OPENSPM_M14_NATIVE_GX_BEGIN_DL,
+            (uint32_t)buffer, (uint32_t)capacity, NULL) != OPENSPM_OK) {
+        return;
+    }
+    if (!g_m14_v10_dl_begin_reported) {
+        bridge_log_native_dl_v10(
+            instance,
+            "M14 native GXBeginDisplayList SDK semantics active; pre-list dirty flush/context save stay native and neutral recording starts after Begin returns.");
+        g_m14_v10_dl_begin_reported = 1u;
+    }
+}
+
+void openspm_m14_display_list_end_after_native(CPUState *cpu) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t recorded_size = 0u;
+    if (bridge_native_dl_physical_call_v10(
+            cpu, OPENSPM_M14_NATIVE_GX_END_DL,
+            0u, 0u, &recorded_size) != OPENSPM_OK) {
+        return;
+    }
+
+    /* PI FIFO write-pointer emulation is intentionally not required for this
+       transitional proof. Native GXEndDisplayList has already run GXFlush and
+       restored the old CPU FIFO/GX shadow context; the neutral recorder owns the
+       authoritative payload bytes and reproduces the same SDK-visible 32-byte
+       alignment/overflow convention used by the prior runtime-proven hosted
+       physical recorder. */
+    cpu->gpr[3] = recorded_size;
+    if (!g_m14_v10_dl_end_reported) {
+        bridge_log_native_dl_v10(
+            instance,
+            "M14 native GXEndDisplayList FIFO/context restore active; neutral recorder closes after recompiled End and supplies aligned size.");
+        g_m14_v10_dl_end_reported = 1u;
+    }
+}
+
+static int OPENSPM_CALL bridge_create_v10(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    int result = bridge_create_v9(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    g_m14_v10_dl_begin_reported = 0u;
+    g_m14_v10_dl_end_reported = 0u;
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev17_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev18";
+    out_api->create = bridge_create_v10;
+    return OPENSPM_OK;
+}

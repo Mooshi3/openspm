@@ -1,0 +1,423 @@
+/*
+ * M14 generated-C bridge v8 / module dev16.
+ *
+ * v7 remains the runtime-proven native scheduler/retrace implementation. Keep
+ * its direct-call/event semantics intact, but remove a migration-only hot-path
+ * tax exposed by the first complete opening-story run: tens of millions of
+ * 1/2/4-byte Broadway write-gather stores were crossing the generated-module /
+ * backend ABI individually.
+ *
+ * Broadway's WPAR target is a 32-byte write-gather line. When the backend offers
+ * OpenSPM's neutral bulk GX FIFO service, serialize those stores locally in PPC
+ * big-endian order and submit one exact 32-byte stream chunk at a time. Flush a
+ * partial line before external reads/writes, ordering instructions, hosted
+ * semantic calls, presentation safepoints, and teardown. Unknown/older backends
+ * retain the proven v6 per-store path unchanged.
+ *
+ * The existing scheduler-idle presentation event remains one-per-retrace epoch.
+ * Backend dev23 now also uses that boundary to latch PC input once per simulation
+ * frame, matching SPM's real wpadGetButtonsPressed getter semantics.
+ *
+ * Diagnostic-only timing samples compare host monotonic elapsed time, delivered
+ * retraces and DolRecomp's guest CPU timebase once per host second. This measures
+ * the architectural clock-divergence hypothesis for the slow opening story; it
+ * does not alter either clock or attempt catch-up.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev15_internal
+#include "legacy_c_adapter_v7.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#include "openspm/gx_fifo_service.h"
+
+#define OPENSPM_M14_WG_GATHER_BYTES UINT32_C(32)
+#define OPENSPM_M14_BUS_CLOCK_WORD  UINT32_C(0x800000F8)
+#define OPENSPM_M14_TIMING_SEQ_WORK UINT32_C(0x804D0D60)
+#define OPENSPM_M14_TIMING_NS       UINT64_C(1000000000)
+
+static uint32_t g_m14_v8_last_presented_tick = UINT32_MAX;
+static openspm_gx_fifo_service g_m14_v8_gx_fifo;
+static uint32_t g_m14_v8_have_gx_fifo;
+static uint8_t g_m14_v8_wg_bytes[OPENSPM_M14_WG_GATHER_BYTES];
+static uint32_t g_m14_v8_wg_size;
+static uint32_t g_m14_v8_wg_pending_stores;
+static uint32_t g_m14_v8_wg_fast_reported;
+static uint32_t g_m14_v8_timing_started;
+static uint64_t g_m14_v8_timing_host_ns;
+static uint64_t g_m14_v8_timing_timebase;
+static uint32_t g_m14_v8_timing_retraces;
+
+static int bridge_query_gx_fifo_v8(openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    int result;
+
+    memset(&g_m14_v8_gx_fifo, 0, sizeof(g_m14_v8_gx_fifo));
+    g_m14_v8_have_gx_fifo = 0u;
+    if (instance == NULL || instance->runtime == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+    host = instance->runtime->host;
+    if (host == NULL || host->query_service == NULL ||
+        (host->capabilities & OPENSPM_HOST_CAP_SERVICE_QUERY) == 0u) {
+        return OPENSPM_ERROR_NOT_FOUND;
+    }
+
+    g_m14_v8_gx_fifo.header.struct_size = sizeof(g_m14_v8_gx_fifo);
+    g_m14_v8_gx_fifo.header.abi_version = OPENSPM_GX_FIFO_SERVICE_VERSION;
+    result = host->query_service(host->context,
+                                 OPENSPM_GX_FIFO_SERVICE_ID,
+                                 OPENSPM_GX_FIFO_SERVICE_VERSION,
+                                 &g_m14_v8_gx_fifo);
+    if (result == OPENSPM_OK && g_m14_v8_gx_fifo.submit != NULL &&
+        (g_m14_v8_gx_fifo.capabilities & OPENSPM_GX_FIFO_CAP_SUBMIT) != 0u) {
+        g_m14_v8_have_gx_fifo = 1u;
+    }
+    return result;
+}
+
+static void bridge_timing_sample_v8(openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    uint64_t now;
+    uint64_t host_delta;
+    uint64_t tb_delta;
+    uint32_t retrace_delta;
+    uint32_t bus_hz;
+    uint32_t seq;
+    uint32_t stage;
+    double guest_ms;
+    char message[320];
+
+    if (instance == NULL || instance->runtime == NULL || !g_m14_retrace_armed)
+        return;
+    host = instance->runtime->host;
+    if (host == NULL || host->monotonic_ns == NULL || host->log == NULL) return;
+    now = host->monotonic_ns(host->context);
+    if (now == 0u) return;
+
+    if (!g_m14_v8_timing_started) {
+        g_m14_v8_timing_started = 1u;
+        g_m14_v8_timing_host_ns = now;
+        g_m14_v8_timing_timebase = instance->cpu.timebase;
+        g_m14_v8_timing_retraces = g_m14_retrace_ticks;
+        return;
+    }
+    if (now - g_m14_v8_timing_host_ns < OPENSPM_M14_TIMING_NS) return;
+
+    host_delta = now - g_m14_v8_timing_host_ns;
+    tb_delta = instance->cpu.timebase - g_m14_v8_timing_timebase;
+    retrace_delta = g_m14_retrace_ticks - g_m14_v8_timing_retraces;
+    bus_hz = mem_read32(&instance->cpu, OPENSPM_M14_BUS_CLOCK_WORD);
+    seq = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK);
+    stage = mem_read32(&instance->cpu, OPENSPM_M14_TIMING_SEQ_WORK + UINT32_C(4));
+    /* Broadway timebase runs at one quarter of the boot-declared bus clock.
+       Convert only for reporting; the underlying CPU timebase is untouched. */
+    guest_ms = bus_hz != 0u
+                   ? ((double)tb_delta * 4000.0) / (double)bus_hz
+                   : 0.0;
+
+    (void)snprintf(message, sizeof(message),
+                   "M14 timing sample host_ms=%llu retraces=%u timebase_ticks=%llu bus_hz=%u guest_ms=%.3f seq=%u stage=%u pc=0x%08X.",
+                   (unsigned long long)(host_delta / UINT64_C(1000000)),
+                   (unsigned)retrace_delta,
+                   (unsigned long long)tb_delta,
+                   (unsigned)bus_hz,
+                   guest_ms,
+                   (unsigned)seq,
+                   (unsigned)stage,
+                   (unsigned)instance->cpu.pc);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+
+    g_m14_v8_timing_host_ns = now;
+    g_m14_v8_timing_timebase = instance->cpu.timebase;
+    g_m14_v8_timing_retraces = g_m14_retrace_ticks;
+}
+
+static void bridge_account_wg_v8(uint32_t stores) {
+    if (stores == 0u) return;
+#ifdef _WIN32
+    (void)InterlockedExchangeAdd(&g_m14_wg_diag_writes, (LONG)stores);
+#else
+    g_m14_wg_diag_writes += stores;
+#endif
+}
+
+static void bridge_log_wg_failure_v8(openspm_bridge_instance *instance,
+                                     uint32_t source_address,
+                                     int result) {
+    const openspm_host_api *host;
+    char message[320];
+    uint32_t b0 = g_m14_v8_wg_size > 0u ? g_m14_v8_wg_bytes[0] : 0u;
+    uint32_t b1 = g_m14_v8_wg_size > 1u ? g_m14_v8_wg_bytes[1] : 0u;
+    uint32_t b2 = g_m14_v8_wg_size > 2u ? g_m14_v8_wg_bytes[2] : 0u;
+    uint32_t b3 = g_m14_v8_wg_size > 3u ? g_m14_v8_wg_bytes[3] : 0u;
+    uint32_t b4 = g_m14_v8_wg_size > 4u ? g_m14_v8_wg_bytes[4] : 0u;
+    uint32_t b5 = g_m14_v8_wg_size > 5u ? g_m14_v8_wg_bytes[5] : 0u;
+    uint32_t b6 = g_m14_v8_wg_size > 6u ? g_m14_v8_wg_bytes[6] : 0u;
+    uint32_t b7 = g_m14_v8_wg_size > 7u ? g_m14_v8_wg_bytes[7] : 0u;
+
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(message, sizeof(message),
+                   "M14 GX bulk submit failure pc=0x%08X size=%u stores=%u service=%d first=%02X%02X%02X%02X%02X%02X%02X%02X.",
+                   (unsigned)source_address,
+                   (unsigned)g_m14_v8_wg_size,
+                   (unsigned)g_m14_v8_wg_pending_stores,
+                   result,
+                   (unsigned)b0, (unsigned)b1, (unsigned)b2, (unsigned)b3,
+                   (unsigned)b4, (unsigned)b5, (unsigned)b6, (unsigned)b7);
+    host->log(host->context, OPENSPM_LOG_WARN, message);
+}
+
+static int bridge_flush_wg_v8(openspm_bridge_instance *instance,
+                              uint32_t source_address) {
+    int result;
+    if (g_m14_v8_wg_size == 0u) return OPENSPM_OK;
+    if (!g_m14_v8_have_gx_fifo || g_m14_v8_gx_fifo.submit == NULL)
+        return OPENSPM_ERROR_UNSUPPORTED;
+
+    result = g_m14_v8_gx_fifo.submit(g_m14_v8_gx_fifo.context,
+                                     g_m14_v8_wg_bytes,
+                                     g_m14_v8_wg_size);
+    if (result != OPENSPM_OK) {
+        bridge_log_wg_failure_v8(instance, source_address, result);
+        bridge_request_fallback(instance, source_address,
+                                result == OPENSPM_ERROR_NOT_FOUND ? 3u : 4u);
+        return result;
+    }
+
+    bridge_account_wg_v8(g_m14_v8_wg_pending_stores);
+    g_m14_v8_wg_size = 0u;
+    g_m14_v8_wg_pending_stores = 0u;
+    return OPENSPM_OK;
+}
+
+static u64 bridge_external_read_v8(CPUState *cpu, u32 address, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    if (g_m14_v8_have_gx_fifo &&
+        bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source_address;
+        return 0u;
+    }
+    return bridge_external_read_v6(cpu, address, width);
+}
+
+static void bridge_external_write_v8(CPUState *cpu, u32 address, u64 value, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    uint32_t i;
+
+    if (g_m14_v8_have_gx_fifo &&
+        address >= OPENSPM_M14_WGPIPE_BASE &&
+        address < OPENSPM_M14_WGPIPE_BASE + OPENSPM_M14_WGPIPE_SIZE &&
+        (width == 1u || width == 2u || width == 4u || width == 8u)) {
+        if (width > OPENSPM_M14_WG_GATHER_BYTES - g_m14_v8_wg_size) {
+            if (bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK) {
+                if (cpu != NULL) cpu->pc = source_address;
+                return;
+            }
+        }
+
+        for (i = 0u; i < width; ++i) {
+            uint32_t shift = (width - 1u - i) * 8u;
+            g_m14_v8_wg_bytes[g_m14_v8_wg_size++] = (uint8_t)(value >> shift);
+        }
+        ++g_m14_v8_wg_pending_stores;
+
+        if (!g_m14_v8_wg_fast_reported && instance != NULL &&
+            instance->runtime != NULL && instance->runtime->host != NULL &&
+            instance->runtime->host->log != NULL) {
+            instance->runtime->host->log(
+                instance->runtime->host->context,
+                OPENSPM_LOG_INFO,
+                "M14 native Broadway GX write-gather fast path active (32-byte lines; exact FIFO order preserved).");
+            g_m14_v8_wg_fast_reported = 1u;
+        }
+
+        if (g_m14_v8_wg_size == OPENSPM_M14_WG_GATHER_BYTES) {
+            if (bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK && cpu != NULL)
+                cpu->pc = source_address;
+        }
+        return;
+    }
+
+    if (g_m14_v8_have_gx_fifo &&
+        bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source_address;
+        return;
+    }
+    bridge_external_write_v6(cpu, address, value, width);
+}
+
+static void bridge_instruction_fallback_v8(CPUState *cpu,
+                                            u32 raw,
+                                            u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t opcode = raw >> 26;
+    uint32_t xo = (raw >> 1) & UINT32_C(0x3FF);
+    int ordering = 0;
+
+    if (opcode == OPENSPM_PPC_OPCODE_SYSTEM && xo == OPENSPM_PPC_XO_ISYNC)
+        ordering = 1;
+    if (opcode == OPENSPM_PPC_OPCODE_X &&
+        (xo == OPENSPM_PPC_XO_SYNC || xo == OPENSPM_PPC_XO_EIEIO))
+        ordering = 1;
+
+    if (ordering && g_m14_v8_have_gx_fifo &&
+        bridge_flush_wg_v8(instance, source_address) != OPENSPM_OK) {
+        if (cpu != NULL) cpu->pc = source_address;
+        return;
+    }
+    bridge_instruction_fallback_v5(cpu, raw, source_address);
+}
+
+static bool bridge_host_call_v8(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY &&
+        bridge_is_m14_host_target((uint32_t)address) &&
+        g_m14_v8_have_gx_fifo &&
+        bridge_flush_wg_v8(instance, cpu != NULL ? (uint32_t)cpu->pc : (uint32_t)address) !=
+            OPENSPM_OK) {
+        return true;
+    }
+    return bridge_host_call_v7(cpu, address);
+}
+
+static void bridge_log_mod_call_v8(openspm_bridge_instance *instance, const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL) host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_emit_present_safepoint_v8(openspm_bridge_instance *instance) {
+    openspm_m14_hostcall_state state;
+    int result;
+
+    if (instance == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+    if (!g_m14_have_hostcall || g_m14_hostcall.handle == NULL)
+        return OPENSPM_ERROR_UNSUPPORTED;
+
+    if (g_m14_v8_have_gx_fifo) {
+        result = bridge_flush_wg_v8(instance, instance->cpu.pc);
+        if (result != OPENSPM_OK) return result;
+    }
+
+    bridge_to_m14_hostcall_state(instance, &state);
+    result = g_m14_hostcall.handle(g_m14_hostcall.context,
+                                   OPENSPM_M14_HOST_EVENT_PRESENT_SAFEPOINT,
+                                   &state);
+    if (result != OPENSPM_OK) return result;
+
+    /* The reserved presentation event must never alter guest CPU state. Fail
+       closed if a future backend accidentally does so. */
+    {
+        openspm_m14_hostcall_state check;
+        bridge_to_m14_hostcall_state(instance, &check);
+        if (memcmp(&state.gpr[0], &check.gpr[0], sizeof(state.gpr)) != 0 ||
+            state.pc != check.pc || state.lr != check.lr ||
+            state.ctr != check.ctr || state.cr != check.cr ||
+            state.xer != check.xer || state.fpscr != check.fpscr ||
+            state.event_argc > OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS ||
+            (state.event_target == 0u && state.event_argc != 0u)) {
+            return OPENSPM_ERROR_RUNTIME;
+        }
+    }
+    /* OpenSPM mods (openspm.guest_call, include/openspm/guest_call.h): the
+       backend may name one guest function to run now, while every guest
+       thread is idle, on a scratch CPU context exactly like an interrupt
+       handler. A call the module cannot complete is logged and skipped: a mod
+       must never stop the game. */
+    if (state.event_target != 0u) {
+        static uint32_t s_mod_calls, s_mod_failures;
+        char message[192];
+        result = bridge_run_m14_event(instance, state.event_target, state.event_argc, state.event_args);
+        if (result == OPENSPM_OK) {
+            if (++s_mod_calls <= 4u || (s_mod_calls & (s_mod_calls - 1u)) == 0u) {
+                (void)snprintf(message, sizeof(message),
+                               "OpenSPM mod guest call #%u to 0x%08X completed at the frame safepoint.",
+                               (unsigned)s_mod_calls, (unsigned)state.event_target);
+                bridge_log_mod_call_v8(instance, message);
+            }
+        } else if (++s_mod_failures <= 8u) {
+            (void)snprintf(message, sizeof(message),
+                           "OpenSPM mod guest call to 0x%08X failed (%d); skipped, the game continues.",
+                           (unsigned)state.event_target, result);
+            bridge_log_mod_call_v8(instance, message);
+        }
+        instance->fallback_requested = 0u;
+        instance->fallback_detail = 0u;
+        instance->fallback_address = 0u;
+    }
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_create_v8(const openspm_native_runtime_api *runtime,
+                                         const openspm_launch_desc *launch,
+                                         void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result = bridge_create_v7(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v8_last_presented_tick = UINT32_MAX;
+    g_m14_v8_wg_size = 0u;
+    g_m14_v8_wg_pending_stores = 0u;
+    g_m14_v8_wg_fast_reported = 0u;
+    g_m14_v8_timing_started = 0u;
+    g_m14_v8_timing_host_ns = 0u;
+    g_m14_v8_timing_timebase = 0u;
+    g_m14_v8_timing_retraces = 0u;
+    (void)bridge_query_gx_fifo_v8(instance);
+
+    if (g_m14_v8_have_gx_fifo) {
+        instance->cpu.external_read = bridge_external_read_v8;
+        instance->cpu.external_write = bridge_external_write_v8;
+        instance->cpu.instruction_fallback = bridge_instruction_fallback_v8;
+        instance->cpu.host_call = bridge_host_call_v8;
+    }
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_run_v8(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    int result;
+
+    /* Present only when Nintendo's scheduler says there is no runnable guest
+       work. The retrace tick number deduplicates v7's repeated 1 ms idle polls. */
+    if (instance != NULL &&
+        instance->cpu.pc == OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        g_m14_v8_last_presented_tick != g_m14_retrace_ticks) {
+        result = bridge_emit_present_safepoint_v8(instance);
+        if (result != OPENSPM_OK) return result;
+        g_m14_v8_last_presented_tick = g_m14_retrace_ticks;
+    }
+
+    result = bridge_run_v7(opaque, soft_cycle_budget, out_exit);
+    if (result == OPENSPM_OK) bridge_timing_sample_v8(instance);
+    return result;
+}
+
+static void OPENSPM_CALL bridge_destroy_v8(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v8_have_gx_fifo)
+        (void)bridge_flush_wg_v8(instance, instance->cpu.pc);
+    bridge_destroy_v6(opaque);
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev15_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev16";
+    out_api->create = bridge_create_v8;
+    out_api->run = bridge_run_v8;
+    out_api->destroy = bridge_destroy_v8;
+    return OPENSPM_OK;
+}

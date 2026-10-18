@@ -1,0 +1,191 @@
+/*
+ * M14 local-module bridge v28 / LLVM scheduler-idle re-entry contract.
+ *
+ * dev37 falsified the NAND hypothesis: no NANDCheckAsync seam/query/service was
+ * reached before the permanent seq_logo stage-1 stall. Comparing against the
+ * known-playable generated-C build showed the real divergence instead: C keeps
+ * running DEMODoneRender/GXDrawDone every retrace while LLVM produces one
+ * post-relF frame and then remains forever at SelectThread's no-runnable-thread
+ * continuation 0x8027551C.
+ *
+ * The fixed-rate M14 retrace bridge intentionally treats that PC as a host
+ * safepoint. It parks the persistent CPU there, executes __VIRetraceHandler in a
+ * scratch CPU against shared scheduler RAM, then resumes the persistent guest
+ * at exactly 0x8027551C so SelectThread can observe the newly runnable thread.
+ * Generated-C can re-enter arbitrary labels. The failing LLVM log instead
+ * showed pc=0x8027551C inside native region [0x802753D0,0x802755D0), meaning our
+ * host was repeatedly resuming at an interior continuation of a larger native
+ * region rather than a materialized compiler entry.
+ *
+ * derive_v19_llvm_seams.py now makes 0x8027551C a hard map partition. v28 does
+ * not alter scheduler state. It only proves at runtime that the query geometry
+ * changed as intended and records whether execution escapes the idle PC after a
+ * retrace. If the new partition fixes liveness, ordinary Nintendo scheduler
+ * semantics remain authoritative.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev37_nand_probe_base
+#include "legacy_c_adapter_v27.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V38_LOG_LIMIT UINT32_C(8)
+
+static openspm_native_create_fn g_m14_v38_underlying_create;
+static openspm_native_run_fn g_m14_v38_underlying_run;
+static openspm_native_destroy_fn g_m14_v38_underlying_destroy;
+static PPCHostCall g_m14_v38_underlying_host_call;
+static uint32_t g_m14_v38_query_logs;
+static uint32_t g_m14_v38_idle_runs;
+static uint32_t g_m14_v38_escape_logs;
+static uint32_t g_m14_v38_bad_geometry;
+
+static void bridge_v38_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static bool bridge_host_call_v38(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance;
+    bool handled;
+    if (cpu == NULL || g_m14_v38_underlying_host_call == NULL)
+        return false;
+    instance = bridge_from_cpu(cpu);
+
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        const uint32_t entry_pc = (uint32_t)cpu->pc;
+        const uint32_t start = (uint32_t)cpu->external_addr;
+        const uint32_t end = (uint32_t)cpu->external_value;
+        const int relevant =
+            entry_pc == OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY ||
+            (OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY >= start &&
+             OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY < end);
+        handled = g_m14_v38_underlying_host_call(cpu, address);
+        if (relevant && g_m14_v38_query_logs < OPENSPM_M14_V38_LOG_LIMIT) {
+            char message[352];
+            const int exact_start =
+                start == OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY;
+            if (entry_pc == OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY && !exact_start)
+                ++g_m14_v38_bad_geometry;
+            (void)snprintf(
+                message, sizeof(message),
+                "M14 LLVM scheduler reentry query #%u pc=0x%08X range=[0x%08X,0x%08X) exact_start=%s blocked=%s rid=0x%02X bad_geometry=%u.",
+                (unsigned)(g_m14_v38_query_logs + 1u),
+                (unsigned)entry_pc, (unsigned)start, (unsigned)end,
+                exact_start ? "yes" : "no",
+                handled ? "yes" : "no", (unsigned)cpu->external_rid,
+                (unsigned)g_m14_v38_bad_geometry);
+            bridge_v38_log(instance, message);
+            ++g_m14_v38_query_logs;
+        }
+        return handled;
+    }
+
+    return g_m14_v38_underlying_host_call(cpu, address);
+}
+
+static int OPENSPM_CALL bridge_run_v38(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint32_t before_pc;
+    int result;
+    if (g_m14_v38_underlying_run == NULL) return OPENSPM_ERROR_RUNTIME;
+    before_pc = instance != NULL ? (uint32_t)instance->cpu.pc : 0u;
+    if (before_pc == OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY)
+        ++g_m14_v38_idle_runs;
+
+    result = g_m14_v38_underlying_run(opaque, soft_cycle_budget, out_exit);
+
+    if (before_pc == OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY &&
+        instance != NULL &&
+        (uint32_t)instance->cpu.pc != OPENSPM_LOCAL_SCHEDULER_IDLE_REENTRY &&
+        g_m14_v38_escape_logs < OPENSPM_M14_V38_LOG_LIMIT) {
+        char message[352];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM scheduler reentry escaped idle #%u run=%u before=0x%08X after=0x%08X result=%d exit=%u/detail=%u/source=0x%08llX.",
+            (unsigned)(g_m14_v38_escape_logs + 1u),
+            (unsigned)g_m14_v38_idle_runs,
+            (unsigned)before_pc, (unsigned)instance->cpu.pc, result,
+            out_exit != NULL ? (unsigned)out_exit->reason : 0u,
+            out_exit != NULL ? (unsigned)out_exit->detail : 0u,
+            (unsigned long long)(out_exit != NULL ? out_exit->source_address : 0u));
+        bridge_v38_log(instance, message);
+        ++g_m14_v38_escape_logs;
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v38(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v38_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v38_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v38_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_v38;
+    g_m14_v38_query_logs = 0u;
+    g_m14_v38_idle_runs = 0u;
+    g_m14_v38_escape_logs = 0u;
+    g_m14_v38_bad_geometry = 0u;
+    bridge_v38_log(instance,
+        "M14 LLVM scheduler-idle reentry partition active: 0x8027551C is a hard compiler boundary; Nintendo run-queue state remains authoritative.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v38(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[288];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM scheduler reentry stats queries=%u idle_runs=%u escapes=%u bad_geometry=%u.",
+            (unsigned)g_m14_v38_query_logs,
+            (unsigned)g_m14_v38_idle_runs,
+            (unsigned)g_m14_v38_escape_logs,
+            (unsigned)g_m14_v38_bad_geometry);
+        bridge_v38_log(instance, message);
+        instance->cpu.host_call = g_m14_v38_underlying_host_call;
+    }
+    if (g_m14_v38_underlying_destroy != NULL)
+        g_m14_v38_underlying_destroy(opaque);
+    g_m14_v38_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev37_nand_probe_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->run == NULL ||
+        out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v38_underlying_create = out_api->create;
+    g_m14_v38_underlying_run = out_api->run;
+    g_m14_v38_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev38-llvm-scheduler-idle-reentry";
+    out_api->create = bridge_create_v38;
+    out_api->run = bridge_run_v38;
+    out_api->destroy = bridge_destroy_v38;
+#endif
+    return OPENSPM_OK;
+}

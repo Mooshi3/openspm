@@ -1,0 +1,1275 @@
+/*
+ * M14 generated-C bridge v7.
+ *
+ * Hosted static calls are deliberate exits from the recompiled game into
+ * OpenSPM-owned PC services. Earlier bridge revisions reported those exits as
+ * generic FALLBACK_REQUIRED and the persistent backend stopped. v7 asks the
+ * backend's temporary M14 host-call service to handle only those known
+ * semantic boundaries, then resumes the direct native call graph.
+ *
+ * This is migration scaffolding. The eventual code generator should emit the
+ * semantic OpenSPM service calls directly instead of exposing raw addresses.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev8_internal
+#include "legacy_c_adapter_v6.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#include "openspm/m14_hostcall_service.h"
+
+#include <stddef.h> /* offsetof: optional appended host API fields */
+
+#define OPENSPM_M14_MAX_HOSTCALLS_PER_RUN 4096u
+#define OPENSPM_M14_EVENT_SENTINEL UINT32_C(0x7FFF0000)
+#define OPENSPM_M14_MAX_EVENT_DISPATCHES 50000u
+
+/* R8PE01 / Revolution OS semantic timing coordinates. These are migration
+   coordinates for the player-local generated module, not public mod symbols.
+
+   SelectThread idles at 0x8027551C when RunQueueBits is zero. On console an
+   external interrupt eventually wakes a sleeping thread. The first persistent
+   Windows hang proved that after GX initialization SPM reaches exactly this
+   idle PC and remains there forever because the no-Dolphin runtime had no
+   retrace source.
+
+   Instead of emulating a VI beam/interrupt controller, the host supplies one
+   60 Hz semantic retrace event and runs SPM's own recompiled __VIRetraceHandler.
+   That code owns retraceCount, callbacks, OSWakeupThread(retraceQueue), and all
+   scheduler-visible state. High-refresh presentation remains separate later. */
+#define OPENSPM_M14_SCHEDULER_IDLE_PC UINT32_C(0x8027551C)
+#define OPENSPM_M14_VI_RETRACE_HANDLER UINT32_C(0x80280600)
+#define OPENSPM_M14_OS_CURRENT_CONTEXT UINT32_C(0x800000D4)
+#define OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET UINT32_C(408)
+#define OPENSPM_M14_VI_INTERRUPT UINT32_C(24)
+#define OPENSPM_M14_MSR_EE UINT32_C(0x00008000)
+#define OPENSPM_M14_DEFAULT_RETRACE_PERIOD_NS UINT64_C(16666667)
+#define OPENSPM_M14_DEV132_HALF_99_943_PERIOD_NS UINT64_C(20011407)
+#define OPENSPM_M14_DEV129_IDLE_PARK_DETAIL UINT64_C(34)
+
+/* Display-locked vanilla pacing. The renderer owns the window and measures the
+   display's exact rational refresh after it is created; when vanilla 60 fits
+   that display (59.94/59.98/60.02 Hz, or an integer multiple such as 120 Hz)
+   it publishes the matching simulation period here before the first retrace.
+   Running SPM at e.g. 59.978 Hz instead of 60.000 Hz is 0.04% slow, which is
+   imperceptible, but makes every simulated frame occupy exactly one (or k)
+   refreshes instead of beating against an unrelated host timer. The bounds
+   reject anything that is not recognisably a ~60 Hz simulation clock. */
+#define OPENSPM_M14_MIN_SYNCED_RETRACE_PERIOD_NS UINT64_C(16583333) /* 60.3 Hz */
+#define OPENSPM_M14_MAX_SYNCED_RETRACE_PERIOD_NS UINT64_C(16750419) /* 59.7 Hz */
+
+static uint32_t g_m14_dev132_cadence_checked;
+static uint32_t g_m14_dev132_half_monitor_cadence;
+static uint64_t g_m14_display_synced_period_ns;
+
+/* Read the live process environment. On Windows the renderer DLL publishes
+   through SetEnvironmentVariableA after this module's CRT copied its startup
+   environment, so CRT getenv() could miss it. */
+static int bridge_m14_read_env(const char *name, char *out, size_t size) {
+#ifdef _WIN32
+    DWORD length = GetEnvironmentVariableA(name, out, (DWORD)size);
+    return length > 0u && length < (DWORD)size;
+#else
+    const char *value = getenv(name);
+    if (value == NULL || strlen(value) >= size) return 0;
+    strcpy(out, value);
+    return 1;
+#endif
+}
+
+static uint64_t bridge_m14_retrace_period_ns(void) {
+    char value[64];
+    if (!g_m14_dev132_cadence_checked) {
+        g_m14_dev132_cadence_checked = 1u;
+        if (bridge_m14_read_env("OPENSPM_M14_DIAG_HALF_99_943HZ", value, sizeof(value)) &&
+            strcmp(value, "0") != 0 &&
+            strcmp(value, "off") != 0 && strcmp(value, "OFF") != 0 &&
+            strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0 &&
+            strcmp(value, "no") != 0 && strcmp(value, "NO") != 0) {
+            g_m14_dev132_half_monitor_cadence = 1u;
+        } else if (bridge_m14_read_env("OPENSPM_M14_RETRACE_PERIOD_NS", value, sizeof(value))) {
+            char *end = NULL;
+            const unsigned long long parsed = strtoull(value, &end, 10);
+            if (end != value && end != NULL && *end == '\0' &&
+                parsed >= OPENSPM_M14_MIN_SYNCED_RETRACE_PERIOD_NS &&
+                parsed <= OPENSPM_M14_MAX_SYNCED_RETRACE_PERIOD_NS) {
+                g_m14_display_synced_period_ns = (uint64_t)parsed;
+            }
+        }
+    }
+    if (g_m14_dev132_half_monitor_cadence) return OPENSPM_M14_DEV132_HALF_99_943_PERIOD_NS;
+    if (g_m14_display_synced_period_ns != 0u) return g_m14_display_synced_period_ns;
+    return OPENSPM_M14_DEFAULT_RETRACE_PERIOD_NS;
+}
+
+#define OPENSPM_M14_RETRACE_PERIOD_NS (bridge_m14_retrace_period_ns())
+
+static openspm_m14_hostcall_service g_m14_hostcall;
+static uint32_t g_m14_have_hostcall;
+static uint32_t g_m14_retrace_armed;
+static uint32_t g_m14_retrace_ticks;
+static uint64_t g_m14_next_retrace_ns;
+/* GPU-finish before retrace. GXDrawDone's host fence completes synchronously
+   inside the DrawDone host call, so by the time the main thread sleeps on
+   FinishQueue the "GPU" is already done. The later LLVM layer (dev47) delivers
+   the matching PE-finish interrupt, but only after this inner run pass returns.
+   If a VI deadline comes due in that window, delivering the retrace first makes
+   the game consume it while still waiting for DrawDone; it then calls
+   VIWaitForRetrace and sleeps a whole extra refresh (a 33 ms dropped frame).
+   Real hardware raises PE-finish as soon as the GPU is done, i.e. first. The
+   hook delivers an already-completed finish; the retrace stays pending (same
+   deadline) and is delivered on the next idle service once the main thread
+   has reached VIWaitForRetrace. OPENSPM_M14_FINISH_BEFORE_RETRACE=0 disables. */
+static int (*g_m14_pre_retrace_finish_hook)(openspm_bridge_instance *instance);
+static uint64_t g_m14_finish_before_retrace;
+/* Second, observed form of the same race (player run 8f4a1149): the DrawDone
+   parse itself crosses the deadline, dev47 then wakes the main thread, and the
+   next service finds it runnable-but-not-yet-run at scheduler idle with the
+   retrace due. Delivering now bumps retraceCount before DEMODoneRender reaches
+   VIWaitForRetrace, which then sleeps a whole extra refresh. On hardware the
+   GPU works concurrently with the CPU and would have finished long before, so
+   hold the (grid-anchored) retrace until the woken thread parks again, bounded
+   by OPENSPM_M14_FINISH_HOLD_MAX_NS. */
+#define OPENSPM_M14_FINISH_HOLD_MAX_NS UINT64_C(4000000)
+static uint32_t g_m14_finish_since_retrace;
+static uint64_t g_m14_finish_holds;
+static uint64_t g_m14_finish_hold_expired;
+static uint64_t g_m14_finish_hold_max_ns;
+static uint32_t g_m14_finish_before_retrace_checked;
+static uint32_t g_m14_finish_before_retrace_disabled;
+static uint32_t g_m14_last_event_transfer_context;
+static uint32_t g_m14_last_event_transfer_pc;
+#ifdef DOLRECOMP_BACKEND_LLVM
+static uint64_t g_m14_dev129_empty_idle_sideexits;
+static uint64_t g_m14_dev129_runnable_idle_native;
+static uint64_t g_m14_dev129_unknown_idle_native;
+static int bridge_m14_idle_runqueue_state(CPUState *cpu);
+#endif
+
+/* DolRecomp asks CPUState::host_call before ordinary guest dispatch. The
+   direct-call normalizer turns static calls to these addresses back into side
+   exits, but a side exit only changes PC and returns. Without this classifier,
+   bridge_run() immediately dispatches that PC as ordinary generated code on
+   its next loop iteration and silently bypasses the backend host service.
+
+   Keep the migration target data in one X-macro include so exact addresses are
+   also usable for the CPU runtime's native-region query. The companion sync
+   test compares this mirror with state/m14-host-targets.json. */
+static int bridge_is_m14_host_target(uint32_t address) {
+    switch (address) {
+#define OPENSPM_M14_HOST_TARGET(value) case value: return 1;
+#include "m14_host_targets.inc"
+#include "openspm_hook_targets.inc" /* OpenSPM hooks (docs/HOOKS.md); empty = none */
+#undef OPENSPM_M14_HOST_TARGET
+        default: return 0;
+    }
+}
+
+static int bridge_m14_host_range_blocked(uint32_t start, uint32_t end) {
+    if (end <= start) return 0;
+#define OPENSPM_M14_HOST_TARGET(value) \
+    do { if ((uint32_t)(value) >= start && (uint32_t)(value) < end) return 1; } while (0);
+#include "m14_host_targets.inc"
+#include "openspm_hook_targets.inc"
+#undef OPENSPM_M14_HOST_TARGET
+    return 0;
+}
+
+/* This callback is intentionally classification-only. Known semantic targets
+   become the same detail-12 migration exit that bridge_run_v7 already knows
+   how to marshal through openspm.m14.hostcall.r8pe01. Unknown addresses return
+   false and remain on DolRecomp's ordinary native guest path.
+
+   ppc_native_region_available() uses a reserved query address and the
+   external_addr/external_value fields for [start,end). Mark that query handled
+   and report a region blocked only when it contains one of our semantic host
+   targets. */
+/* OpenSPM content hooks: one resumed call into a hooked function's original
+   body (OPENSPM_M14_HOOK_CONTINUE_ORIGINAL). The resumed call is recognised by
+   its entry address, return address and stack pointer; it passes at most two
+   host checks (the dispatcher and the body's own entry guard). A new call to
+   the same function from inside its body has another return address and is
+   hooked as usual. */
+static struct {
+    uint32_t pc, lr, sp, checks;
+} g_m14_hook_bypass;
+
+static void bridge_m14_hook_arm_bypass(const openspm_m14_hostcall_state *state) {
+    g_m14_hook_bypass.pc = state->pc;
+    g_m14_hook_bypass.lr = state->lr;
+    g_m14_hook_bypass.sp = state->gpr[1];
+    g_m14_hook_bypass.checks = 2u;
+}
+
+static int bridge_m14_hook_bypassed(const CPUState *cpu, uint32_t address) {
+    if (g_m14_hook_bypass.checks == 0u) return 0;
+    if (address != g_m14_hook_bypass.pc || (uint32_t)cpu->lr != g_m14_hook_bypass.lr ||
+        (uint32_t)cpu->gpr[1] != g_m14_hook_bypass.sp) {
+        if (address != g_m14_hook_bypass.pc) return 0; /* another host check: keep waiting */
+        g_m14_hook_bypass.checks = 0u;                /* same function, different call: hook it */
+        return 0;
+    }
+    --g_m14_hook_bypass.checks;
+    return 1;
+}
+
+static bool bridge_host_call_v7(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance;
+
+    if (cpu == NULL) return false;
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY) {
+        int blocked = bridge_m14_host_range_blocked(
+            (uint32_t)cpu->external_addr, (uint32_t)cpu->external_value);
+        cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+        return blocked != 0;
+    }
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+    /* dev129: scheduler-idle is state-sensitive. Empty RunQueueBits returns to
+       the outer host immediately so it can wait for VI; runnable work keeps the
+       existing native SelectThread re-entry from dev68/dev90. Unknown state
+       also stays native (fail-open to Nintendo rather than fabricating idle). */
+    if ((uint32_t)address == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+        const int runq_state = bridge_m14_idle_runqueue_state(cpu);
+        if (runq_state == 0) {
+            instance = bridge_from_cpu(cpu);
+            if (instance == NULL) return false;
+            ++g_m14_dev129_empty_idle_sideexits;
+            bridge_request_fallback(
+                instance, (uint32_t)address,
+                (uint32_t)OPENSPM_M14_DEV129_IDLE_PARK_DETAIL);
+            cpu->pc = address;
+            return true;
+        }
+        if (runq_state > 0) ++g_m14_dev129_runnable_idle_native;
+        else ++g_m14_dev129_unknown_idle_native;
+        return false;
+    }
+#endif
+
+    if (!bridge_is_m14_host_target((uint32_t)address)) return false;
+    if (bridge_m14_hook_bypassed(cpu, (uint32_t)address)) return false; /* run the original body */
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) return false;
+
+    bridge_request_fallback(instance, (uint32_t)address, 12u);
+    cpu->pc = address;
+    return true;
+}
+
+/* These two exceptions are already understood architectural boundaries in the
+   native bridge, not reasons to bounce back to an emulator/interpreter.
+
+   FP-unavailable is lazy FPU ownership: retry SRR0 with MSR[FP] enabled.
+   Nintendo's SDK uses SC as a cache/bus synchronization barrier; DolRecomp
+   saves SRR0 as CIA+4 for that exception. Host MEM1/MEM2 are coherent and the
+   bridge's cache/order operations are already hosted, so perform the ordering
+   fence and return from the exception using the saved SRR state. */
+static int bridge_resume_m14_exception(CPUState *cpu) {
+    if (cpu == NULL) return 0;
+
+    if (cpu->exception == PPC_EXC_FP_UNAVAILABLE) {
+        cpu->pc = cpu->srr0;
+        cpu->msr = cpu->srr1 | UINT32_C(0x00002000);
+        cpu->exception = 0u;
+        return 1;
+    }
+
+    if (cpu->exception == PPC_EXC_SYSTEM_CALL) {
+        bridge_ordering_barrier_v5();
+        cpu->pc = cpu->srr0;
+        cpu->msr = cpu->srr1;
+        cpu->exception = 0u;
+        return 1;
+    }
+
+    return 0;
+}
+
+static void bridge_cpu_to_m14_hostcall_state(
+    const CPUState *cpu,
+    openspm_m14_hostcall_state *state) {
+    uint32_t i;
+    memset(state, 0, sizeof(*state));
+    state->header.struct_size = sizeof(*state);
+    state->header.abi_version = OPENSPM_ABI_VERSION;
+    if (cpu == NULL) return;
+    for (i = 0; i < 32u; ++i) state->gpr[i] = cpu->gpr[i];
+    state->pc = cpu->pc;
+    state->lr = cpu->lr;
+    state->ctr = cpu->ctr;
+    state->cr = cpu->cr;
+    state->xer = cpu->xer;
+    state->fpscr = cpu->fpscr;
+    for (i = 0; i < 32u; ++i) state->fpr_bits[i] = bridge_f64_bits(cpu->fpr[i]);
+}
+
+static void bridge_cpu_from_m14_hostcall_state(
+    CPUState *cpu,
+    const openspm_m14_hostcall_state *state) {
+    uint32_t i;
+    if (cpu == NULL || state == NULL) return;
+    for (i = 0; i < 32u; ++i) cpu->gpr[i] = state->gpr[i];
+    cpu->pc = state->pc;
+    cpu->lr = state->lr;
+    cpu->ctr = state->ctr;
+    cpu->cr = state->cr;
+    cpu->xer = state->xer;
+    cpu->fpscr = state->fpscr;
+    /* Only a register the handler changed (hooks): ps1 follows ps0 as for an
+       lfs/frsp result; untouched registers keep their paired-single half. */
+    if (openspm_m14_hostcall_has_fpr(state)) {
+        for (i = 0; i < 32u; ++i) {
+            if (state->fpr_bits[i] == bridge_f64_bits(cpu->fpr[i])) continue;
+            cpu->fpr[i] = bridge_bits_f64(state->fpr_bits[i]);
+            cpu->ps1[i] = cpu->fpr[i];
+        }
+    }
+}
+
+static void bridge_to_m14_hostcall_state(
+    const openspm_bridge_instance *instance,
+    openspm_m14_hostcall_state *state) {
+    bridge_cpu_to_m14_hostcall_state(instance != NULL ? &instance->cpu : NULL,
+                                     state);
+}
+
+static void bridge_from_m14_hostcall_state(
+    openspm_bridge_instance *instance,
+    const openspm_m14_hostcall_state *state) {
+    if (instance == NULL) return;
+    bridge_cpu_from_m14_hostcall_state(&instance->cpu, state);
+    instance->fallback_requested = 0u;
+    instance->fallback_detail = 0u;
+    instance->fallback_address = 0u;
+}
+
+static void bridge_log_m14_event_failure(openspm_bridge_instance *instance,
+                                         const char *reason,
+                                         uint32_t target,
+                                         const CPUState *event_cpu,
+                                         uint32_t dispatches,
+                                         uint32_t hostcalls) {
+    const openspm_host_api *host;
+    char message[256];
+    if (instance == NULL || instance->runtime == NULL || reason == NULL ||
+        event_cpu == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    (void)snprintf(message, sizeof(message),
+                   "M14 event failure reason=%s target=0x%08X pc=0x%08X lr=0x%08X exc=0x%08X dispatches=%u hostcalls=%u",
+                   reason, (unsigned)target, (unsigned)event_cpu->pc,
+                   (unsigned)event_cpu->lr, (unsigned)event_cpu->exception,
+                   (unsigned)dispatches, (unsigned)hostcalls);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_m14_context_address_valid(const CPUState *cpu,
+                                            uint32_t address,
+                                            uint32_t size) {
+    uint32_t offset;
+    if (cpu == NULL || size == 0u) return 0;
+    if (address >= GC_RAM_BASE) {
+        offset = address - GC_RAM_BASE;
+        if (offset <= cpu->ram_size && size <= cpu->ram_size - offset) return 1;
+    }
+    if (cpu->mem2 != NULL && address >= WII_MEM2_BASE) {
+        offset = address - WII_MEM2_BASE;
+        if (offset <= cpu->mem2_size && size <= cpu->mem2_size - offset) return 1;
+    }
+    return 0;
+}
+
+/* SelectThread does not necessarily return to the retrace handler after
+   OSWakeupThread makes a sleeper runnable. In the proven idle case it may call
+   OSSetCurrentContext(new_thread) and OSLoadContext(new_thread); OSLoadContext
+   terminates with rfi, which restores the new thread's saved SRR0/MSR and
+   deliberately transfers execution there.
+
+   A scratch event that insists on returning to a fake LR sentinel therefore
+   misclassifies a correct scheduler wake as failure and then runs the awakened
+   thread on a disposable CPU copy. Recognize only the narrow RVL context-load
+   shape: the global OS_CURRENT_CONTEXT changed away from the interrupted
+   context, is a valid guest context, and its saved SRR0 exactly matches the PC
+   produced by rfi. Commit that CPU state back to the persistent native CPU and
+   let Nintendo's scheduler own the transition. */
+/* Other guest interrupt handlers with __VIRetraceHandler's (interrupt,
+   context) shape that a later layer delivers as events (the opt-in audio
+   device's AI DMA and DSP handlers). Empty unless such a layer registers one,
+   so the default retrace path is exactly as before. */
+static uint32_t g_m14_event_interrupt_handlers[4];
+
+static int bridge_m14_event_is_interrupt_handler(uint32_t target) {
+    uint32_t i;
+    if (target == OPENSPM_M14_VI_RETRACE_HANDLER) return 1;
+    for (i = 0u; i < sizeof(g_m14_event_interrupt_handlers) /
+                         sizeof(g_m14_event_interrupt_handlers[0]); ++i) {
+        if (g_m14_event_interrupt_handlers[i] != 0u &&
+            g_m14_event_interrupt_handlers[i] == target) return 1;
+    }
+    return 0;
+}
+
+static int bridge_commit_m14_retrace_context_transfer(
+    openspm_bridge_instance *instance,
+    CPUState *event_cpu,
+    uint32_t event_target,
+    uint32_t interrupted_context) {
+    uint32_t current_context;
+    uint32_t saved_pc;
+
+    if (instance == NULL || event_cpu == NULL ||
+        !bridge_m14_event_is_interrupt_handler(event_target) ||
+        interrupted_context == 0u) return 0;
+
+    current_context = mem_read32(event_cpu, OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (current_context == 0u || current_context == interrupted_context ||
+        !bridge_m14_context_address_valid(event_cpu, current_context,
+                                          OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET + 4u)) {
+        return 0;
+    }
+
+    saved_pc = mem_read32(event_cpu,
+                          current_context + OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET) &
+               ~UINT32_C(3);
+    if (saved_pc != (event_cpu->pc & ~UINT32_C(3))) return 0;
+
+    instance->cpu = *event_cpu;
+    g_m14_last_event_transfer_context = current_context;
+    g_m14_last_event_transfer_pc = event_cpu->pc;
+    return 1;
+}
+
+static int bridge_run_m14_event_from_cpu(
+    openspm_bridge_instance *instance,
+    const CPUState *base_cpu,
+    uint32_t target,
+    uint32_t argc,
+    const uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS]);
+
+static int bridge_run_m14_event(
+    openspm_bridge_instance *instance,
+    uint32_t target,
+    uint32_t argc,
+    const uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS]);
+
+/* Event callbacks execute recompiled guest code too, so they can cross the
+   same semantic host boundaries as ordinary gameplay. Handle those boundaries
+   in the scratch CPU rather than redispatching the Wii implementation or
+   rejecting a perfectly valid native event. */
+static int bridge_handle_m14_event_hostcall(
+    openspm_bridge_instance *instance,
+    CPUState *event_cpu) {
+    openspm_m14_hostcall_state state;
+    uint32_t target;
+    int result;
+
+    if (instance == NULL || event_cpu == NULL || !instance->fallback_requested)
+        return OPENSPM_OK;
+    if (instance->fallback_detail != 12u || !g_m14_have_hostcall)
+        return OPENSPM_ERROR_UNSUPPORTED;
+
+    target = instance->fallback_address;
+    bridge_cpu_to_m14_hostcall_state(event_cpu, &state);
+    instance->fallback_requested = 0u;
+    instance->fallback_detail = 0u;
+    instance->fallback_address = 0u;
+
+    result = g_m14_hostcall.handle(g_m14_hostcall.context, target, &state);
+    if (result != OPENSPM_OK) return result;
+    bridge_cpu_from_m14_hostcall_state(event_cpu, &state);
+
+    if (state.event_target == OPENSPM_M14_HOOK_CONTINUE_ORIGINAL) {
+        bridge_m14_hook_arm_bypass(&state);
+    } else if (state.event_target != 0u) {
+        /* A completion raised while another guest event is executing must
+           inherit the parent event's live registers and stack, not the stale
+           persistent CPU snapshot from before the parent callback started. */
+        result = bridge_run_m14_event_from_cpu(instance,
+                                               event_cpu,
+                                               state.event_target,
+                                               state.event_argc,
+                                               state.event_args);
+        if (result != OPENSPM_OK) return result;
+    }
+    return OPENSPM_OK;
+}
+
+/* Run one completion/interrupt callback in a scratch register context. RAM and
+   Nintendo OS scheduler state remain shared with the main native CPU context.
+   Ordinary callbacks return through a private LR sentinel. The VI retrace
+   event additionally accepts the exact OSLoadContext/rfi scheduler transfer
+   described above and commits it to the persistent CPU instead of discarding
+   the newly awakened thread context.
+
+   base_cpu is explicit because nested host callbacks must begin from the live
+   parent event state. Top-level events still seed from instance->cpu. */
+static int bridge_run_m14_event_from_cpu(
+    openspm_bridge_instance *instance,
+    const CPUState *base_cpu,
+    uint32_t target,
+    uint32_t argc,
+    const uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS]) {
+    CPUState event_cpu;
+    uint32_t dispatches = 0u;
+    uint32_t hostcalls = 0u;
+    uint32_t interrupted_context = 0u;
+    uint32_t i;
+    uint32_t saved_fallback_requested;
+    uint32_t saved_fallback_detail;
+    uint32_t saved_fallback_address;
+    int result = OPENSPM_ERROR_RUNTIME;
+
+    if (instance == NULL || base_cpu == NULL || target == 0u ||
+        argc > OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+
+    event_cpu = *base_cpu;
+    for (i = 0; i < argc; ++i) event_cpu.gpr[3u + i] = args[i];
+    if (bridge_m14_event_is_interrupt_handler(target) && argc >= 2u)
+        interrupted_context = args[1];
+    event_cpu.lr = OPENSPM_M14_EVENT_SENTINEL;
+    event_cpu.pc = target;
+    event_cpu.downcount = 0;
+    event_cpu.exception = 0u;
+    event_cpu.program_exception = 0u;
+
+    saved_fallback_requested = instance->fallback_requested;
+    saved_fallback_detail = instance->fallback_detail;
+    saved_fallback_address = instance->fallback_address;
+    instance->fallback_requested = 0u;
+    instance->fallback_detail = 0u;
+    instance->fallback_address = 0u;
+
+    while (event_cpu.pc != OPENSPM_M14_EVENT_SENTINEL &&
+           dispatches++ < OPENSPM_M14_MAX_EVENT_DISPATCHES) {
+        event_cpu.downcount = 0;
+        if (!dolrecomp_call(&event_cpu, event_cpu.pc)) {
+            bridge_log_m14_event_failure(instance, "no-dispatch", target,
+                                         &event_cpu, dispatches, hostcalls);
+            result = OPENSPM_ERROR_UNSUPPORTED;
+            goto cleanup;
+        }
+
+        if (bridge_commit_m14_retrace_context_transfer(instance, &event_cpu,
+                                                        target,
+                                                        interrupted_context)) {
+            result = OPENSPM_OK;
+            goto cleanup;
+        }
+
+        if (instance->fallback_requested) {
+            if (hostcalls++ >= OPENSPM_M14_MAX_HOSTCALLS_PER_RUN) {
+                bridge_log_m14_event_failure(instance, "hostcall-limit", target,
+                                             &event_cpu, dispatches, hostcalls);
+                result = OPENSPM_ERROR_RUNTIME;
+                goto cleanup;
+            }
+            result = bridge_handle_m14_event_hostcall(instance, &event_cpu);
+            if (result != OPENSPM_OK) {
+                bridge_log_m14_event_failure(instance, "hostcall", target,
+                                             &event_cpu, dispatches, hostcalls);
+                goto cleanup;
+            }
+            continue;
+        }
+
+        if (event_cpu.exception == 0u) continue;
+        if (bridge_resume_m14_exception(&event_cpu)) continue;
+        bridge_log_m14_event_failure(instance, "exception", target,
+                                     &event_cpu, dispatches, hostcalls);
+        result = OPENSPM_ERROR_RUNTIME;
+        goto cleanup;
+    }
+
+    if (event_cpu.pc == OPENSPM_M14_EVENT_SENTINEL) {
+        result = OPENSPM_OK;
+    } else {
+        bridge_log_m14_event_failure(instance, "dispatch-limit", target,
+                                     &event_cpu, dispatches, hostcalls);
+        result = OPENSPM_ERROR_RUNTIME;
+    }
+
+cleanup:
+    instance->fallback_requested = saved_fallback_requested;
+    instance->fallback_detail = saved_fallback_detail;
+    instance->fallback_address = saved_fallback_address;
+    return result;
+}
+
+static int bridge_run_m14_event(
+    openspm_bridge_instance *instance,
+    uint32_t target,
+    uint32_t argc,
+    const uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS]) {
+    if (instance == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+    return bridge_run_m14_event_from_cpu(instance, &instance->cpu,
+                                         target, argc, args);
+}
+
+static uint64_t bridge_m14_now_ns(const openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL) return 0u;
+    host = instance->runtime->host;
+    if (host == NULL || host->monotonic_ns == NULL) return 0u;
+    return host->monotonic_ns(host->context);
+}
+
+/* OpenSPM fast-forward ([Game] turbo_speed = unlimited, docs/PLAYING.md): the
+   host's guest clock (include/openspm/guest_clock.h) jumps to the idle
+   deadline instead of this module sleeping until it. An older host has no
+   clock_skip_to field, a NULL one or a 0 answer: wait exactly as before. N x
+   turbo needs nothing here: the deadlines and the waits below already run on
+   host->monotonic_ns, which the backend scales. */
+static int bridge_m14_clock_skip_to(const openspm_bridge_instance *instance,
+                                    uint64_t target_ns, uint64_t *io_now) {
+    const openspm_host_api *host;
+    uint64_t now;
+    if (instance == NULL || instance->runtime == NULL || target_ns == 0u) return 0;
+    host = instance->runtime->host;
+    if (host == NULL ||
+        host->header.struct_size < offsetof(openspm_host_api, clock_skip_to) + sizeof(host->clock_skip_to) ||
+        host->clock_skip_to == NULL ||
+        !host->clock_skip_to(host->context, target_ns))
+        return 0;
+    now = bridge_m14_now_ns(instance);
+    if (now < target_ns) return 0;
+    *io_now = now;
+    return 1;
+}
+
+static void bridge_log_m14_retrace(openspm_bridge_instance *instance,
+                                   const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_m14_should_log_tick(uint32_t tick) {
+    return tick <= 8u || (tick != 0u && (tick & (tick - 1u)) == 0u);
+}
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+/* dev68: an idle continuation PC is not proof that the scheduler is still
+ * idle. A scratch PE-finish event can set the real RunQueueBits and return
+ * normally, leaving the persistent PC at SelectThread's idle-loop load.
+ * Let that native load/scheduler run immediately instead of parking runnable
+ * work until VI. This is the same US2 r13-relative word observed by dev39 and
+ * printed after every dev47 finish completion; never write guest OS state. */
+#define OPENSPM_M14_DEV68_RUNQUEUE_BITS_DELTA UINT32_C(29552)
+static uint64_t g_m14_dev68_runnable_resumes;
+static uint64_t g_m14_dev68_idle_polls;
+static uint64_t g_m14_dev68_idle_sleep_ns;
+
+/* dev118: diagnose the end-of-frame/retrace boundary and provide a bounded
+ * Windows idle-wait A/B. Normal behavior remains Sleep(1) unless
+ * OPENSPM_M14_PRECISE_IDLE_WAIT is enabled. With it enabled, only the final
+ * <=2 ms before an already-established fixed VI deadline uses Sleep(0).
+ * Nintendo scheduler state, VI timing, guest work and retrace delivery are not
+ * fabricated or reordered. */
+#define OPENSPM_M14_DEV118_FINE_WAIT_NS UINT64_C(2000000)
+typedef struct openspm_m14_dev118_pacing_state {
+    uint32_t precise_checked;
+    uint32_t precise_enabled;
+    uint32_t final_spin_checked;
+    uint32_t final_spin_enabled;
+    uint64_t idle_epoch_deadline_ns;
+    uint64_t idle_first_ns;
+    uint64_t idle_ready_count;
+    uint64_t idle_ready_margin_total_ns;
+    uint64_t idle_ready_margin_min_ns;
+    uint64_t idle_ready_margin_max_ns;
+    uint64_t sleep1_calls;
+    uint64_t yield0_calls;
+    uint64_t sleep_crossings;
+    uint64_t sleep_overshoot_max_ns;
+    uint64_t delivery_count;
+    uint64_t delivery_from_idle_count;
+    uint64_t delivery_busy_count;
+    uint64_t delivery_late_total_ns;
+    uint64_t delivery_late_max_ns;
+    uint64_t delivery_late_over_1ms;
+    uint64_t delivery_late_over_2ms;
+    uint64_t event_start_ns;
+    uint64_t event_total_ns;
+    uint64_t event_max_ns;
+} openspm_m14_dev118_pacing_state;
+
+static openspm_m14_dev118_pacing_state g_m14_dev118_pacing;
+
+/* dev128: tail-only ownership of the minority VI deadlines reached while the
+ * guest is still busy. v13 updates the current top-level phase at the existing
+ * four phase markers; no new steady-state clock read is added here. */
+static uint32_t g_m14_dev128_phase_id = UINT32_MAX;
+static uint64_t g_m14_dev128_phase_enter_ns;
+static uint64_t g_m14_dev128_busy_due_count;
+
+static int bridge_m14_dev118_precise_wait_enabled(void) {
+    const char *value;
+    if (g_m14_dev118_pacing.precise_checked)
+        return g_m14_dev118_pacing.precise_enabled != 0u;
+    g_m14_dev118_pacing.precise_checked = 1u;
+    value = getenv("OPENSPM_M14_PRECISE_IDLE_WAIT");
+    if (value == NULL || *value == '\0' ||
+        strcmp(value, "0") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        g_m14_dev118_pacing.precise_enabled = 0u;
+    } else {
+        g_m14_dev118_pacing.precise_enabled = 1u;
+    }
+    return g_m14_dev118_pacing.precise_enabled != 0u;
+}
+
+static int bridge_m14_dev126_final_spin_enabled(void) {
+    const char *value;
+    if (g_m14_dev118_pacing.final_spin_checked)
+        return g_m14_dev118_pacing.final_spin_enabled != 0u;
+    g_m14_dev118_pacing.final_spin_checked = 1u;
+    value = getenv("OPENSPM_M14_FINAL_IDLE_SPIN");
+    if (value == NULL || *value == '\0' ||
+        strcmp(value, "0") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) {
+        g_m14_dev118_pacing.final_spin_enabled = 0u;
+    } else {
+        g_m14_dev118_pacing.final_spin_enabled = 1u;
+    }
+    return g_m14_dev118_pacing.final_spin_enabled != 0u;
+}
+
+static void bridge_m14_dev118_note_idle_ready(uint64_t now) {
+    uint64_t margin;
+    if (g_m14_next_retrace_ns == 0u || now >= g_m14_next_retrace_ns)
+        return;
+    if (g_m14_dev118_pacing.idle_epoch_deadline_ns == g_m14_next_retrace_ns)
+        return;
+    g_m14_dev118_pacing.idle_epoch_deadline_ns = g_m14_next_retrace_ns;
+    g_m14_dev118_pacing.idle_first_ns = now;
+    margin = g_m14_next_retrace_ns - now;
+    ++g_m14_dev118_pacing.idle_ready_count;
+    g_m14_dev118_pacing.idle_ready_margin_total_ns += margin;
+    if (g_m14_dev118_pacing.idle_ready_margin_min_ns == 0u ||
+        margin < g_m14_dev118_pacing.idle_ready_margin_min_ns)
+        g_m14_dev118_pacing.idle_ready_margin_min_ns = margin;
+    if (margin > g_m14_dev118_pacing.idle_ready_margin_max_ns)
+        g_m14_dev118_pacing.idle_ready_margin_max_ns = margin;
+}
+
+static void bridge_m14_dev118_note_delivery_begin(uint64_t now) {
+    const uint64_t due = g_m14_next_retrace_ns;
+    uint64_t lateness = 0u;
+    const int from_idle =
+        due != 0u && g_m14_dev118_pacing.idle_epoch_deadline_ns == due;
+    if (due != 0u && now >= due) lateness = now - due;
+    ++g_m14_dev118_pacing.delivery_count;
+    if (from_idle)
+        ++g_m14_dev118_pacing.delivery_from_idle_count;
+    else
+        ++g_m14_dev118_pacing.delivery_busy_count;
+    g_m14_dev118_pacing.delivery_late_total_ns += lateness;
+    if (lateness > g_m14_dev118_pacing.delivery_late_max_ns)
+        g_m14_dev118_pacing.delivery_late_max_ns = lateness;
+    if (lateness > UINT64_C(1000000))
+        ++g_m14_dev118_pacing.delivery_late_over_1ms;
+    if (lateness > UINT64_C(2000000))
+        ++g_m14_dev118_pacing.delivery_late_over_2ms;
+    g_m14_dev118_pacing.event_start_ns = now;
+}
+
+static void bridge_m14_dev118_note_delivery_end(uint64_t now) {
+    uint64_t elapsed = 0u;
+    if (g_m14_dev118_pacing.event_start_ns != 0u &&
+        now >= g_m14_dev118_pacing.event_start_ns) {
+        elapsed = now - g_m14_dev118_pacing.event_start_ns;
+    }
+    g_m14_dev118_pacing.event_total_ns += elapsed;
+    if (elapsed > g_m14_dev118_pacing.event_max_ns)
+        g_m14_dev118_pacing.event_max_ns = elapsed;
+    g_m14_dev118_pacing.event_start_ns = 0u;
+    g_m14_dev118_pacing.idle_epoch_deadline_ns = 0u;
+    g_m14_dev118_pacing.idle_first_ns = 0u;
+}
+
+static int bridge_m14_dev128_should_log(uint64_t count) {
+    return count <= UINT64_C(64) ||
+           (count != 0u && (count & (count - UINT64_C(1))) == 0u);
+}
+
+static const char *bridge_m14_dev128_phase_name(uint32_t phase) {
+    switch (phase) {
+    case 0u: return "before";
+    case 1u: return "disp";
+    case 2u: return "main";
+    case 3u: return "done";
+    default: return "unknown";
+    }
+}
+
+static void bridge_m14_dev128_log_busy_due(
+    openspm_bridge_instance *instance, uint64_t now) {
+    const uint64_t due = g_m14_next_retrace_ns;
+    const uint64_t count = ++g_m14_dev128_busy_due_count;
+    uint64_t late_ns = 0u;
+    uint64_t phase_age_ns = 0u;
+    char message[512];
+
+    if (instance == NULL || !bridge_m14_dev128_should_log(count)) return;
+    if (due != 0u && now >= due) late_ns = now - due;
+    if (g_m14_dev128_phase_enter_ns != 0u &&
+        now >= g_m14_dev128_phase_enter_ns)
+        phase_age_ns = now - g_m14_dev128_phase_enter_ns;
+
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 dev128 busy-due owner n=%llu phase=%u(%s) phase_age_us=%llu late_us=%llu pc=0x%08X lr=0x%08X msr=0x%08X downcount=%lld.",
+        (unsigned long long)count,
+        (unsigned)g_m14_dev128_phase_id,
+        bridge_m14_dev128_phase_name(g_m14_dev128_phase_id),
+        (unsigned long long)(phase_age_ns / UINT64_C(1000)),
+        (unsigned long long)(late_ns / UINT64_C(1000)),
+        (unsigned)instance->cpu.pc,
+        (unsigned)instance->cpu.lr,
+        (unsigned)instance->cpu.msr,
+        (long long)instance->cpu.downcount);
+    bridge_log_m14_retrace(instance, message);
+}
+
+static int bridge_m14_idle_runqueue_state(CPUState *cpu) {
+    uint32_t r13;
+    uint32_t address;
+    if (cpu == NULL || cpu->pc != OPENSPM_M14_SCHEDULER_IDLE_PC)
+        return -1;
+    r13 = (uint32_t)cpu->gpr[13];
+    if (r13 < OPENSPM_M14_DEV68_RUNQUEUE_BITS_DELTA) return -1;
+    address = r13 - OPENSPM_M14_DEV68_RUNQUEUE_BITS_DELTA;
+    if ((address & 3u) != 0u ||
+        !bridge_m14_context_address_valid(cpu, address, 4u)) return -1;
+    return mem_read32(cpu, address) != 0u ? 1 : 0;
+}
+
+static int bridge_m14_idle_has_runnable(CPUState *cpu) {
+    return bridge_m14_idle_runqueue_state(cpu) > 0;
+}
+#endif
+
+/* Deliver at most one fixed-rate simulation retrace per host deadline. Do not
+   catch up a backlog after a stall: that would silently speed simulation. The
+   persistent native path arms this clock only after SPM first reaches its real
+   no-runnable-thread scheduler idle, proving OS/VI initialization is complete.
+
+   Return 1 through out_idle_wait when the scheduler is idle but the next tick
+   is not due. LLVM additionally checks the live run queue: a device event may
+   have made a thread runnable without changing the persistent idle PC. The
+   caller yields only for a real idle wait instead of charging the guest spin. */
+static int bridge_m14_service_retrace(openspm_bridge_instance *instance,
+                                      int *out_idle_wait) {
+    uint64_t now;
+    uint32_t current_context;
+    uint32_t args[OPENSPM_M14_HOSTCALL_MAX_EVENT_ARGS] = {0};
+    int result;
+
+    if (out_idle_wait != NULL) *out_idle_wait = 0;
+    if (instance == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+
+    now = bridge_m14_now_ns(instance);
+    if (!g_m14_retrace_armed) {
+        if (instance->cpu.pc != OPENSPM_M14_SCHEDULER_IDLE_PC)
+            return OPENSPM_OK;
+        if (now == 0u) {
+            bridge_log_m14_retrace(instance,
+                "M14 native retrace could not arm: host monotonic clock unavailable");
+            return OPENSPM_ERROR_UNSUPPORTED;
+        }
+        g_m14_retrace_armed = 1u;
+        g_m14_retrace_ticks = 0u;
+        g_m14_next_retrace_ns = now + OPENSPM_M14_RETRACE_PERIOD_NS;
+        if (g_m14_dev132_half_monitor_cadence) {
+            bridge_log_m14_retrace(instance,
+                "M14 dev132 diagnostic cadence active: VI period=20011407ns (~49.9715 Hz), exactly half of player-reported 99.943 Hz monitor rate; gameplay is intentionally ~16.7% slow for cadence diagnosis only.");
+        } else if (g_m14_display_synced_period_ns != 0u) {
+            char message[224];
+            (void)snprintf(message, sizeof(message),
+                           "M14 native retrace armed at Revolution OS scheduler idle (display-locked vanilla clock: period=%lluns, %.4f Hz)",
+                           (unsigned long long)g_m14_display_synced_period_ns,
+                           1.0e9 / (double)g_m14_display_synced_period_ns);
+            bridge_log_m14_retrace(instance, message);
+        } else {
+            bridge_log_m14_retrace(instance,
+                "M14 native retrace armed at Revolution OS scheduler idle (60 Hz simulation clock)");
+        }
+#ifdef DOLRECOMP_BACKEND_LLVM
+        if (bridge_m14_dev118_precise_wait_enabled()) {
+            bridge_log_m14_retrace(instance,
+                "M14 dev118 precise idle-wait A/B enabled: fixed VI deadline unchanged; Sleep(1) remains when >2ms early and final <=2ms idle polls use Sleep(0).");
+            if (bridge_m14_dev126_final_spin_enabled()) {
+                bridge_log_m14_retrace(instance,
+                    "M14 dev126 final-idle-spin A/B active: while Nintendo scheduler is truly idle, the final <=2ms before the fixed VI deadline spins with YieldProcessor instead of issuing repeated Sleep(0) yields.");
+            }
+        }
+#endif
+    }
+
+    if (now == 0u) return OPENSPM_ERROR_UNSUPPORTED;
+    if (now < g_m14_next_retrace_ns) {
+        if (instance->cpu.pc == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+#ifdef DOLRECOMP_BACKEND_LLVM
+            if (bridge_m14_idle_has_runnable(&instance->cpu)) {
+                ++g_m14_dev68_runnable_resumes;
+                if (g_m14_dev68_runnable_resumes <= 8u) {
+                    char message[256];
+                    (void)snprintf(message, sizeof(message),
+                        "M14 LLVM dev68 runnable idle resume #%llu runq=0x%08X next_retrace_us=%llu; native SelectThread resumes without waiting for VI.",
+                        (unsigned long long)g_m14_dev68_runnable_resumes,
+                        (unsigned)mem_read32(&instance->cpu,
+                            (uint32_t)instance->cpu.gpr[13] -
+                            OPENSPM_M14_DEV68_RUNQUEUE_BITS_DELTA),
+                        (unsigned long long)((g_m14_next_retrace_ns - now) / 1000u));
+                    bridge_log_m14_retrace(instance, message);
+                }
+                return OPENSPM_OK;
+            }
+            bridge_m14_dev118_note_idle_ready(now);
+            ++g_m14_dev68_idle_polls;
+#endif
+            /* Turbo unlimited: no host wait, deliver the retrace now. */
+            if (bridge_m14_clock_skip_to(instance, g_m14_next_retrace_ns, &now))
+                goto m14_retrace_due;
+            if (out_idle_wait != NULL) *out_idle_wait = 1;
+#ifdef _WIN32
+            /* Re-check the exact monotonic deadline on the next native slice.
+               dev118 keeps the historical millisecond sleep when comfortably
+               early, but avoids asking Windows for another 1 ms once the fixed
+               VI deadline is <=2 ms away. */
+#ifdef DOLRECOMP_BACKEND_LLVM
+            {
+                const uint64_t deadline = g_m14_next_retrace_ns;
+                const uint64_t remaining =
+                    deadline > now ? deadline - now : 0u;
+                uint64_t after;
+                if (bridge_m14_dev118_precise_wait_enabled() &&
+                    remaining <= OPENSPM_M14_DEV118_FINE_WAIT_NS) {
+                    if (bridge_m14_dev126_final_spin_enabled()) {
+                        after = now;
+                        while (after != 0u && after < deadline) {
+                            YieldProcessor();
+                            after = bridge_m14_now_ns(instance);
+                        }
+                    } else {
+                        ++g_m14_dev118_pacing.yield0_calls;
+                        Sleep(0u);
+                        after = bridge_m14_now_ns(instance);
+                    }
+                } else {
+                    ++g_m14_dev118_pacing.sleep1_calls;
+                    Sleep(1u);
+                    after = bridge_m14_now_ns(instance);
+                }
+                if (after >= now) g_m14_dev68_idle_sleep_ns += after - now;
+                if (deadline != 0u && after > deadline) {
+                    const uint64_t overshoot = after - deadline;
+                    ++g_m14_dev118_pacing.sleep_crossings;
+                    if (overshoot > g_m14_dev118_pacing.sleep_overshoot_max_ns)
+                        g_m14_dev118_pacing.sleep_overshoot_max_ns = overshoot;
+                }
+            }
+#else
+            Sleep(1u);
+#endif
+#endif
+        }
+        return OPENSPM_OK;
+    }
+
+m14_retrace_due:
+    /* External interrupts are deferred while Nintendo code has MSR[EE] clear.
+       Keep the deadline pending; the next safepoint after OSEnableInterrupts
+       will deliver it. */
+    if ((instance->cpu.msr & OPENSPM_M14_MSR_EE) == 0u) return OPENSPM_OK;
+
+    if (!g_m14_finish_before_retrace_checked) {
+        char value[16];
+        g_m14_finish_before_retrace_checked = 1u;
+        g_m14_finish_before_retrace_disabled =
+            bridge_m14_read_env("OPENSPM_M14_FINISH_BEFORE_RETRACE", value, sizeof(value)) &&
+            (strcmp(value, "0") == 0 || strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0);
+    }
+    if (!g_m14_finish_before_retrace_disabled &&
+        g_m14_pre_retrace_finish_hook != NULL &&
+        instance->cpu.pc == OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        g_m14_pre_retrace_finish_hook(instance)) {
+        ++g_m14_finish_before_retrace;
+        if (g_m14_finish_before_retrace == 1u) {
+            bridge_log_m14_retrace(instance,
+                "M14 GPU-finish-before-retrace ordering active: a completed DrawDone was pending at a due VI deadline; delivered PE-finish first and held the retrace for the next idle service.");
+        }
+        return OPENSPM_OK;
+    }
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (!g_m14_finish_before_retrace_disabled && g_m14_finish_since_retrace &&
+        instance->cpu.pc == OPENSPM_M14_SCHEDULER_IDLE_PC &&
+        bridge_m14_idle_has_runnable(&instance->cpu)) {
+        const uint64_t late = now - g_m14_next_retrace_ns;
+        if (late < OPENSPM_M14_FINISH_HOLD_MAX_NS) {
+            if (g_m14_finish_since_retrace == 1u) {
+                g_m14_finish_since_retrace = 2u; /* count once per deadline */
+                ++g_m14_finish_holds;
+                if (g_m14_finish_holds == 1u) {
+                    bridge_log_m14_retrace(instance,
+                        "M14 finish-to-retrace hold active: DrawDone completion woke the main thread at a due VI deadline; letting it reach VIWaitForRetrace before delivering the retrace (bounded 4 ms, deadline grid unchanged).");
+                }
+            }
+            if (late > g_m14_finish_hold_max_ns) g_m14_finish_hold_max_ns = late;
+            return OPENSPM_OK;
+        }
+        ++g_m14_finish_hold_expired;
+    }
+#endif
+
+    current_context = mem_read32(&instance->cpu, OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (current_context == 0u) {
+        bridge_log_m14_retrace(instance,
+            "M14 native retrace has no guest OS_CURRENT_CONTEXT");
+        return OPENSPM_ERROR_RUNTIME;
+    }
+
+    g_m14_last_event_transfer_context = 0u;
+    g_m14_last_event_transfer_pc = 0u;
+    args[0] = OPENSPM_M14_VI_INTERRUPT;
+    args[1] = current_context;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (g_m14_dev118_pacing.idle_epoch_deadline_ns != g_m14_next_retrace_ns)
+        bridge_m14_dev128_log_busy_due(instance, now);
+    bridge_m14_dev118_note_delivery_begin(now);
+#endif
+    result = bridge_run_m14_event(instance,
+                                  OPENSPM_M14_VI_RETRACE_HANDLER,
+                                  2u, args);
+#ifdef DOLRECOMP_BACKEND_LLVM
+    bridge_m14_dev118_note_delivery_end(bridge_m14_now_ns(instance));
+#endif
+    if (result != OPENSPM_OK) {
+        bridge_log_m14_retrace(instance,
+            "M14 native retrace handler failed before returning/resuming guest context");
+        return result;
+    }
+
+    ++g_m14_retrace_ticks;
+    g_m14_finish_since_retrace = 0u;
+    /* No catch-up burst. Anchor the next simulation tick to delivery time. */
+    now = bridge_m14_now_ns(instance);
+    if (now == 0u) return OPENSPM_ERROR_UNSUPPORTED;
+    g_m14_next_retrace_ns = now + OPENSPM_M14_RETRACE_PERIOD_NS;
+
+    if (g_m14_last_event_transfer_context != 0u) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 native retrace scheduler transfer context=0x%08X pc=0x%08X",
+                       (unsigned)g_m14_last_event_transfer_context,
+                       (unsigned)g_m14_last_event_transfer_pc);
+        bridge_log_m14_retrace(instance, message);
+    }
+
+    if (bridge_m14_should_log_tick(g_m14_retrace_ticks)) {
+        char message[192];
+        (void)snprintf(message, sizeof(message),
+                       "M14 native retrace #%u delivered handler=0x%08X context=0x%08X",
+                       (unsigned)g_m14_retrace_ticks,
+                       (unsigned)OPENSPM_M14_VI_RETRACE_HANDLER,
+                       (unsigned)current_context);
+        bridge_log_m14_retrace(instance, message);
+    }
+    return OPENSPM_OK;
+}
+
+static int bridge_query_m14_hostcall(const openspm_native_runtime_api *runtime) {
+    const openspm_host_api *host;
+    int result;
+
+    memset(&g_m14_hostcall, 0, sizeof(g_m14_hostcall));
+    g_m14_have_hostcall = 0u;
+    if (runtime == NULL || runtime->host == NULL) return OPENSPM_ERROR_NOT_FOUND;
+    host = runtime->host;
+    if (host->query_service == NULL ||
+        (host->capabilities & OPENSPM_HOST_CAP_SERVICE_QUERY) == 0u) {
+        return OPENSPM_ERROR_NOT_FOUND;
+    }
+
+    g_m14_hostcall.header.struct_size = sizeof(g_m14_hostcall);
+    g_m14_hostcall.header.abi_version = OPENSPM_ABI_VERSION;
+    result = host->query_service(host->context,
+                                 OPENSPM_M14_HOSTCALL_SERVICE_ID,
+                                 OPENSPM_M14_HOSTCALL_SERVICE_VERSION,
+                                 &g_m14_hostcall);
+    if (result == OPENSPM_OK && g_m14_hostcall.handle != NULL) {
+        g_m14_have_hostcall = 1u;
+        return OPENSPM_OK;
+    }
+    memset(&g_m14_hostcall, 0, sizeof(g_m14_hostcall));
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create_v7(const openspm_native_runtime_api *runtime,
+                                         const openspm_launch_desc *launch,
+                                         void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result = bridge_create_v6(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    /* Install the classifier even if the backend service is unavailable. In
+       that case a known host target still becomes an explicit fail-closed
+       detail-12 exit rather than silently running the Wii implementation. */
+    instance->cpu.host_call = bridge_host_call_v7;
+
+    g_m14_retrace_armed = 0u;
+    g_m14_retrace_ticks = 0u;
+    g_m14_next_retrace_ns = 0u;
+    g_m14_dev132_cadence_checked = 0u;
+    g_m14_dev132_half_monitor_cadence = 0u;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    memset(&g_m14_dev118_pacing, 0, sizeof(g_m14_dev118_pacing));
+    g_m14_dev128_phase_id = UINT32_MAX;
+    g_m14_dev128_phase_enter_ns = 0u;
+    g_m14_dev128_busy_due_count = 0u;
+    g_m14_dev129_empty_idle_sideexits = 0u;
+    g_m14_dev129_runnable_idle_native = 0u;
+    g_m14_dev129_unknown_idle_native = 0u;
+#endif
+    g_m14_last_event_transfer_context = 0u;
+    g_m14_last_event_transfer_pc = 0u;
+
+    /* Optional while migration is incomplete: an unavailable service simply
+       leaves hosted functions as explicit fallback exits instead of guessing. */
+    (void)bridge_query_m14_hostcall(runtime);
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_run_v7(void *opaque,
+                                      uint64_t soft_cycle_budget,
+                                      openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint64_t requested = soft_cycle_budget ? soft_cycle_budget : OPENSPM_BRIDGE_DEFAULT_BUDGET;
+    uint64_t total_cycles = 0u;
+    uint32_t hostcalls = 0u;
+    int result;
+    int idle_wait = 0;
+
+    if (instance == NULL || out_exit == NULL) return OPENSPM_ERROR_INVALID_ARGUMENT;
+
+    /* Host-native timing is serviced only at coarse native safepoints; ordinary
+       game-to-game calls remain direct. When SelectThread is truly idle, yield
+       instead of re-running its spin and charging fake guest cycles. */
+    result = bridge_m14_service_retrace(instance, &idle_wait);
+    if (result != OPENSPM_OK) return result;
+    if (idle_wait) {
+        memset(out_exit, 0, sizeof(*out_exit));
+        out_exit->header.struct_size = sizeof(*out_exit);
+        out_exit->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+        out_exit->reason = OPENSPM_NATIVE_EXIT_SAFEPOINT;
+        out_exit->source_address = instance->cpu.pc;
+        out_exit->guest_cycles = 0u;
+        return OPENSPM_OK;
+    }
+
+    for (;;) {
+        openspm_native_exit segment;
+        uint64_t remaining = total_cycles < requested ? requested - total_cycles : 1u;
+        memset(&segment, 0, sizeof(segment));
+        segment.header.struct_size = sizeof(segment);
+        segment.header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+
+        result = bridge_run(opaque, remaining, &segment);
+        if (result != OPENSPM_OK) return result;
+        total_cycles += segment.guest_cycles;
+
+        /* bridge_run intentionally surfaces guest exceptions at a coarse
+           safepoint. Consume only the two architectural exceptions whose
+           native behavior is already defined above; all others remain visible
+           to the backend and fail closed. */
+        if (segment.reason == OPENSPM_NATIVE_EXIT_FALLBACK_REQUIRED &&
+            segment.detail == OPENSPM_M14_DEV129_IDLE_PARK_DETAIL &&
+            (uint32_t)segment.source_address == OPENSPM_M14_SCHEDULER_IDLE_PC) {
+            memset(out_exit, 0, sizeof(*out_exit));
+            out_exit->header.struct_size = sizeof(*out_exit);
+            out_exit->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+            out_exit->reason = OPENSPM_NATIVE_EXIT_SAFEPOINT;
+            out_exit->source_address = OPENSPM_M14_SCHEDULER_IDLE_PC;
+            out_exit->guest_cycles = total_cycles;
+            return OPENSPM_OK;
+        }
+
+        if (segment.reason == OPENSPM_NATIVE_EXIT_SAFEPOINT &&
+            segment.detail != 0u &&
+            bridge_resume_m14_exception(&instance->cpu)) {
+            if (total_cycles < requested) continue;
+
+            memset(out_exit, 0, sizeof(*out_exit));
+            out_exit->header.struct_size = sizeof(*out_exit);
+            out_exit->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+            out_exit->reason = OPENSPM_NATIVE_EXIT_SAFEPOINT;
+            out_exit->source_address = instance->cpu.pc;
+            out_exit->guest_cycles = total_cycles;
+            return OPENSPM_OK;
+        }
+
+        if (segment.reason == OPENSPM_NATIVE_EXIT_FALLBACK_REQUIRED &&
+            segment.detail == 12u && g_m14_have_hostcall &&
+            hostcalls < OPENSPM_M14_MAX_HOSTCALLS_PER_RUN) {
+            openspm_m14_hostcall_state state;
+            bridge_to_m14_hostcall_state(instance, &state);
+            result = g_m14_hostcall.handle(g_m14_hostcall.context,
+                                           (uint32_t)segment.source_address,
+                                           &state);
+            if (result == OPENSPM_OK) {
+                bridge_from_m14_hostcall_state(instance, &state);
+                ++hostcalls;
+
+                if (state.event_target == OPENSPM_M14_HOOK_CONTINUE_ORIGINAL) {
+                    bridge_m14_hook_arm_bypass(&state);
+                } else if (state.event_target != 0u) {
+                    result = bridge_run_m14_event(instance,
+                                                  state.event_target,
+                                                  state.event_argc,
+                                                  state.event_args);
+                    if (result != OPENSPM_OK) return result;
+                }
+
+                if (total_cycles < requested) continue;
+
+                memset(out_exit, 0, sizeof(*out_exit));
+                out_exit->header.struct_size = sizeof(*out_exit);
+                out_exit->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+                out_exit->reason = OPENSPM_NATIVE_EXIT_SAFEPOINT;
+                out_exit->source_address = instance->cpu.pc;
+                out_exit->guest_cycles = total_cycles;
+                return OPENSPM_OK;
+            }
+            if (result != OPENSPM_ERROR_NOT_FOUND && result != OPENSPM_ERROR_UNSUPPORTED)
+                return result;
+        }
+
+        *out_exit = segment;
+        out_exit->guest_cycles = total_cycles;
+        return OPENSPM_OK;
+    }
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev8_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev15";
+    out_api->create = bridge_create_v7;
+    out_api->run = bridge_run_v7;
+    return OPENSPM_OK;
+}

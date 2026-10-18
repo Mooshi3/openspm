@@ -1,0 +1,20 @@
+; OpenSPM-authored import list for the freestanding player-local module.
+;   llvm-dlltool -m i386:x86-64 -d m14_freestanding_kernel32.def -l kernel32.lib
+; Names only (documented kernel32.dll export names); no Windows SDK content.
+; Must list exactly the kernel32 calls declared in m14_freestanding_crt.h.
+LIBRARY kernel32.dll
+EXPORTS
+AddVectoredExceptionHandler
+CloseHandle
+CreateEventW
+CreateThread
+GetCurrentThreadId
+GetEnvironmentVariableA
+GetModuleHandleA
+GetModuleHandleExW
+GetProcAddress
+RemoveVectoredExceptionHandler
+SetEvent
+Sleep
+VirtualQuery
+WaitForSingleObject

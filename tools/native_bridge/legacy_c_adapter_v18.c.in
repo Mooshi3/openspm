@@ -1,0 +1,257 @@
+/*
+ * M14 local-module bridge v18 / LLVM live-frontier diagnostics.
+ *
+ * The first Broadway-SPR-parity run no longer faults, but can leave the Windows
+ * window black and unresponsive while the old v6 diagnostic thread keeps
+ * reporting one materialized CPUState PC. LLVM only writes CPUState.pc at
+ * architectural/materialization boundaries, so that value can be stale while a
+ * native region or helper owns the main thread.
+ *
+ * Wrap the existing v17 host-call chain without changing guest behavior. Record
+ * the most recent native-region [start,end) query and ordinary host-call target,
+ * then replace only v6's Windows heartbeat thread with a richer sampler. If the
+ * query counter keeps advancing, the guest is repeatedly side-exiting/re-entering
+ * near the reported frontier. If it stops, execution is trapped inside the last
+ * queried native region/helper. This deliberately avoids per-basic-block logging
+ * or changing the LLVM budget policy before we know which case is real.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev26_llvm_frontier_base
+#include "legacy_c_adapter_v17.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_v26_underlying_create;
+static openspm_native_destroy_fn g_m14_v26_underlying_destroy;
+static PPCHostCall g_m14_v26_underlying_host_call;
+
+#ifdef _WIN32
+static volatile LONG g_m14_v26_region_queries;
+static volatile LONG g_m14_v26_region_start;
+static volatile LONG g_m14_v26_region_end;
+static volatile LONG g_m14_v26_last_hostcall;
+
+static uint32_t bridge_v26_atomic_long(volatile LONG *value) {
+    return (uint32_t)InterlockedCompareExchange(value, 0, 0);
+}
+
+/* R8PE01 rev 2: OSPanic (0x8019D924) formats its message (file, line, text
+   and a stack trace) into a 2 KB buffer at r1 + 120 of its own frame, then
+   halts in the loop at 0x8019DA5C. The buffer is still there while the game
+   sits in that loop: log it once, so a crash log says which check failed. */
+#define BRIDGE_V26_PANIC_HALT_LR 0x8019DA5Cu
+#define BRIDGE_V26_PANIC_TEXT_OFFSET 120u
+#define BRIDGE_V26_PANIC_TEXT_SIZE 2048u
+
+static void bridge_v26_log_panic(openspm_bridge_instance *instance, const openspm_host_api *host) {
+    const openspm_native_runtime_api *runtime = instance->runtime;
+    const uint32_t sp = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.gpr[1]);
+    const uint32_t text = sp + BRIDGE_V26_PANIC_TEXT_OFFSET;
+    char line[300];
+    uint32_t i, used = 0u, lines = 0u;
+    if (runtime->mem1 == NULL || text < 0x80000000u ||
+        (uint64_t)(text - 0x80000000u) + BRIDGE_V26_PANIC_TEXT_SIZE > runtime->mem1_size) {
+        (void)snprintf(line, sizeof line, "OpenSPM: the game stopped in OSPanic (stack 0x%08X: message not readable).",
+                       (unsigned)sp);
+        host->log(host->context, OPENSPM_LOG_ERROR, line);
+        return;
+    }
+    host->log(host->context, OPENSPM_LOG_ERROR, "OpenSPM: the game stopped in OSPanic (a game check failed):");
+    for (i = 0u; i < BRIDGE_V26_PANIC_TEXT_SIZE && lines < 24u; ++i) {
+        const uint8_t ch = runtime->mem1[text - 0x80000000u + i];
+        if (ch == 0u || ch == '\n' || used + 1u >= sizeof line - 16u) {
+            if (used != 0u) {
+                line[used] = '\0';
+                host->log(host->context, OPENSPM_LOG_ERROR, line);
+                ++lines;
+            }
+            used = 0u;
+            if (ch == 0u) break;
+            if (ch == '\n') continue;
+        }
+        if (used == 0u) {
+            memcpy(line, "OpenSPM panic: ", 15u);
+            used = 15u;
+        }
+        line[used++] = (ch >= 0x20u && ch < 0x7Fu) ? (char)ch : '?';
+    }
+}
+
+static DWORD WINAPI bridge_diag_thread_v26(LPVOID parameter) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)parameter;
+    uint32_t heartbeat = 0u;
+    uint32_t previous_queries = UINT32_MAX;
+    int panic_logged = 0;
+
+    while (g_m14_diag_stop != NULL &&
+           WaitForSingleObject(g_m14_diag_stop, 1000u) == WAIT_TIMEOUT) {
+        const openspm_host_api *host;
+        uint32_t pc;
+        uint32_t lr;
+        uint32_t ctr;
+        uint32_t msr;
+        uint32_t exception;
+        uint32_t program_exception;
+        uint32_t wg;
+        uint32_t queries;
+        uint32_t region_start;
+        uint32_t region_end;
+        uint32_t last_hostcall;
+        uint32_t stationary;
+        char message[512];
+
+        if (instance == NULL || instance != g_m14_diag_instance ||
+            instance->runtime == NULL) continue;
+        host = instance->runtime->host;
+        if (host == NULL || host->log == NULL) continue;
+
+        pc = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.pc);
+        lr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.lr);
+        ctr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.ctr);
+        msr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.msr);
+        exception = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.exception);
+        program_exception = bridge_atomic_u32_v6(
+            (volatile u32 *)&instance->cpu.program_exception);
+        wg = (uint32_t)InterlockedCompareExchange(&g_m14_wg_diag_writes, 0, 0);
+        queries = bridge_v26_atomic_long(&g_m14_v26_region_queries);
+        region_start = bridge_v26_atomic_long(&g_m14_v26_region_start);
+        region_end = bridge_v26_atomic_long(&g_m14_v26_region_end);
+        last_hostcall = bridge_v26_atomic_long(&g_m14_v26_last_hostcall);
+        stationary = previous_queries != UINT32_MAX && previous_queries == queries;
+        previous_queries = queries;
+        ++heartbeat;
+
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "M14 LLVM frontier heartbeat #%u pc=0x%08X lr=0x%08X ctr=0x%08X msr=0x%08X exc=0x%08X program=0x%08X wg=%u region_queries=%u region=[0x%08X,0x%08X) last_hostcall=0x%08X query_stationary=%u",
+            (unsigned)heartbeat,
+            (unsigned)pc,
+            (unsigned)lr,
+            (unsigned)ctr,
+            (unsigned)msr,
+            (unsigned)exception,
+            (unsigned)program_exception,
+            (unsigned)wg,
+            (unsigned)queries,
+            (unsigned)region_start,
+            (unsigned)region_end,
+            (unsigned)last_hostcall,
+            (unsigned)stationary);
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+        if (!panic_logged && lr == BRIDGE_V26_PANIC_HALT_LR && stationary) {
+            panic_logged = 1;
+            bridge_v26_log_panic(instance, host);
+        }
+    }
+    return 0u;
+}
+
+static void bridge_start_diag_v26(openspm_bridge_instance *instance) {
+    /* v6 already started its legacy heartbeat during the inherited create
+       chain. Replace that thread in-place while retaining its module-scoped VEH
+       capture and teardown globals. */
+    bridge_stop_diag_v6();
+    g_m14_diag_instance = instance;
+
+    (void)GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)(const void *)&g_m14_diag_instance,
+        &g_m14_diag_module);
+    if (g_m14_diag_module != NULL) {
+        g_m14_diag_veh = AddVectoredExceptionHandler(1u,
+                                                     bridge_diag_exception_v6);
+    }
+
+    g_m14_diag_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_m14_diag_stop == NULL) {
+        bridge_stop_diag_v6();
+        return;
+    }
+    g_m14_diag_thread = CreateThread(NULL, 0u, bridge_diag_thread_v26,
+                                     instance, 0u, NULL);
+    if (g_m14_diag_thread == NULL) bridge_stop_diag_v6();
+}
+#endif
+
+static bool bridge_host_call_v26(CPUState *cpu, u32 address) {
+#ifdef _WIN32
+    if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY && cpu != NULL) {
+        InterlockedExchange(&g_m14_v26_region_start,
+                            (LONG)(uint32_t)cpu->external_addr);
+        InterlockedExchange(&g_m14_v26_region_end,
+                            (LONG)(uint32_t)cpu->external_value);
+        InterlockedIncrement(&g_m14_v26_region_queries);
+    } else {
+        InterlockedExchange(&g_m14_v26_last_hostcall, (LONG)(uint32_t)address);
+    }
+#endif
+    return g_m14_v26_underlying_host_call != NULL
+               ? g_m14_v26_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v26(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_v26_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v26_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v26_underlying_host_call = instance->cpu.host_call;
+#ifdef _WIN32
+    InterlockedExchange(&g_m14_v26_region_queries, 0);
+    InterlockedExchange(&g_m14_v26_region_start, 0);
+    InterlockedExchange(&g_m14_v26_region_end, 0);
+    InterlockedExchange(&g_m14_v26_last_hostcall, 0);
+#endif
+    instance->cpu.host_call = bridge_host_call_v26;
+#ifdef _WIN32
+    bridge_start_diag_v26(instance);
+#endif
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v26(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+#ifdef _WIN32
+    bridge_stop_diag_v6();
+#endif
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v26_underlying_host_call;
+    if (g_m14_v26_underlying_destroy != NULL)
+        g_m14_v26_underlying_destroy(opaque);
+    g_m14_v26_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev26_llvm_frontier_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v26_underlying_create = out_api->create;
+    g_m14_v26_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev27-llvm-live-frontier";
+    out_api->create = bridge_create_v26;
+    out_api->destroy = bridge_destroy_v26;
+#endif
+    return OPENSPM_OK;
+}

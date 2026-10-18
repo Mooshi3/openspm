@@ -1,0 +1,217 @@
+/*
+ * M14 local-module bridge v20 / first DSP-task init completion.
+ *
+ * The CPU->DSP mailbox acceptance fix moved LLVM past __DSP_boot_task's
+ * mailbox-send waits.  Live-frontier telemetry now reaches the higher-level
+ * JAudio/Revolution DSP bootstrap wait at 0x802871E4.  The guest has inserted
+ * its first DSPTaskInfo and sent the complete boot command stream, then waits
+ * for that task's init callback to set the small-data completion flag.
+ *
+ * On real Wii hardware DSP microcode eventually raises mail 0xDCD10000.  The
+ * SDK __DSPHandler responds by setting __DSP_curr_task->state=RUN and invoking
+ * __DSP_curr_task->init_cb(task).  OpenSPM deliberately does not execute
+ * Nintendo DSP microcode, so no device exists to originate that mail/IRQ.
+ *
+ * Reproduce only the two architectural effects of that proven first INIT event
+ * at the exact caller continuation.  Fail closed unless all player-owned R8PE01
+ * signatures still match: wait-loop instructions, task descriptor shape,
+ * callback pointer, callback instructions and zero completion flag.  The init
+ * callback at 0x802870A8 is exactly `li r0,1; stw r0,-0x7070(r13); blr`, so
+ * writing the same flag after marking the task RUN is byte-for-byte equivalent
+ * to executing the callback, without recursively entering DolRecomp from its
+ * low-level host_call callback.
+ *
+ * This is LLVM-only migration scaffolding.  The generated-C rollback authority
+ * is intentionally untouched.  In particular, the historical 0x8028987C host
+ * target is now known to be misclassified: retail R8PE01 contains
+ * DSPCheckMailFromDSP there, not GX write-gather setup.  Do not remove that
+ * shared target until the known-good C path has an A/B proving it does not rely
+ * on the old no-op while OpenSPM has no DSP microcode implementation.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev28_rvl_cold_resume_base
+#include "legacy_c_adapter_v19.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_DSP_TASK_WAIT_PC       UINT32_C(0x802871E4)
+#define OPENSPM_M14_DSP_TASK_ADDRESS       UINT32_C(0x80511700)
+#define OPENSPM_M14_DSP_TASK_STATE_OFFSET  UINT32_C(0x00)
+#define OPENSPM_M14_DSP_TASK_PRIORITY_OFF  UINT32_C(0x04)
+#define OPENSPM_M14_DSP_TASK_FLAGS_OFFSET  UINT32_C(0x08)
+#define OPENSPM_M14_DSP_TASK_DRAM_ADDR_OFF UINT32_C(0x20)
+#define OPENSPM_M14_DSP_TASK_INIT_CB_OFF   UINT32_C(0x28)
+#define OPENSPM_M14_DSP_TASK_INIT_CB       UINT32_C(0x802870A8)
+#define OPENSPM_M14_DSP_TASK_STATE_INIT    UINT32_C(0)
+#define OPENSPM_M14_DSP_TASK_STATE_RUN     UINT32_C(1)
+#define OPENSPM_M14_DSP_TASK_FLAG_ATTACHED UINT32_C(1)
+#define OPENSPM_M14_DSP_TASK_DRAM_ADDR     UINT32_C(0x00000CD2)
+#define OPENSPM_M14_DSP_WAIT_DISPLACEMENT  UINT32_C(0x00007070)
+
+/* Exact R8PE01 instruction signatures from the verified player main.dol. */
+#define OPENSPM_M14_DSP_WAIT_LWZ           UINT32_C(0x800D8F90)
+#define OPENSPM_M14_DSP_WAIT_CMPWI         UINT32_C(0x2C000000)
+#define OPENSPM_M14_DSP_WAIT_BEQ           UINT32_C(0x4182FFF8)
+#define OPENSPM_M14_DSP_INIT_LI            UINT32_C(0x38000001)
+#define OPENSPM_M14_DSP_INIT_STW           UINT32_C(0x900D8F90)
+#define OPENSPM_M14_DSP_INIT_BLR           UINT32_C(0x4E800020)
+
+static openspm_native_create_fn g_m14_v29_underlying_create;
+static openspm_native_destroy_fn g_m14_v29_underlying_destroy;
+static PPCHostCall g_m14_v29_underlying_host_call;
+static uint32_t g_m14_v29_dsp_attempted;
+static uint32_t g_m14_v29_dsp_completed;
+static uint32_t g_m14_v29_dsp_mismatch_logged;
+
+static void bridge_v29_log(openspm_bridge_instance *instance,
+                           openspm_log_level level,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, level, message);
+}
+
+static int bridge_v29_dsp_signature_matches(CPUState *cpu,
+                                            uint32_t *out_wait_flag) {
+    uint32_t wait_flag;
+
+    if (cpu == NULL || out_wait_flag == NULL) return 0;
+    if (!bridge_m14_context_address_valid(cpu, OPENSPM_M14_DSP_TASK_WAIT_PC, 12u) ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_DSP_TASK_ADDRESS, 44u) ||
+        !bridge_m14_context_address_valid(cpu, OPENSPM_M14_DSP_TASK_INIT_CB, 12u)) {
+        return 0;
+    }
+
+    wait_flag = (uint32_t)cpu->gpr[13] - OPENSPM_M14_DSP_WAIT_DISPLACEMENT;
+    if (!bridge_m14_context_address_valid(cpu, wait_flag, 4u)) return 0;
+
+    if (mem_read32(cpu, OPENSPM_M14_DSP_TASK_WAIT_PC) != OPENSPM_M14_DSP_WAIT_LWZ ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_WAIT_PC + 4u) != OPENSPM_M14_DSP_WAIT_CMPWI ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_WAIT_PC + 8u) != OPENSPM_M14_DSP_WAIT_BEQ) {
+        return 0;
+    }
+    if (mem_read32(cpu, OPENSPM_M14_DSP_TASK_INIT_CB) != OPENSPM_M14_DSP_INIT_LI ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_INIT_CB + 4u) != OPENSPM_M14_DSP_INIT_STW ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_INIT_CB + 8u) != OPENSPM_M14_DSP_INIT_BLR) {
+        return 0;
+    }
+
+    if (mem_read32(cpu, OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_STATE_OFFSET) !=
+            OPENSPM_M14_DSP_TASK_STATE_INIT ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_PRIORITY_OFF) != 0u ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_FLAGS_OFFSET) !=
+            OPENSPM_M14_DSP_TASK_FLAG_ATTACHED ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_DRAM_ADDR_OFF) !=
+            OPENSPM_M14_DSP_TASK_DRAM_ADDR ||
+        mem_read32(cpu, OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_INIT_CB_OFF) !=
+            OPENSPM_M14_DSP_TASK_INIT_CB ||
+        mem_read32(cpu, wait_flag) != 0u) {
+        return 0;
+    }
+
+    *out_wait_flag = wait_flag;
+    return 1;
+}
+
+static void bridge_v29_try_complete_dsp_init(CPUState *cpu, uint32_t address) {
+    openspm_bridge_instance *instance;
+    uint32_t wait_flag = 0u;
+
+    if (cpu == NULL || address != OPENSPM_M14_DSP_TASK_WAIT_PC ||
+        g_m14_v29_dsp_attempted) {
+        return;
+    }
+    g_m14_v29_dsp_attempted = 1u;
+    instance = bridge_from_cpu(cpu);
+
+    if (!bridge_v29_dsp_signature_matches(cpu, &wait_flag)) {
+        if (!g_m14_v29_dsp_mismatch_logged) {
+            bridge_v29_log(
+                instance, OPENSPM_LOG_INFO,
+                "M14 LLVM DSP task-init completion refused: R8PE01 wait/task/callback signature changed; leaving guest behavior untouched.");
+            g_m14_v29_dsp_mismatch_logged = 1u;
+        }
+        return;
+    }
+
+    /* Exact SDK __DSPHandler case 0xDCD10000 for this first task:
+       state=RUN, then init_cb(task).  The verified callback performs only the
+       following wait-flag store, so reproduce those two memory effects. */
+    mem_write32(cpu,
+                OPENSPM_M14_DSP_TASK_ADDRESS + OPENSPM_M14_DSP_TASK_STATE_OFFSET,
+                OPENSPM_M14_DSP_TASK_STATE_RUN);
+    mem_write32(cpu, wait_flag, UINT32_C(1));
+    g_m14_v29_dsp_completed = 1u;
+    bridge_v29_log(
+        instance, OPENSPM_LOG_INFO,
+        "M14 LLVM DSP task-init semantic completion active: synthesized the first 0xDCD10000 SDK effect (task RUN + verified init_cb flag); Nintendo DSP microcode is not executed.");
+}
+
+static bool bridge_host_call_v29(CPUState *cpu, u32 address) {
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        bridge_v29_try_complete_dsp_init(cpu, (uint32_t)address);
+    return g_m14_v29_underlying_host_call != NULL
+               ? g_m14_v29_underlying_host_call(cpu, address)
+               : false;
+}
+
+static int OPENSPM_CALL bridge_create_v29(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_v29_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v29_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v29_underlying_host_call = instance->cpu.host_call;
+    g_m14_v29_dsp_attempted = 0u;
+    g_m14_v29_dsp_completed = 0u;
+    g_m14_v29_dsp_mismatch_logged = 0u;
+    instance->cpu.host_call = bridge_host_call_v29;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v29(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && g_m14_v29_dsp_completed) {
+        bridge_v29_log(instance, OPENSPM_LOG_INFO,
+                       "M14 LLVM DSP task-init semantic completion stats completed=1.");
+    }
+    if (instance != NULL)
+        instance->cpu.host_call = g_m14_v29_underlying_host_call;
+    if (g_m14_v29_underlying_destroy != NULL)
+        g_m14_v29_underlying_destroy(opaque);
+    g_m14_v29_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev28_rvl_cold_resume_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v29_underlying_create = out_api->create;
+    g_m14_v29_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev29-llvm-dsp-task-init";
+    out_api->create = bridge_create_v29;
+    out_api->destroy = bridge_destroy_v29;
+#endif
+    return OPENSPM_OK;
+}

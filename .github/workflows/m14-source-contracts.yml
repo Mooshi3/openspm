@@ -1,0 +1,56 @@
+name: M14 Source Contracts
+
+on:
+  push:
+    branches:
+      - m14-native-execution
+    paths:
+      - "tools/native_bridge/**"
+      - "backend/native/**"
+      - "renderer/aurora/**"
+      - "M14-*.cmd"
+      - ".github/workflows/m14-source-contracts.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m14-source-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-contracts:
+    name: Python/source-only contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile M14 Python tooling
+        run: |
+          python -m py_compile \
+            tools/native_bridge/analyze_m14_perf.py \
+            tools/native_bridge/analyze_yold_npc_sweep.py \
+            tools/native_bridge/analyze_yold_npc_groups.py \
+            tools/native_bridge/m14_debug_console.py \
+            tools/native_bridge/m14_debug_gui.py \
+            tools/native_bridge/generate_local_llvm.py \
+            tools/native_bridge/build_local_llvm_module.py \
+            tools/native_bridge/run_m14_llvm_candidate.py \
+            tools/native_bridge/test_llvm_native_pipeline.py
+
+      - name: Performance analyzer self-tests
+        run: |
+          python tools/native_bridge/analyze_m14_perf.py --self-test
+          python tools/native_bridge/analyze_yold_npc_sweep.py --self-test
+          python tools/native_bridge/analyze_yold_npc_groups.py --self-test
+
+      - name: Full M14 synthetic/source contracts
+        run: python tools/native_bridge/test_llvm_native_pipeline.py

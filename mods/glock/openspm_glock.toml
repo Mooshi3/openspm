@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_glock.dll in the mods folder.
+id = "openspm.sample.glock"
+name = "Glock"
+version = "1.0"
+author = "OpenSPM samples"
+description = "A Frackle partner with a Squirps-style blaster, as a Pixl (1 = arm / fire)."
+requires = ["openspm.guest_memory>=1", "openspm.guest_call>=1", "openspm.input>=1"]

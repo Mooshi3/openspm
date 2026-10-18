@@ -1,0 +1,2 @@
+M11B perf/QoL build trigger, attempt 3.
+Real Win32 OpenSPM aspect menu + portable fast-forward hold/toggle + runtime perf diagnostics.

@@ -1,0 +1,339 @@
+/*
+ * M14 generated-C bridge v6.
+ *
+ * Make the first real whole-DOL bring-up diagnostic useful: external-bus
+ * migration exits must identify the guest instruction that touched hardware,
+ * not overwrite source_address with the MMIO address.  The exact bus access is
+ * logged separately.  This keeps the public exit contract meaningful while we
+ * fill OpenSPM's Wii platform services one boundary at a time.
+ */
+
+#define bridge_create_v5 bridge_create_v5_dev7_internal
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev7_internal
+#include "legacy_c_adapter_v5.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+#undef bridge_create_v5
+
+#include <stdio.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+#define OPENSPM_M14_WGPIPE_BASE UINT32_C(0xCC008000)
+#define OPENSPM_M14_WGPIPE_SIZE UINT32_C(32)
+
+#ifdef _WIN32
+static volatile LONG g_m14_wg_diag_writes;
+static HANDLE g_m14_diag_thread;
+static HANDLE g_m14_diag_stop;
+static openspm_bridge_instance *g_m14_diag_instance;
+static PVOID g_m14_diag_veh;
+static HMODULE g_m14_diag_module;
+#else
+static uint32_t g_m14_wg_diag_writes;
+#endif
+
+static void bridge_log_bus_v6(openspm_bridge_instance *instance,
+                              const char *kind,
+                              uint32_t source_address,
+                              uint32_t bus_address,
+                              uint32_t width,
+                              uint64_t value,
+                              int service_result) {
+    const openspm_host_api *host;
+    char message[256];
+
+    if (instance == NULL || instance->runtime == NULL) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+
+    (void)snprintf(message, sizeof(message),
+                   "M14 Wii bus boundary: pc=0x%08X %s addr=0x%08X width=%u value=0x%016llX service=%d",
+                   (unsigned)source_address,
+                   kind != NULL ? kind : "access",
+                   (unsigned)bus_address,
+                   (unsigned)width,
+                   (unsigned long long)value,
+                   service_result);
+    host->log(host->context, OPENSPM_LOG_WARN, message);
+}
+
+static int bridge_should_log_wg(uint32_t ordinal) {
+    if (ordinal <= 16u) return 1;
+    return ordinal != 0u && (ordinal & (ordinal - 1u)) == 0u;
+}
+
+static void bridge_log_wg_v6(openspm_bridge_instance *instance,
+                             const char *phase,
+                             uint32_t ordinal,
+                             uint32_t source_address,
+                             uint32_t bus_address,
+                             uint32_t width,
+                             int service_result) {
+    const openspm_host_api *host;
+    char message[256];
+
+    if (instance == NULL || instance->runtime == NULL ||
+        !bridge_should_log_wg(ordinal)) return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+
+    (void)snprintf(message, sizeof(message),
+                   "M14 WG %s #%u pc=0x%08X addr=0x%08X width=%u service=%d",
+                   phase != NULL ? phase : "progress",
+                   (unsigned)ordinal,
+                   (unsigned)source_address,
+                   (unsigned)bus_address,
+                   (unsigned)width,
+                   service_result);
+    host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+#ifdef _WIN32
+static uint32_t bridge_atomic_u32_v6(volatile u32 *value) {
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)value, 0, 0);
+}
+
+/* The periodic heartbeat is intentionally only a sample. Once visible native
+   gameplay became possible, the process advanced for seconds after the first
+   GXDrawDone and then died without producing a guest migration/exception exit.
+   If an access violation or other host exception originates in this generated
+   player-local DLL, capture the exact contemporaneous guest frontier before
+   Windows unwinds it. Ignore first-chance exceptions from Aurora/Dawn/other
+   modules so their internal exception machinery remains untouched. */
+static LONG CALLBACK bridge_diag_exception_v6(EXCEPTION_POINTERS *info) {
+    EXCEPTION_RECORD *record;
+    MEMORY_BASIC_INFORMATION memory;
+    openspm_bridge_instance *instance;
+    const openspm_host_api *host;
+    uint32_t pc;
+    uint32_t lr;
+    uint32_t ctr;
+    uint32_t wg;
+    char message[320];
+
+    if (info == NULL || info->ExceptionRecord == NULL ||
+        info->ExceptionRecord->ExceptionAddress == NULL ||
+        g_m14_diag_module == NULL) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    record = info->ExceptionRecord;
+    memset(&memory, 0, sizeof(memory));
+    if (VirtualQuery(record->ExceptionAddress, &memory, sizeof(memory)) !=
+            sizeof(memory) ||
+        memory.AllocationBase != (void *)g_m14_diag_module) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    instance = g_m14_diag_instance;
+    if (instance == NULL || instance->runtime == NULL) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return EXCEPTION_CONTINUE_SEARCH;
+
+    pc = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.pc);
+    lr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.lr);
+    ctr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.ctr);
+    wg = (uint32_t)InterlockedCompareExchange(&g_m14_wg_diag_writes, 0, 0);
+    (void)snprintf(message, sizeof(message),
+                   "M14 generated-module host exception code=0x%08X host=%p guest_pc=0x%08X guest_lr=0x%08X guest_ctr=0x%08X wg_writes=%u thread=%lu",
+                   (unsigned)record->ExceptionCode,
+                   record->ExceptionAddress,
+                   (unsigned)pc,
+                   (unsigned)lr,
+                   (unsigned)ctr,
+                   (unsigned)wg,
+                   (unsigned long)GetCurrentThreadId());
+    host->log(host->context, OPENSPM_LOG_ERROR, message);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static DWORD WINAPI bridge_diag_thread_v6(LPVOID parameter) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)parameter;
+    uint32_t heartbeat = 0u;
+
+    while (g_m14_diag_stop != NULL &&
+           WaitForSingleObject(g_m14_diag_stop, 1000u) == WAIT_TIMEOUT) {
+        const openspm_host_api *host;
+        uint32_t pc;
+        uint32_t lr;
+        uint32_t wg;
+        char message[224];
+
+        if (instance == NULL || instance != g_m14_diag_instance ||
+            instance->runtime == NULL) continue;
+        host = instance->runtime->host;
+        if (host == NULL || host->log == NULL) continue;
+
+        /* Diagnostic-only concurrent snapshots. Interlocked reads keep these
+           32-bit migration fields coherent without changing the native CPU hot
+           path or making CPUState part of OpenSPM's public ABI. */
+        pc = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.pc);
+        lr = bridge_atomic_u32_v6((volatile u32 *)&instance->cpu.lr);
+        wg = (uint32_t)InterlockedCompareExchange(&g_m14_wg_diag_writes, 0, 0);
+        ++heartbeat;
+
+        (void)snprintf(message, sizeof(message),
+                       "M14 native heartbeat #%u pc=0x%08X lr=0x%08X wg_writes=%u",
+                       (unsigned)heartbeat, (unsigned)pc, (unsigned)lr,
+                       (unsigned)wg);
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+    }
+    return 0u;
+}
+
+static void bridge_stop_diag_v6(void) {
+    if (g_m14_diag_stop != NULL) SetEvent(g_m14_diag_stop);
+    if (g_m14_diag_thread != NULL) {
+        (void)WaitForSingleObject(g_m14_diag_thread, 2000u);
+        CloseHandle(g_m14_diag_thread);
+    }
+    if (g_m14_diag_stop != NULL) CloseHandle(g_m14_diag_stop);
+    if (g_m14_diag_veh != NULL) {
+        (void)RemoveVectoredExceptionHandler(g_m14_diag_veh);
+    }
+    g_m14_diag_thread = NULL;
+    g_m14_diag_stop = NULL;
+    g_m14_diag_instance = NULL;
+    g_m14_diag_veh = NULL;
+    g_m14_diag_module = NULL;
+}
+
+static void bridge_start_diag_v6(openspm_bridge_instance *instance) {
+    bridge_stop_diag_v6();
+    g_m14_diag_instance = instance;
+
+    /* FROM_ADDRESS treats lpModuleName as an arbitrary address. Use a static
+       object in this DLL rather than a function-pointer cast, keeping the C
+       build warning-free under MSVC. UNCHANGED_REFCOUNT avoids pinning the
+       player-local DLL after its normal destroy/unload path. */
+    (void)GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)(const void *)&g_m14_diag_instance,
+        &g_m14_diag_module);
+    if (g_m14_diag_module != NULL) {
+        g_m14_diag_veh = AddVectoredExceptionHandler(1u,
+                                                     bridge_diag_exception_v6);
+    }
+
+    g_m14_diag_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_m14_diag_stop == NULL) {
+        bridge_stop_diag_v6();
+        return;
+    }
+    g_m14_diag_thread = CreateThread(NULL, 0u, bridge_diag_thread_v6,
+                                     instance, 0u, NULL);
+    if (g_m14_diag_thread == NULL) bridge_stop_diag_v6();
+}
+#endif
+
+static u64 bridge_external_read_v6(CPUState *cpu, u32 address, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint64_t value = 0;
+    uint32_t source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    int result = OPENSPM_ERROR_NOT_FOUND;
+
+    if (instance != NULL && instance->have_wii &&
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_EXTERNAL_BUS) != 0 &&
+        instance->wii.read_bus != NULL) {
+        result = instance->wii.read_bus(instance->wii.context, address, width, &value);
+        if (result == OPENSPM_OK) return (u64)value;
+    }
+
+    bridge_log_bus_v6(instance, "read", source_address, address, width, 0, result);
+    bridge_request_fallback(instance, source_address, result == OPENSPM_ERROR_NOT_FOUND ? 1u : 2u);
+    if (cpu != NULL) cpu->pc = source_address;
+    return 0;
+}
+
+static void bridge_external_write_v6(CPUState *cpu, u32 address, u64 value, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t source_address = cpu != NULL ? (uint32_t)cpu->pc : 0u;
+    uint32_t service_address = address;
+    uint32_t wg_ordinal = 0u;
+    int is_wg = 0;
+    int result = OPENSPM_ERROR_NOT_FOUND;
+
+    /* Broadway's WPAR write-gather target is a 32-byte cache-line window. A
+       paired-single store aimed at 0xCC008000 is emitted by the recompiler as
+       two 32-bit external writes at +0 and +4, but both belong to one ordered
+       GX FIFO byte stream. Normalize only that 32-byte window to OpenSPM's
+       canonical FIFO endpoint; unrelated MMIO addresses remain fail-closed. */
+    if (address >= OPENSPM_M14_WGPIPE_BASE &&
+        address < OPENSPM_M14_WGPIPE_BASE + OPENSPM_M14_WGPIPE_SIZE) {
+        service_address = OPENSPM_M14_WGPIPE_BASE;
+        is_wg = 1;
+#ifdef _WIN32
+        wg_ordinal = (uint32_t)InterlockedIncrement(&g_m14_wg_diag_writes);
+#else
+        wg_ordinal = ++g_m14_wg_diag_writes;
+#endif
+        bridge_log_wg_v6(instance, "begin", wg_ordinal,
+                         source_address, address, width, result);
+    }
+
+    if (instance != NULL && instance->have_wii &&
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_EXTERNAL_BUS) != 0 &&
+        instance->wii.write_bus != NULL) {
+        result = instance->wii.write_bus(instance->wii.context,
+                                         service_address, width, value);
+        if (is_wg) {
+            bridge_log_wg_v6(instance, "end", wg_ordinal,
+                             source_address, address, width, result);
+        }
+        if (result == OPENSPM_OK) return;
+    }
+
+    /* Log the original effective bus address, not the normalized service
+       endpoint, so a future failure still identifies exactly what guest code
+       attempted. */
+    bridge_log_bus_v6(instance, "write", source_address, address, width, value, result);
+    bridge_request_fallback(instance, source_address, result == OPENSPM_ERROR_NOT_FOUND ? 3u : 4u);
+    if (cpu != NULL) cpu->pc = source_address;
+}
+
+static int OPENSPM_CALL bridge_create_v6(const openspm_native_runtime_api *runtime,
+                                         const openspm_launch_desc *launch,
+                                         void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result = bridge_create_v5_dev7_internal(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+#ifdef _WIN32
+    InterlockedExchange(&g_m14_wg_diag_writes, 0);
+#else
+    g_m14_wg_diag_writes = 0u;
+#endif
+    instance->cpu.external_read = bridge_external_read_v6;
+    instance->cpu.external_write = bridge_external_write_v6;
+#ifdef _WIN32
+    bridge_start_diag_v6(instance);
+#endif
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v6(void *opaque) {
+#ifdef _WIN32
+    bridge_stop_diag_v6();
+#endif
+    bridge_destroy(opaque);
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev7_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev8";
+    out_api->create = bridge_create_v6;
+    out_api->destroy = bridge_destroy_v6;
+    return OPENSPM_OK;
+}

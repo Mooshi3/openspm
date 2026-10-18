@@ -1,0 +1,125 @@
+; OpenSPM player settings. Copy this file to OpenSPM.ini (same folder as the
+; launcher .cmd files) and edit. Empty values keep the default. Launcher
+; arguments (fullscreen, borderless, nosync, notags, ...) and variables set in
+; the console override these. The OpenSPM menu (F1) edits this file too.
+
+[Display]
+; windowed (default) | borderless | exclusive
+window_mode =
+; exclusive fullscreen refresh: auto (default: best rate for vanilla 60) | Hz, e.g. 59.978
+refresh_hz =
+; 4:3 (default, black bars on wide screens) | stretch
+; (with widescreen = 1, "4:3" keeps the 16:9 picture's aspect: black bars on non-16:9 windows)
+aspect =
+; native 16:9: the game renders a wider view, as on a Wii set to a 16:9 TV. 0 (default) | 1
+; (applies on restart; launcher flag "widescreen")
+widescreen =
+; auto (default: lock the game clock to the display when it fits 60 Hz) | off
+display_sync =
+; how frames reach the screen (the game always simulates 60 per second):
+;   vanilla (default): one image per game frame, vsync, like the console
+;   smooth: experimental frame interpolation to the display refresh (only helps
+;           above 60 Hz: 100 / 120 / 144 / 240 Hz); launcher flag "interp"
+;   vanilla_timeline: vanilla through the smooth presenter (diagnostic, "timelinevanilla")
+frame_mode =
+; smooth: interpolate with the game's camera views. 1 (default) | 0 ("interpdirect")
+interp_camera_views =
+
+[Effects]
+; star-door swing: resolve CPU-moved EFB copies to HD textures. 1 (default) | 0
+copy_tags =
+; pixel-exact EFB copy rectangles (door alignment). 1 (default) | 0
+copy_pixel_exact =
+; PE bounding boxes in game coordinates (pipe chunks). 1 (default) | 0
+bbox_logical =
+
+[Controller]
+; XInput gamepad (Xbox pads; others via Steam Input). 1 (default) | 0
+enabled =
+; buttons -> Wii Remote (held sideways): names a b x y start back lb rb lt rt ls rs,
+; values 1 2 A B PLUS MINUS TURBO NONE. D-pad and left stick always move.
+; TURBO = fast-forward while held ([Game] turbo), never a game button.
+; default: a=2,b=B,x=1,y=A,start=PLUS,back=MINUS,rs=TURBO
+map =
+; HOME (gamepad Guide / PS button, or the [Keyboard] home key) opens and closes the
+; OpenSPM menu; HOME never reaches the game. 1 (default) | 0 (HOME does nothing)
+home_opens_menu =
+; the right stick moves the Wii Remote pointer (Tippi); moving the mouse takes it
+; back. 1 (default) | 0. Speed 1..100 (default 50), deadzone 0..90 (default 20)
+stick_pointer =
+pointer_speed =
+pointer_deadzone =
+; the gamepad rumbles when the game rumbles the Wii Remote. 1 (default) | 0;
+; strength 0..100 (default 70)
+rumble =
+rumble_strength =
+
+[Keyboard]
+; keys -> Wii Remote (held sideways). Slots up down left right a b 1 2 minus plus home turbo,
+; each up to 4 keys separated by /, or none. F1 menu > Controls rebinds them.
+; turbo = fast-forward ([Game] turbo); its default Tab yields to a game button bound to Tab.
+; default: up=Up/W,down=Down/S,left=Left/A,right=Right/D,a=Space/Z,b=C,1=X,2=Enter,minus=Backspace,plus=none,home=Home,turbo=Tab
+map =
+
+[Overlay]
+; FPS counter in the top-left corner. 0 (default) | 1
+show_fps =
+; pause the game (and its clock) while the OpenSPM menu is open. 1 (default) | 0
+pause_game =
+
+[Cheats]
+; F1 menu > Cheats. Everything is off unless set to 1.
+; refill HP to max every frame in game. 0 (default) | 1
+infinite_hp =
+; keep coins at 999. 0 (default) | 1
+max_coins =
+; custom Gecko 04 codes (32-bit writes), code1 .. code16:
+; code1 = 1 | name | 04XXXXXX YYYYYYYY 04XXXXXX YYYYYYYY
+
+[Mods]
+; load mod DLLs from the mods folder next to OpenSPMNative.exe. 0 (default) | 1
+enabled =
+; per-mod toggle, e.g.
+; openspm_debug.dll = 0
+
+[Audio]
+; experimental: game music and sound through OpenSPM's AX HLE mixer
+; (docs/AUDIO-PLAN.md). 0 (default, silent as before) | 1. Launcher flag: audio
+enabled =
+; output volume in percent. 0 .. 100 (default 100)
+volume =
+
+[Game]
+; your Super Paper Mario (USA, R8PE01, disc revision 2): a .iso / .wbfs / .wia,
+; or an extracted folder. Empty: OpenSPMNative.exe asks on first run and saves
+; the choice here. A disc image is extracted once to User-OpenSPM\game with
+; Wiimms ISO Tools (wit). The whole line after '=' is the path (no ; comments).
+path =
+; wit.exe; empty: OPENSPM_WIT, wit\bin\wit.exe next to OpenSPMNative.exe, PATH
+wit =
+; fast-forward (docs/PLAYING.md "Fast-forward"): hold the turbo key (Tab / right stick
+; click) to run the game faster; only active while engaged. 1 (default) | 0 (no hotkey)
+turbo =
+; speed while engaged: 2 (default) | 3 | 4 | unlimited
+turbo_speed =
+; hold (default: while the key is held) | toggle (press on, press off)
+turbo_mode =
+
+[TexturePacks]
+; Dolphin HD texture packs (docs/TEXTURE-PACKS.md): one pack per subfolder of the folder.
+; 1 (default) | 0
+enabled =
+; pack folder, relative to OpenSPMNative.exe or absolute. default: texturepacks
+folder =
+; GPU memory for decoded pack textures in MB: 512 | 1024 | 2048 (default) | 4096
+cache_mb =
+; write each texture no pack replaces once, as a Dolphin-named tex1_ PNG
+; (texturedumps\R8PE01 next to the exe), to make packs. 0 (default) | 1
+dump =
+; priority, highest first (the F1 menu writes it), e.g. order = SPM HD|Mario model
+; per-pack toggle (default on), e.g. pack.SPM HD = 0
+
+[Debug]
+; sample the game thread and log its busiest functions every 30 s and at exit
+; ("OpenSPM profile" lines), for performance reports. 0 (default) | 1
+profile =

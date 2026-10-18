@@ -1,0 +1,8 @@
+# OpenSPM mod info file (docs/MODDING.md "Mod info files"): installed next to
+# openspm_flint_follower.dll in the mods folder.
+id = "openspm.sample.flint_follower"
+name = "Flint Follower"
+version = "1.0"
+author = "OpenSPM samples"
+description = "Flint Cragley follows you through the whole game, cutscenes included."
+requires = ["openspm.content>=1"]

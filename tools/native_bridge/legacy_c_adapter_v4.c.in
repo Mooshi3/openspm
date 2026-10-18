@@ -1,0 +1,190 @@
+/*
+ * M14 generated-C bridge v4.
+ *
+ * The disc boot path enters application code with a valid MEM1 stack. Keep the
+ * older bridge implementation intact and layer boot-state / privileged CPU
+ * migration fixes on top so the temporary adapter remains easy to retire later.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev3_internal
+#include "legacy_c_adapter.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_BRIDGE_INITIAL_STACK UINT32_C(0x816FFFF0)
+#define OPENSPM_PPC_OPCODE_X 31u
+#define OPENSPM_PPC_XO_DCBST 54u
+#define OPENSPM_PPC_XO_DCBF 86u
+#define OPENSPM_PPC_XO_MFSPR 339u
+#define OPENSPM_PPC_XO_DCBI 470u
+#define OPENSPM_PPC_XO_MTSPR 467u
+#define OPENSPM_PPC_XO_ICBI 982u
+
+static uint32_t bridge_decode_spr(uint32_t raw) {
+    uint32_t encoded = (raw >> 11) & UINT32_C(0x3FF);
+    return ((encoded & UINT32_C(0x1F)) << 5) |
+           ((encoded >> 5) & UINT32_C(0x1F));
+}
+
+static int bridge_read_core_spr(CPUState *cpu, uint32_t spr, uint32_t *out_value) {
+    if (cpu == NULL || out_value == NULL) return 0;
+    switch (spr) {
+        case 1u: *out_value = (uint32_t)cpu->xer; return 1;
+        case 8u: *out_value = (uint32_t)cpu->lr; return 1;
+        case 9u: *out_value = (uint32_t)cpu->ctr; return 1;
+        case 18u: *out_value = (uint32_t)cpu->dsisr; return 1;
+        case 19u: *out_value = (uint32_t)cpu->dar; return 1;
+        case 26u: *out_value = (uint32_t)cpu->srr0; return 1;
+        case 27u: *out_value = (uint32_t)cpu->srr1; return 1;
+        case 268u: *out_value = (uint32_t)cpu->timebase; return 1;
+        case 269u: *out_value = (uint32_t)(cpu->timebase >> 32); return 1;
+        case 920u: *out_value = (uint32_t)cpu->hid2; return 1;
+        default:
+            if (spr >= 912u && spr <= 919u) {
+                *out_value = (uint32_t)cpu->gqr[spr - 912u];
+                return 1;
+            }
+            return 0;
+    }
+}
+
+static int bridge_write_core_spr(CPUState *cpu, uint32_t spr, uint32_t value) {
+    uint64_t timebase;
+    if (cpu == NULL) return 0;
+    switch (spr) {
+        case 1u: cpu->xer = (u32)value; return 1;
+        case 8u: cpu->lr = (u32)value; return 1;
+        case 9u: cpu->ctr = (u32)value; return 1;
+        case 18u: cpu->dsisr = (u32)value; return 1;
+        case 19u: cpu->dar = (u32)value; return 1;
+        case 26u: cpu->srr0 = (u32)value; return 1;
+        case 27u: cpu->srr1 = (u32)value; return 1;
+        case 268u:
+            timebase = cpu->timebase;
+            cpu->timebase = (timebase & UINT64_C(0xFFFFFFFF00000000)) | value;
+            return 1;
+        case 269u:
+            timebase = cpu->timebase;
+            cpu->timebase = ((uint64_t)value << 32) | (timebase & UINT64_C(0xFFFFFFFF));
+            return 1;
+        case 920u: cpu->hid2 = (u32)value; return 1;
+        default:
+            if (spr >= 912u && spr <= 919u) {
+                cpu->gqr[spr - 912u] = (u32)value;
+                return 1;
+            }
+            return 0;
+    }
+}
+
+static int bridge_cache_fallback_v4(openspm_bridge_instance *instance,
+                                    CPUState *cpu,
+                                    uint32_t raw,
+                                    uint32_t xo,
+                                    uint32_t source_address) {
+    uint32_t ra;
+    uint32_t rb;
+    uint32_t ea;
+    uint8_t operation;
+
+    switch (xo) {
+        case OPENSPM_PPC_XO_DCBST: operation = (uint8_t)OPENSPM_WII_CACHE_DCBST; break;
+        case OPENSPM_PPC_XO_DCBF: operation = (uint8_t)OPENSPM_WII_CACHE_DCBF; break;
+        case OPENSPM_PPC_XO_DCBI: operation = (uint8_t)OPENSPM_WII_CACHE_DCBI; break;
+        case OPENSPM_PPC_XO_ICBI: operation = (uint8_t)OPENSPM_WII_CACHE_ICBI; break;
+        default: return 0;
+    }
+
+    ra = (raw >> 16) & UINT32_C(0x1F);
+    rb = (raw >> 11) & UINT32_C(0x1F);
+    ea = (ra == 0u ? 0u : (uint32_t)cpu->gpr[ra]) + (uint32_t)cpu->gpr[rb];
+    bridge_cache_control(cpu, operation, ea, source_address);
+    if (!instance->fallback_requested) cpu->pc = source_address + 4u;
+    return 1;
+}
+
+static void bridge_instruction_fallback_v4(CPUState *cpu,
+                                            u32 raw,
+                                            u32 source_address) {
+    openspm_bridge_instance *instance;
+    uint32_t opcode;
+    uint32_t xo;
+    uint32_t spr;
+    uint32_t gpr;
+    uint32_t value;
+
+    if (cpu == NULL) {
+        bridge_instruction_fallback(cpu, raw, source_address);
+        return;
+    }
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) {
+        bridge_instruction_fallback(cpu, raw, source_address);
+        return;
+    }
+
+    opcode = raw >> 26;
+    xo = (raw >> 1) & UINT32_C(0x3FF);
+    if (opcode != OPENSPM_PPC_OPCODE_X) {
+        bridge_instruction_fallback(cpu, raw, source_address);
+        return;
+    }
+
+    if (bridge_cache_fallback_v4(instance, cpu, raw, xo, source_address)) return;
+
+    spr = bridge_decode_spr(raw);
+    gpr = (raw >> 21) & UINT32_C(0x1F);
+    if (xo == OPENSPM_PPC_XO_MFSPR) {
+        if (bridge_read_core_spr(cpu, spr, &value)) {
+            cpu->gpr[gpr] = (u32)value;
+        } else {
+            cpu->gpr[gpr] = (u32)bridge_spr_read(cpu, (u16)spr, source_address);
+        }
+        if (!instance->fallback_requested) cpu->pc = source_address + 4u;
+        return;
+    }
+    if (xo == OPENSPM_PPC_XO_MTSPR) {
+        value = (uint32_t)cpu->gpr[gpr];
+        if (!bridge_write_core_spr(cpu, spr, value)) {
+            bridge_spr_write(cpu, (u16)spr, (u32)value, source_address);
+        }
+        if (!instance->fallback_requested) cpu->pc = source_address + 4u;
+        return;
+    }
+
+    bridge_instruction_fallback(cpu, raw, source_address);
+}
+
+static int OPENSPM_CALL bridge_create_v4(const openspm_native_runtime_api *runtime,
+                                          const openspm_launch_desc *launch,
+                                          void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result = bridge_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    /* The Wii disc bootstrap enters the apploader/application with r1 pointing
+       at a valid high-MEM1 stack. The game's own CRT establishes r2/r13. */
+    instance->cpu.gpr[1] = (u32)OPENSPM_BRIDGE_INITIAL_STACK;
+
+    /* Older C codegen deliberately side-exits privileged SPR/cache operations.
+       They are not a reason to reintroduce an interpreter. Core state stays in
+       private CPUState; less common SPRs route through OpenSPM's Wii CPU service,
+       and cache maintenance routes through the same standalone service boundary.
+       Unknown opcodes still fail closed through the original migration path. */
+    instance->cpu.instruction_fallback = bridge_instruction_fallback_v4;
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev3_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev6";
+    out_api->create = bridge_create_v4;
+    return OPENSPM_OK;
+}

@@ -1,0 +1,462 @@
+/*
+ * OpenSPM M14 migration bridge for locally generated DolRecomp C output.
+ *
+ * This file is a DEVELOPMENT BRIDGE, not the final native codegen model.
+ * It lets player-local generated C execute behind the OpenSPM-owned native ABI
+ * without StaticRecompCore driving every block. CPUState stays private inside
+ * the generated module and is never part of the public OpenSPM ABI.
+ *
+ * Expected local-only inputs beside this file at build time:
+ *   generated.h + generated/chunks/*.c
+ *   cpu/cpu.h + cpu/cpu.c from the selected local compiler toolchain
+ *   openspm_local_identity.h generated from the verified player input
+ */
+
+#include "openspm/native_api.h"
+#include "openspm/wii_cpu_service.h"
+#include "legacy_dev_api.h"
+#include "openspm_local_identity.h"
+#include "generated.h"
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef OPENSPM_LOCAL_GAME_ID
+#error "openspm_local_identity.h must define OPENSPM_LOCAL_GAME_ID"
+#endif
+#ifndef OPENSPM_LOCAL_ENTRY_PC
+#error "openspm_local_identity.h must define OPENSPM_LOCAL_ENTRY_PC"
+#endif
+
+#define OPENSPM_BRIDGE_DEFAULT_BUDGET UINT64_C(200000)
+#define OPENSPM_BRIDGE_MAX_TOPLEVEL_DISPATCHES UINT32_C(65536)
+/* Broadway's time-base clock is CPU clock / 12. The old Dolphin chassis used
+   the same TIMER_RATIO. Keeping the remainder here lets busy-wait loops observe
+   time progressing without returning to StaticRecompCore after every block. */
+#define OPENSPM_BRIDGE_TIMEBASE_RATIO UINT64_C(12)
+/* Wii application code enters with translation, recoverability and floating
+   point enabled. Paired-single quantized load/store is enabled in HID2 before
+   control reaches the DOL. These are private migration-state defaults, not part
+   of the public OpenSPM native ABI. */
+#define OPENSPM_BRIDGE_INITIAL_MSR UINT32_C(0x00002032)
+#define OPENSPM_BRIDGE_INITIAL_HID2 UINT32_C(0xE0000000)
+
+typedef struct openspm_bridge_instance {
+    CPUState cpu;
+    const openspm_native_runtime_api *runtime;
+    openspm_wii_cpu_service wii;
+    uint64_t timebase_cycle_remainder;
+    uint32_t have_wii;
+    uint32_t stop_requested;
+    uint32_t fallback_requested;
+    uint32_t fallback_detail;
+    uint32_t fallback_address;
+} openspm_bridge_instance;
+
+static openspm_bridge_instance *bridge_from_cpu(CPUState *cpu) {
+    return cpu ? (openspm_bridge_instance *)cpu->external_user_data : NULL;
+}
+
+static void bridge_request_fallback(openspm_bridge_instance *instance,
+                                    uint32_t address,
+                                    uint32_t detail) {
+    if (instance == NULL || instance->fallback_requested) {
+        return;
+    }
+    instance->fallback_requested = 1u;
+    instance->fallback_address = address;
+    instance->fallback_detail = detail;
+}
+
+static u64 bridge_external_read(CPUState *cpu, u32 address, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint64_t value = 0;
+    int result;
+
+    if (instance == NULL || !instance->have_wii ||
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_EXTERNAL_BUS) == 0 ||
+        instance->wii.read_bus == NULL) {
+        bridge_request_fallback(instance, address, 1u);
+        return 0;
+    }
+    result = instance->wii.read_bus(instance->wii.context, address, width, &value);
+    if (result != OPENSPM_OK) {
+        bridge_request_fallback(instance, address, 2u);
+        return 0;
+    }
+    return (u64)value;
+}
+
+static void bridge_external_write(CPUState *cpu, u32 address, u64 value, u8 width) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    int result;
+
+    if (instance == NULL || !instance->have_wii ||
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_EXTERNAL_BUS) == 0 ||
+        instance->wii.write_bus == NULL) {
+        bridge_request_fallback(instance, address, 3u);
+        return;
+    }
+    result = instance->wii.write_bus(instance->wii.context, address, width, value);
+    if (result != OPENSPM_OK) {
+        bridge_request_fallback(instance, address, 4u);
+    }
+}
+
+static u32 bridge_spr_read(CPUState *cpu, u16 spr, u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t value = 0;
+    int result;
+
+    if (instance == NULL || !instance->have_wii ||
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_SPR) == 0 ||
+        instance->wii.read_spr == NULL) {
+        bridge_request_fallback(instance, source_address, 5u);
+        return 0;
+    }
+    result = instance->wii.read_spr(instance->wii.context, spr, source_address, &value);
+    if (result != OPENSPM_OK) {
+        bridge_request_fallback(instance, source_address, 6u);
+        return 0;
+    }
+    return value;
+}
+
+static void bridge_spr_write(CPUState *cpu, u16 spr, u32 value, u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    int result;
+
+    if (instance == NULL || !instance->have_wii ||
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_SPR) == 0 ||
+        instance->wii.write_spr == NULL) {
+        bridge_request_fallback(instance, source_address, 7u);
+        return;
+    }
+    result = instance->wii.write_spr(instance->wii.context, spr, source_address, value);
+    if (result != OPENSPM_OK) {
+        bridge_request_fallback(instance, source_address, 8u);
+    }
+}
+
+static void bridge_cache_control(CPUState *cpu, u8 operation, u32 address,
+                                 u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    int result;
+
+    if (instance == NULL || !instance->have_wii ||
+        (instance->wii.capabilities & OPENSPM_WII_CPU_CAP_CACHE_CONTROL) == 0 ||
+        instance->wii.cache_control == NULL) {
+        bridge_request_fallback(instance, source_address, 9u);
+        return;
+    }
+    result = instance->wii.cache_control(instance->wii.context, operation, address,
+                                         source_address);
+    if (result != OPENSPM_OK) {
+        bridge_request_fallback(instance, source_address, 10u);
+    }
+}
+
+static void bridge_instruction_fallback(CPUState *cpu, u32 raw, u32 source_address) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    (void)raw;
+    bridge_request_fallback(instance, source_address, 11u);
+    if (cpu != NULL) {
+        cpu->pc = source_address;
+    }
+}
+
+static int bridge_query_wii_service(openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    int result;
+
+    if (instance == NULL || instance->runtime == NULL) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+    host = instance->runtime->host;
+    if (host == NULL || host->query_service == NULL ||
+        (host->capabilities & OPENSPM_HOST_CAP_SERVICE_QUERY) == 0) {
+        return OPENSPM_ERROR_NOT_FOUND;
+    }
+
+    memset(&instance->wii, 0, sizeof(instance->wii));
+    instance->wii.header.struct_size = sizeof(instance->wii);
+    instance->wii.header.abi_version = OPENSPM_ABI_VERSION;
+    result = host->query_service(host->context,
+                                 OPENSPM_WII_CPU_SERVICE_ID,
+                                 OPENSPM_WII_CPU_SERVICE_VERSION,
+                                 &instance->wii);
+    if (result == OPENSPM_OK) {
+        instance->have_wii = 1u;
+    }
+    return result;
+}
+
+static int OPENSPM_CALL bridge_create(const openspm_native_runtime_api *runtime,
+                                      const openspm_launch_desc *launch,
+                                      void **out_instance) {
+    openspm_bridge_instance *instance;
+    (void)launch;
+
+    if (runtime == NULL || out_instance == NULL || runtime->mem1 == NULL ||
+        runtime->mem1_size == 0 || runtime->mem1_size > UINT32_MAX ||
+        runtime->mem2_size > UINT32_MAX) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+
+    instance = (openspm_bridge_instance *)calloc(1, sizeof(*instance));
+    if (instance == NULL) {
+        return OPENSPM_ERROR_RUNTIME;
+    }
+    instance->runtime = runtime;
+
+    /* CPUState is private migration state. Memory is owned by OpenSPM. */
+    instance->cpu.ram = runtime->mem1;
+    instance->cpu.ram_size = (u32)runtime->mem1_size;
+    instance->cpu.mem2 = runtime->mem2;
+    instance->cpu.mem2_size = (u32)runtime->mem2_size;
+    instance->cpu.pc = (u32)OPENSPM_LOCAL_ENTRY_PC;
+    instance->cpu.msr = (u32)OPENSPM_BRIDGE_INITIAL_MSR;
+    instance->cpu.hid2 = (u32)OPENSPM_BRIDGE_INITIAL_HID2;
+    instance->cpu.external_user_data = instance;
+    instance->cpu.external_read = bridge_external_read;
+    instance->cpu.external_write = bridge_external_write;
+    instance->cpu.instruction_fallback = bridge_instruction_fallback;
+    instance->cpu.spr_read = bridge_spr_read;
+    instance->cpu.spr_write = bridge_spr_write;
+    instance->cpu.cache_control = bridge_cache_control;
+
+    /* The first pure-RAM region tests do not require Wii services. Full boot
+       progressively fills this OpenSPM service rather than routing through
+       Dolphin. */
+    (void)bridge_query_wii_service(instance);
+
+    *out_instance = instance;
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_run(void *opaque,
+                                   uint64_t soft_cycle_budget,
+                                   openspm_native_exit *out_exit) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint64_t budget;
+    uint64_t cycles = 0;
+    uint64_t control_flags = 0;
+    uint32_t dispatches = 0;
+    int result;
+
+    if (instance == NULL || out_exit == NULL) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+    out_exit->header.struct_size = sizeof(*out_exit);
+    out_exit->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+
+    if (instance->stop_requested) {
+        out_exit->reason = OPENSPM_NATIVE_EXIT_STOPPED;
+        return OPENSPM_OK;
+    }
+
+    budget = soft_cycle_budget ? soft_cycle_budget : OPENSPM_BRIDGE_DEFAULT_BUDGET;
+    instance->fallback_requested = 0u;
+    instance->fallback_detail = 0u;
+    instance->fallback_address = 0u;
+
+    while (cycles < budget && dispatches < OPENSPM_BRIDGE_MAX_TOPLEVEL_DISPATCHES) {
+        s64 charge;
+        uint64_t effective_charge;
+        uint64_t timebase_cycles;
+
+        /* Preserve generated loop-yield semantics, but batch host timing outside
+           the per-chunk loop. This removes StaticRecompCore from the hot path. */
+        instance->cpu.downcount = 0;
+        if (!dolrecomp_call(&instance->cpu, instance->cpu.pc)) {
+            bridge_request_fallback(instance, instance->cpu.pc, 12u);
+            break;
+        }
+        charge = -instance->cpu.downcount;
+        effective_charge = (uint64_t)(charge > 0 ? charge : 1);
+        cycles += effective_charge;
+        dispatches++;
+
+        /* Keep the private migration CPU's time base live between coarse host
+           safepoints. This is intentionally per generated yield, not per guest
+           basic block, so ordinary direct-call chains stay native. */
+        timebase_cycles = instance->timebase_cycle_remainder + effective_charge;
+        instance->cpu.timebase += timebase_cycles / OPENSPM_BRIDGE_TIMEBASE_RATIO;
+        instance->timebase_cycle_remainder =
+            timebase_cycles % OPENSPM_BRIDGE_TIMEBASE_RATIO;
+
+        if (instance->fallback_requested) {
+            break;
+        }
+
+        /* Guest exceptions have already redirected PC inside the generated CPU
+           helpers. Return at a coarse safepoint so the standalone host can own
+           interrupt/timing policy without a per-block chassis round trip. */
+        if (instance->cpu.exception != 0u) {
+            break;
+        }
+    }
+
+    if (cycles != 0u && instance->runtime->account_cycles != NULL) {
+        result = instance->runtime->account_cycles(instance->runtime->context, cycles);
+        if (result != OPENSPM_OK) {
+            return result;
+        }
+    }
+    if (instance->runtime->poll_control != NULL) {
+        result = instance->runtime->poll_control(instance->runtime->context, &control_flags);
+        if (result != OPENSPM_OK) {
+            return result;
+        }
+        if ((control_flags & OPENSPM_NATIVE_CONTROL_STOP) != 0u) {
+            instance->stop_requested = 1u;
+        }
+    }
+
+    out_exit->guest_cycles = cycles;
+    out_exit->source_address = instance->cpu.pc;
+    if (instance->fallback_requested) {
+        out_exit->reason = OPENSPM_NATIVE_EXIT_FALLBACK_REQUIRED;
+        out_exit->detail = instance->fallback_detail;
+        out_exit->source_address = instance->fallback_address;
+    } else if (instance->stop_requested) {
+        out_exit->reason = OPENSPM_NATIVE_EXIT_STOPPED;
+    } else {
+        out_exit->reason = OPENSPM_NATIVE_EXIT_SAFEPOINT;
+        out_exit->detail = instance->cpu.exception;
+    }
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_request_stop(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance == NULL) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+    instance->stop_requested = 1u;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy(void *opaque) {
+    /* Do not cpu_free(): MEM1/MEM2 are owned by the OpenSPM runtime. */
+    free(opaque);
+}
+
+static uint64_t bridge_f64_bits(f64 value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static f64 bridge_bits_f64(uint64_t bits) {
+    f64 value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int OPENSPM_CALL bridge_get_state(void *opaque,
+                                         openspm_legacy_dev_state *out_state) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint32_t i;
+    if (instance == NULL || out_state == NULL ||
+        out_state->header.struct_size < sizeof(*out_state)) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+    memset(out_state, 0, sizeof(*out_state));
+    out_state->header.struct_size = sizeof(*out_state);
+    out_state->header.abi_version = OPENSPM_ABI_VERSION;
+    for (i = 0; i < 32u; ++i) {
+        out_state->gpr[i] = instance->cpu.gpr[i];
+        out_state->fpr_bits[i] = bridge_f64_bits(instance->cpu.fpr[i]);
+        out_state->ps1_bits[i] = bridge_f64_bits(instance->cpu.ps1[i]);
+    }
+    out_state->pc = instance->cpu.pc;
+    out_state->lr = instance->cpu.lr;
+    out_state->ctr = instance->cpu.ctr;
+    out_state->cr = instance->cpu.cr;
+    out_state->xer = instance->cpu.xer;
+    out_state->fpscr = instance->cpu.fpscr;
+    out_state->msr = instance->cpu.msr;
+    out_state->downcount = instance->cpu.downcount;
+    out_state->timebase = instance->cpu.timebase;
+    out_state->exception = instance->cpu.exception;
+    out_state->program_exception = instance->cpu.program_exception;
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_set_state(void *opaque,
+                                         const openspm_legacy_dev_state *state) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    uint32_t i;
+    if (instance == NULL || state == NULL || state->header.struct_size < sizeof(*state)) {
+        return OPENSPM_ERROR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < 32u; ++i) {
+        instance->cpu.gpr[i] = state->gpr[i];
+        instance->cpu.fpr[i] = bridge_bits_f64(state->fpr_bits[i]);
+        instance->cpu.ps1[i] = bridge_bits_f64(state->ps1_bits[i]);
+    }
+    instance->cpu.pc = state->pc;
+    instance->cpu.lr = state->lr;
+    instance->cpu.ctr = state->ctr;
+    instance->cpu.cr = state->cr;
+    instance->cpu.xer = state->xer;
+    instance->cpu.fpscr = state->fpscr;
+    instance->cpu.msr = state->msr;
+    instance->cpu.downcount = state->downcount;
+    instance->cpu.timebase = state->timebase;
+    instance->timebase_cycle_remainder = 0;
+    instance->cpu.exception = state->exception;
+    instance->cpu.program_exception = state->program_exception;
+    instance->fallback_requested = 0u;
+    return OPENSPM_OK;
+}
+
+static int OPENSPM_CALL bridge_query_service(void *opaque,
+                                              const char *service_id,
+                                              uint32_t requested_version,
+                                              void *out_service) {
+    openspm_legacy_dev_service *service = (openspm_legacy_dev_service *)out_service;
+    if (opaque == NULL || service_id == NULL ||
+        strcmp(service_id, OPENSPM_LEGACY_DEV_SERVICE_ID) != 0 ||
+        requested_version != OPENSPM_LEGACY_DEV_SERVICE_VERSION ||
+        service == NULL || service->header.struct_size < sizeof(*service)) {
+        return OPENSPM_ERROR_NOT_FOUND;
+    }
+    memset(service, 0, sizeof(*service));
+    service->header.struct_size = sizeof(*service);
+    service->header.abi_version = OPENSPM_ABI_VERSION;
+    service->context = opaque;
+    service->get_state = bridge_get_state;
+    service->set_state = bridge_set_state;
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    if (requested_abi != OPENSPM_NATIVE_ABI_VERSION || out_api == NULL ||
+        out_api->header.struct_size < sizeof(*out_api)) {
+        return OPENSPM_ERROR_ABI_MISMATCH;
+    }
+
+    memset(out_api, 0, sizeof(*out_api));
+    out_api->header.struct_size = sizeof(*out_api);
+    out_api->header.abi_version = OPENSPM_NATIVE_ABI_VERSION;
+    out_api->capabilities = OPENSPM_NATIVE_MODULE_CAP_DIRECT_MEMORY |
+                            OPENSPM_NATIVE_MODULE_CAP_DIRECT_CALLS |
+                            OPENSPM_NATIVE_MODULE_CAP_FALLBACK_EXIT |
+                            OPENSPM_NATIVE_MODULE_CAP_SERVICE_EXPORTS;
+    out_api->module_id = "openspm.local.generated-c-bridge";
+    out_api->module_version = "m14-dev3";
+    out_api->source_game_id = OPENSPM_LOCAL_GAME_ID;
+    memcpy(out_api->source_sha256, OPENSPM_LOCAL_SOURCE_SHA256,
+           sizeof(out_api->source_sha256));
+    out_api->create = bridge_create;
+    out_api->run = bridge_run;
+    out_api->request_stop = bridge_request_stop;
+    out_api->destroy = bridge_destroy;
+    out_api->query_service = bridge_query_service;
+    return OPENSPM_OK;
+}

@@ -1,0 +1,216 @@
+/*
+ * M14 generated-C bridge v11 / local-module bridge v19.
+ *
+ * v18 attempted to keep Nintendo's native GXBeginDisplayList/GXEndDisplayList
+ * CPU-side state semantics while using OpenSPM's neutral bounded recorder for
+ * the physical display-list payload. Its after-native callback lived inside a
+ * temporary C direct-call wrapper, which is not continuation-safe: any guest
+ * yield can unwind that host C frame, and later execution resumes only from the
+ * guest PC/LR. The callback can therefore disappear even though the native SDK
+ * function eventually returns normally.
+ *
+ * v19 moves the physical recorder transition to persistent guest continuation
+ * labels inserted by display_list_return_hooks_v19.py. Pre-call hooks arm module
+ * state before entering the recompiled SDK function. Return-label hooks consume
+ * that state after the SDK returns, even if it yielded/resumed many times.
+ *
+ * This is the active post-half-scale graphics candidate. Runtime-proven v17 is
+ * retained underneath and in source history; v19 changes only the display-list
+ * seam. No public OpenSPM ABI is changed.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev17_v19_base
+#include "legacy_c_adapter_v9.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#define OPENSPM_M14_V19_GX_BEGIN_DL UINT32_C(0x80291DC8)
+#define OPENSPM_M14_V19_GX_END_DL   UINT32_C(0x80291E78)
+
+typedef struct openspm_m14_v19_display_list_state {
+    uint32_t begin_pending;
+    uint32_t end_pending;
+    uint32_t recorder_active;
+    uint32_t buffer;
+    uint32_t capacity;
+} openspm_m14_v19_display_list_state;
+
+static openspm_m14_v19_display_list_state g_m14_v19_dl;
+static uint32_t g_m14_v19_begin_reported;
+static uint32_t g_m14_v19_end_reported;
+
+static void bridge_log_v19(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static int bridge_v19_fail(CPUState *cpu, uint32_t target, uint32_t detail) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    bridge_request_fallback(instance, target, detail);
+    if (cpu != NULL) cpu->pc = target;
+    return 0;
+}
+
+static int bridge_v19_physical_call(CPUState *cpu,
+                                    uint32_t target,
+                                    uint32_t arg3,
+                                    uint32_t arg4,
+                                    uint32_t *out_r3) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    openspm_m14_hostcall_state state;
+    int result;
+
+    if (cpu == NULL || instance == NULL || !g_m14_have_hostcall ||
+        g_m14_hostcall.handle == NULL) {
+        (void)bridge_v19_fail(cpu, target, 41u);
+        return OPENSPM_ERROR_UNSUPPORTED;
+    }
+
+    /* The native SDK can have produced a partial Broadway write-gather line
+       before returning to its caller. Flush that line before changing the
+       neutral recorder state so bytes on the two sides of Begin/End cannot be
+       reordered across the physical boundary. */
+    if (g_m14_v8_have_gx_fifo) {
+        result = bridge_flush_wg_v8(instance, cpu->pc);
+        if (result != OPENSPM_OK) {
+            (void)bridge_v19_fail(cpu, target, 42u);
+            return result;
+        }
+    }
+
+    bridge_cpu_to_m14_hostcall_state(cpu, &state);
+    state.gpr[3] = arg3;
+    state.gpr[4] = arg4;
+    /* We are already executing at the durable guest continuation label. The
+       legacy backend handler synthesizes pc=lr, so point both at the current PC
+       and consume only the handler's r3 result; do not copy its control state
+       back over the real recompiled caller. */
+    state.pc = cpu->pc;
+    state.lr = cpu->pc;
+    state.event_target = 0u;
+    state.event_argc = 0u;
+    memset(state.event_args, 0, sizeof(state.event_args));
+
+    result = g_m14_hostcall.handle(g_m14_hostcall.context, target, &state);
+    if (result != OPENSPM_OK || state.event_target != 0u || state.event_argc != 0u) {
+        (void)bridge_v19_fail(cpu, target, 43u);
+        return result != OPENSPM_OK ? result : OPENSPM_ERROR_RUNTIME;
+    }
+    if (out_r3 != NULL) *out_r3 = state.gpr[3];
+    return OPENSPM_OK;
+}
+
+/* External linkage is intentional: display_list_return_hooks_v19.py inserts
+ * declarations/calls into player-local generated chunk translation units.
+ * These symbols remain module-private implementation details, not public ABI. */
+int openspm_m14_display_list_begin_before_native_v19(CPUState *cpu,
+                                                      u32 buffer,
+                                                      u32 capacity) {
+    if (cpu == NULL || buffer == 0u || capacity == 0u ||
+        g_m14_v19_dl.begin_pending || g_m14_v19_dl.end_pending ||
+        g_m14_v19_dl.recorder_active) {
+        return bridge_v19_fail(cpu, OPENSPM_M14_V19_GX_BEGIN_DL, 44u);
+    }
+    g_m14_v19_dl.begin_pending = 1u;
+    g_m14_v19_dl.buffer = (uint32_t)buffer;
+    g_m14_v19_dl.capacity = (uint32_t)capacity;
+    return 1;
+}
+
+int openspm_m14_display_list_begin_after_return_v19(CPUState *cpu) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    int result;
+    if (cpu == NULL || !g_m14_v19_dl.begin_pending ||
+        g_m14_v19_dl.end_pending || g_m14_v19_dl.recorder_active) {
+        return bridge_v19_fail(cpu, OPENSPM_M14_V19_GX_BEGIN_DL, 45u);
+    }
+
+    result = bridge_v19_physical_call(cpu, OPENSPM_M14_V19_GX_BEGIN_DL,
+                                      g_m14_v19_dl.buffer,
+                                      g_m14_v19_dl.capacity, NULL);
+    if (result != OPENSPM_OK) return 0;
+
+    g_m14_v19_dl.begin_pending = 0u;
+    g_m14_v19_dl.recorder_active = 1u;
+    if (!g_m14_v19_begin_reported) {
+        bridge_log_v19(
+            instance,
+            "M14 v19 continuation-safe GXBeginDisplayList return hook active; native GXData/FIFO CPU semantics completed and neutral payload recording began at the durable guest continuation.");
+        g_m14_v19_begin_reported = 1u;
+    }
+    return 1;
+}
+
+int openspm_m14_display_list_end_before_native_v19(CPUState *cpu) {
+    if (cpu == NULL || g_m14_v19_dl.begin_pending ||
+        g_m14_v19_dl.end_pending || !g_m14_v19_dl.recorder_active) {
+        return bridge_v19_fail(cpu, OPENSPM_M14_V19_GX_END_DL, 46u);
+    }
+    g_m14_v19_dl.end_pending = 1u;
+    return 1;
+}
+
+int openspm_m14_display_list_end_after_return_v19(CPUState *cpu) {
+    openspm_bridge_instance *instance = bridge_from_cpu(cpu);
+    uint32_t recorded_size = 0u;
+    int result;
+    if (cpu == NULL || g_m14_v19_dl.begin_pending ||
+        !g_m14_v19_dl.end_pending || !g_m14_v19_dl.recorder_active) {
+        return bridge_v19_fail(cpu, OPENSPM_M14_V19_GX_END_DL, 47u);
+    }
+
+    result = bridge_v19_physical_call(cpu, OPENSPM_M14_V19_GX_END_DL,
+                                      0u, 0u, &recorded_size);
+    if (result != OPENSPM_OK) return 0;
+
+    /* Native GXEndDisplayList may observe a zero PI FIFO count because the
+       transitional neutral recorder, not the emulated PI write pointer, owns
+       the authoritative list payload. Replace r3 at the durable continuation
+       before the game's caller inspects the SDK return value. */
+    cpu->gpr[3] = recorded_size;
+    g_m14_v19_dl.end_pending = 0u;
+    g_m14_v19_dl.recorder_active = 0u;
+    g_m14_v19_dl.buffer = 0u;
+    g_m14_v19_dl.capacity = 0u;
+    if (!g_m14_v19_end_reported) {
+        bridge_log_v19(
+            instance,
+            "M14 v19 continuation-safe GXEndDisplayList return hook active; native GXData restore completed and neutral recorder supplied the durable SDK-visible list size.");
+        g_m14_v19_end_reported = 1u;
+    }
+    return 1;
+}
+
+static int OPENSPM_CALL bridge_create_v11(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    int result = bridge_create_v9(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    memset(&g_m14_v19_dl, 0, sizeof(g_m14_v19_dl));
+    g_m14_v19_begin_reported = 0u;
+    g_m14_v19_end_reported = 0u;
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v11(void *opaque) {
+    memset(&g_m14_v19_dl, 0, sizeof(g_m14_v19_dl));
+    bridge_destroy_v9(opaque);
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev17_v19_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev19";
+    out_api->create = bridge_create_v11;
+    out_api->destroy = bridge_destroy_v11;
+    return OPENSPM_OK;
+}

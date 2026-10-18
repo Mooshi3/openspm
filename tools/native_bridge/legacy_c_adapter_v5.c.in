@@ -1,0 +1,134 @@
+/*
+ * M14 generated-C bridge v5.
+ *
+ * Continue retiring legacy instruction side exits at the standalone boundary.
+ * These instructions are architectural CPU/control operations, not reasons to
+ * reintroduce an interpreter or the StaticRecomp dispatcher.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev6_internal
+#include "legacy_c_adapter_v4.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#include <stdatomic.h>
+
+#define OPENSPM_PPC_OPCODE_SYSTEM 19u
+#define OPENSPM_PPC_XO_ISYNC 150u
+#define OPENSPM_PPC_XO_MFMSR 83u
+#define OPENSPM_PPC_XO_MTMSR 146u
+#define OPENSPM_PPC_XO_MFTB 371u
+#define OPENSPM_PPC_XO_SYNC 598u
+#define OPENSPM_PPC_XO_EIEIO 854u
+
+static void bridge_ordering_barrier_v5(void) {
+    /* MEM1/MEM2 are ordinary coherent host memory. A host fence is therefore
+       sufficient for the ordering portion of sync/eieio/isync. Actual device
+       effects remain behind the external-bus service callbacks. */
+    atomic_thread_fence(memory_order_seq_cst);
+}
+
+static int bridge_system_fallback_v5(openspm_bridge_instance *instance,
+                                     CPUState *cpu,
+                                     uint32_t raw,
+                                     uint32_t opcode,
+                                     uint32_t xo,
+                                     uint32_t source_address) {
+    uint32_t gpr;
+    uint32_t tbr;
+
+    if (opcode == OPENSPM_PPC_OPCODE_SYSTEM && xo == OPENSPM_PPC_XO_ISYNC) {
+        bridge_ordering_barrier_v5();
+        cpu->pc = source_address + 4u;
+        return 1;
+    }
+    if (opcode != OPENSPM_PPC_OPCODE_X) return 0;
+
+    gpr = (raw >> 21) & UINT32_C(0x1F);
+    switch (xo) {
+        case OPENSPM_PPC_XO_MFMSR:
+            cpu->gpr[gpr] = cpu->msr;
+            cpu->pc = source_address + 4u;
+            return 1;
+
+        case OPENSPM_PPC_XO_MTMSR:
+            cpu->msr = cpu->gpr[gpr];
+            cpu->pc = source_address + 4u;
+            return 1;
+
+        case OPENSPM_PPC_XO_MFTB:
+            /* MFTB uses the same split 10-bit field encoding as SPR operands.
+               Broadway exposes TBL/TBU as TBR 268/269. Keep unknown TBR values
+               fail-closed instead of inventing state. */
+            tbr = bridge_decode_spr(raw);
+            if (tbr == 268u) {
+                cpu->gpr[gpr] = (u32)cpu->timebase;
+            } else if (tbr == 269u) {
+                cpu->gpr[gpr] = (u32)(cpu->timebase >> 32);
+            } else {
+                bridge_request_fallback(instance, source_address, 13u);
+                cpu->pc = source_address;
+                return 1;
+            }
+            cpu->pc = source_address + 4u;
+            return 1;
+
+        case OPENSPM_PPC_XO_SYNC:
+        case OPENSPM_PPC_XO_EIEIO:
+            bridge_ordering_barrier_v5();
+            cpu->pc = source_address + 4u;
+            return 1;
+
+        default:
+            return 0;
+    }
+}
+
+static void bridge_instruction_fallback_v5(CPUState *cpu,
+                                            u32 raw,
+                                            u32 source_address) {
+    openspm_bridge_instance *instance;
+    uint32_t opcode;
+    uint32_t xo;
+
+    if (cpu == NULL) {
+        bridge_instruction_fallback_v4(cpu, raw, source_address);
+        return;
+    }
+    instance = bridge_from_cpu(cpu);
+    if (instance == NULL) {
+        bridge_instruction_fallback_v4(cpu, raw, source_address);
+        return;
+    }
+
+    opcode = raw >> 26;
+    xo = (raw >> 1) & UINT32_C(0x3FF);
+    if (bridge_system_fallback_v5(instance, cpu, raw, opcode, xo, source_address)) return;
+
+    bridge_instruction_fallback_v4(cpu, raw, source_address);
+}
+
+static int OPENSPM_CALL bridge_create_v5(const openspm_native_runtime_api *runtime,
+                                          const openspm_launch_desc *launch,
+                                          void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result = bridge_create_v4(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    instance->cpu.instruction_fallback = bridge_instruction_fallback_v5;
+    return OPENSPM_OK;
+}
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev6_internal(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+    out_api->module_version = "m14-dev7";
+    out_api->create = bridge_create_v5;
+    return OPENSPM_OK;
+}

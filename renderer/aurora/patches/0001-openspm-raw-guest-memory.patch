@@ -1,0 +1,189 @@
+From: OpenSPM M14
+Subject: [PATCH 1/2] Aurora: map original-console GX guest addresses
+
+Target: encounter/aurora 749d6ee7a22bdfab78c8ece9047bca5d79aa72ca
+
+This patch is intentionally limited to address-bearing raw GX commands. It does
+not implement OpenSPM presentation or raster bounding boxes.
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@
+         lib/gx/attr_fmt.cpp
+         lib/gx/command_processor.cpp
++        lib/gx/guest_memory.cpp
+         lib/gx/regs.cpp
+         lib/gx/dl.cpp
+
+diff --git a/include/aurora/gx_guest_memory.hpp b/include/aurora/gx_guest_memory.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/aurora/gx_guest_memory.hpp
+@@
++#pragma once
++
++#include <cstdint>
++
++namespace aurora::gx::guest_memory {
++
++struct Span {
++  const std::uint8_t* data = nullptr;
++  std::uint32_t size = 0;
++};
++
++using MapFn = bool (*)(void* context, std::uint32_t guestAddress,
++                       std::uint32_t minSize, Span* outSpan);
++
++// Optional bridge for consumers feeding Aurora an original console FIFO.
++// Source ports that emit Aurora's host-pointer metadata leave this unset.
++void set_mapper(void* context, MapFn map) noexcept;
++void clear_mapper() noexcept;
++bool has_mapper() noexcept;
++bool map(std::uint32_t guestAddress, std::uint32_t minSize, Span* outSpan) noexcept;
++
++} // namespace aurora::gx::guest_memory
+
+diff --git a/lib/gx/guest_memory.cpp b/lib/gx/guest_memory.cpp
+new file mode 100644
+--- /dev/null
++++ b/lib/gx/guest_memory.cpp
+@@
++#include <aurora/gx_guest_memory.hpp>
++
++namespace aurora::gx::guest_memory {
++namespace {
++void* sContext = nullptr;
++MapFn sMap = nullptr;
++}
++
++void set_mapper(void* context, MapFn mapFn) noexcept {
++  sContext = context;
++  sMap = mapFn;
++}
++
++void clear_mapper() noexcept {
++  sContext = nullptr;
++  sMap = nullptr;
++}
++
++bool has_mapper() noexcept { return sMap != nullptr; }
++
++bool map(std::uint32_t guestAddress, std::uint32_t minSize, Span* outSpan) noexcept {
++  if (outSpan == nullptr) return false;
++  *outSpan = {};
++  if (sMap == nullptr || !sMap(sContext, guestAddress, minSize, outSpan)) return false;
++  return outSpan->data != nullptr && outSpan->size >= minSize;
++}
++
++} // namespace aurora::gx::guest_memory
+
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@
+ #include "regs.hpp"
+ 
++#include <aurora/gx_guest_memory.hpp>
++
+ #include "gx_fmt.hpp"
+ #include "texture.hpp"
+@@
+ void bp_tlut_load(u8, u32 value) noexcept {
+   const auto idx = reg_get(value, 10, 0);
+   if (idx < MaxTluts) {
+     auto& slot = g_gxState.loadedTluts[idx];
+     slot.loadTlut0 = g_gxState.bpRegCache[0x64];
+     slot.numEntries = static_cast<u16>(reg_get(value, 10, 10) + 1);
++    if (guest_memory::has_mapper()) {
++      guest_memory::Span span;
++      const u32 guestAddress = (slot.loadTlut0 & 0x00FFFFFFu) << 5;
++      const u32 sourceBytes = static_cast<u32>(slot.numEntries) * sizeof(u16);
++      slot.data = guest_memory::map(guestAddress, sourceBytes, &span)
++                      ? static_cast<const void*>(span.data)
++                      : nullptr;
++    }
+   }
+ }
+@@
+   case 5: // Image3
+     slot.image3 = value;
++    if (guest_memory::has_mapper()) {
++      guest_memory::Span span;
++      const u32 guestAddress = (value & 0x00FFFFFFu) << 5;
++      const size_t wanted = texture::texture_source_size(
++          slot.format(), slot.width(), slot.height(), slot.mip_count());
++      const u32 minSize = wanted != 0 && wanted <= UINT32_MAX
++                              ? static_cast<u32>(wanted)
++                              : 1u;
++      slot.data = guest_memory::map(guestAddress, minSize, &span)
++                      ? static_cast<const void*>(span.data)
++                      : nullptr;
++    }
+     break;
+@@
+-void cp_arraybase_unsupported(u8, u32) noexcept {
+-  Log.error("CP_REG_ARRAYBASE_ID is not supported. Use GX_AURORA_LOAD_ARRAYBASE instead.");
++void cp_arraybase(u8 addr, u32 value) noexcept {
++  if (!guest_memory::has_mapper()) {
++    Log.error("CP_REG_ARRAYBASE_ID is not supported. Use GX_AURORA_LOAD_ARRAYBASE instead.");
++    return;
++  }
++
++  const u32 attrIdx = addr - 0xA0 + GX_VA_POS;
++  if (attrIdx >= g_gxState.arrays.size()) return;
++
++  guest_memory::Span span;
++  auto& array = g_gxState.arrays[attrIdx];
++  if (!guest_memory::map(value, 1u, &span)) {
++    array.data = nullptr;
++    array.size = 0;
++    Log.error("Failed to map CP array base 0x{:08X} for attr {}", value, attrIdx);
++    return;
++  }
++
++  array.data = span.data;
++  array.size = span.size;
++  array.le = false;
+ }
+@@
+   }
+   for (u8 i = 0; i < 0x10; ++i) {
+-    regs[0xA0 + i] = {cp_arraybase_unsupported, 0, /* alwaysHandle */ true};
++    regs[0xA0 + i] = {cp_arraybase, DirtyPipeline, /* alwaysHandle */ true};
+     regs[0xB0 + i] = {cp_array_stride, DirtyPipeline};
+   }
+
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@
+ #include "command_processor.hpp"
+ 
++#include <aurora/gx_guest_memory.hpp>
++
+ #include "../gfx/depth_peek.hpp"
+@@
+     case CP_CMD_CALL_DL: {
+-      // Call display list: 8 bytes (address + size)
+-      Log.warn("Ignoring nested GX_CMD_CALL_DL");
+-      reader.skip(8);
++      const u32 guestAddress = reader.read<u32>();
++      const u32 displayListSize = reader.read<u32>();
++      if (!guest_memory::has_mapper()) {
++        Log.warn("Ignoring nested GX_CMD_CALL_DL");
++        break;
++      }
++
++      guest_memory::Span span;
++      if (!guest_memory::map(guestAddress, displayListSize, &span)) {
++        FATAL("GX_CMD_CALL_DL references unmapped guest memory: address=0x{:08X}, size={}",
++              guestAddress, displayListSize);
++      }
++
++      const ProcessResult nested = process(span.data, displayListSize);
++      if (nested.drawDone) {
++        return {static_cast<u32>(reader.offset()), true};
++      }
+       break;
+     }

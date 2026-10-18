@@ -1,0 +1,145 @@
+/*
+ * M14 local-module bridge v16 / LLVM SSA-preserving WPAR hook.
+ *
+ * The normal DolRecomp LLVM CPUState external-write path materializes the full
+ * architectural state before every MMIO callback and reloads live state on
+ * return. That is correct for arbitrary devices, but Broadway's WPAR window is
+ * already a proven OpenSPM streaming primitive and heavy SPM scenes issue
+ * millions of those stores per host second.
+ *
+ * A player-local DolRecomp codegen patch calls the symbol below before generic
+ * externalWrite materialization. The helper reuses v20/dev16's exact proven
+ * openspm_m14_try_wg_write() implementation and therefore preserves byte order,
+ * 32-byte line boundaries, semantic flushes and terminal error handling. On a
+ * successful WPAR store LLVM keeps its guest registers in SSA and continues.
+ * Non-WPAR writes return zero and take DolRecomp's untouched generic path. A
+ * real FIFO failure returns -1 so generated code materializes state and exits.
+ *
+ * DolRecomp remains build-time tooling only. This bridge still exports only the
+ * OpenSPM native module ABI; no ModernGekko/Dolphin runtime is introduced.
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev23_llvm_base
+#include "legacy_c_adapter_v15.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_v24_underlying_create;
+static openspm_native_destroy_fn g_m14_v24_underlying_destroy;
+static uint64_t g_m14_v24_wpar_stores;
+static uint64_t g_m14_v24_wpar_failures;
+static uint32_t g_m14_v24_wpar_reported;
+
+static void bridge_v24_log_wpar_once(openspm_bridge_instance *instance) {
+    const openspm_host_api *host;
+    if (g_m14_v24_wpar_reported || instance == NULL || instance->runtime == NULL)
+        return;
+    host = instance->runtime->host;
+    if (host == NULL || host->log == NULL) return;
+    host->log(
+        host->context,
+        OPENSPM_LOG_INFO,
+        "M14 LLVM WPAR SSA fast path active: Broadway WPAR stores bypass generic externalWrite CPUState materialize/reload; exact dev16 32-byte gather/order preserved.");
+    g_m14_v24_wpar_reported = 1u;
+}
+
+int openspm_m14_try_wg_write_llvm(CPUState *cpu,
+                                  u32 source_pc,
+                                  u32 address,
+                                  u64 value,
+                                  u8 width) {
+    openspm_bridge_instance *instance;
+    uint32_t saved_pc;
+    uint32_t fallback_before;
+    int consumed;
+
+    if (cpu == NULL ||
+        address < OPENSPM_M14_WGPIPE_BASE ||
+        address >= OPENSPM_M14_WGPIPE_BASE + OPENSPM_M14_WGPIPE_SIZE ||
+        (width != 1u && width != 2u && width != 4u && width != 8u)) {
+        return 0;
+    }
+
+    instance = bridge_from_cpu(cpu);
+    bridge_v24_log_wpar_once(instance);
+    saved_pc = (uint32_t)cpu->pc;
+    fallback_before = instance != NULL ? instance->fallback_requested : 0u;
+
+    /* v20's proven helper uses cpu->pc only as the diagnostic/order source for
+       a line flush. Publish the live LLVM source PC for the duration of this
+       narrow call, then restore the architecturally materialized PC on success.
+       No GPR/FPR/CR/XER/FPSCR state is spilled to CPUState on the hot path. */
+    cpu->pc = source_pc;
+    consumed = openspm_m14_try_wg_write(cpu, address, value, width);
+    if (!consumed) {
+        cpu->pc = saved_pc;
+        return 0;
+    }
+
+    ++g_m14_v24_wpar_stores;
+    if (instance != NULL && !fallback_before && instance->fallback_requested) {
+        ++g_m14_v24_wpar_failures;
+        /* Keep source_pc visible. The generated LLVM failure edge now
+           materializes the live architectural state and returns to OpenSPM. */
+        return -1;
+    }
+
+    cpu->pc = saved_pc;
+    return 1;
+}
+
+static int OPENSPM_CALL bridge_create_v24(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    int result;
+    if (g_m14_v24_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    g_m14_v24_wpar_stores = 0u;
+    g_m14_v24_wpar_failures = 0u;
+    g_m14_v24_wpar_reported = 0u;
+    result = g_m14_v24_underlying_create(runtime, launch, out_instance);
+    return result;
+}
+
+static void OPENSPM_CALL bridge_destroy_v24(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL && instance->runtime != NULL &&
+        instance->runtime->host != NULL &&
+        instance->runtime->host->log != NULL &&
+        g_m14_v24_wpar_stores != 0u) {
+        char message[320];
+        (void)snprintf(
+            message,
+            sizeof(message),
+            "M14 LLVM WPAR SSA stats stores=%llu failures=%llu; successful stores stayed in LLVM SSA across the exact dev16 gather path.",
+            (unsigned long long)g_m14_v24_wpar_stores,
+            (unsigned long long)g_m14_v24_wpar_failures);
+        instance->runtime->host->log(instance->runtime->host->context,
+                                    OPENSPM_LOG_INFO, message);
+    }
+    if (g_m14_v24_underlying_destroy != NULL)
+        g_m14_v24_underlying_destroy(opaque);
+}
+#endif
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev23_llvm_base(requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v24_underlying_create = out_api->create;
+    g_m14_v24_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev24-llvm";
+    out_api->create = bridge_create_v24;
+    out_api->destroy = bridge_destroy_v24;
+#endif
+    return OPENSPM_OK;
+}

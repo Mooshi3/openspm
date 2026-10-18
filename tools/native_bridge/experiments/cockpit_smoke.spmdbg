@@ -1,0 +1,11 @@
+# OpenSPM M14 dev29 - non-destructive cockpit smoke test
+# Safe to run during normal gameplay. No raw writes.
+
+status
+map
+seq
+pos
+hp
+npcs info
+freezes
+mark COCKPIT-SMOKE-PASS

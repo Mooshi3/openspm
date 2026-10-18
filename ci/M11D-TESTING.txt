@@ -1,0 +1,49 @@
+OpenSPM M11D runtime lab
+========================
+
+M11D reuses the exact M11C gR8PE01_recomp.dll and changes only the host runtime.
+That keeps the performance experiment clean and avoids rebuilding all 218 chunks.
+
+Recommended first test
+----------------------
+Double-click RUN-OPENSPM-M11D-LAB.cmd and press Enter at the mode prompt (mode 4).
+Mode 4 enables both analyzer-detected busy-wait skipping and the known R8PE01
+Nintendo OS SelectThread idle PC at 0x8027551C.
+
+Modes
+-----
+1 baseline: analyzer OFF, known idle OFF
+2 auto detector: analyzer ON, known idle OFF
+3 known idle: analyzer OFF, known idle ON
+4 both: analyzer ON, known idle ON
+5 both + cache affinity: mode 4 plus largest-L3 process affinity
+6 Dolphin JIT control: selects Jit64 instead of StaticRecomp
+
+The launcher optionally accepts a Dolphin .sav path so repeated benchmarks can
+boot directly into Bowser castle interior, Flipside, or another heavy scene.
+Use the in-game File menu to make a savestate once, then reuse it for every arm.
+
+Perf log fields added by M11D
+-----------------------------
+idle_auto  = analyzer-detected busy-wait skips during the last sample window
+idle_known = configured 0x8027551C scheduler-idle skips during the last sample window
+
+Every newly detected busy-wait head is also logged once as:
+  [OPENSPM-IDLE-DETECT] pc=XXXXXXXX
+
+Cache affinity
+--------------
+The pinned ModernGekko already contains Windows largest-L3 affinity support.
+It is intentionally opt-in: it can help substantially on asymmetric multi-CCD
+CPUs (for example X3D parts with V-Cache on only one CCD), but can be neutral or
+slightly negative on symmetric multi-CCD CPUs. Mode 5 is therefore an experiment,
+not the default.
+
+Notes
+-----
+- OPENSPM_BUSYWAIT=0 disables automatic busy-wait detection.
+- OPENSPM_IDLE_PC=1 enables the known R8PE01 scheduler idle shortcut.
+- MODERNGEKKO_CACHE_AFFINITY=1 enables largest-L3 cache affinity.
+- MODERNGEKKO_STATICRECOMP=0 selects Dolphin Jit64 for the control arm.
+- No unsafe DolRecomp cross-chunk calls are enabled in M11D.
+- The game DLL is reused byte-for-byte from M11C.

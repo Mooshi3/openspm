@@ -1,0 +1,245 @@
+/*
+ * M14 local-module bridge v32 / LLVM VI scratch-context transfer capture fix.
+ *
+ * dev41 had the right semantic boundary but one invalid ownership test. The VI
+ * retrace event executes on a stack-local CPUState copy. bridge_from_cpu(cpu)
+ * is only meaningful for the persistent CPU embedded in openspm_bridge_instance;
+ * using it on the scratch event CPU therefore rejected the exact restored
+ * SelectThread PC+4 query before the capture predicate could run.
+ *
+ * v32 keeps the complete v31 -> v30 -> ... chain and changes only that proof.
+ * v31's run wrapper already records when a top-level persistent run started at
+ * SelectThread idle and which OS_CURRENT_CONTEXT was interrupted. v32 reuses
+ * those bounded globals directly. During that window, a native-region query is
+ * captured only when:
+ *   - the queried region begins exactly at the derived saved-context re-entry;
+ *   - cpu is not the persistent CPU, but shares its MEM1/MEM2 backing stores;
+ *   - Nintendo changed OS_CURRENT_CONTEXT away from the interrupted context;
+ *   - the selected context is a valid guest OSContext;
+ *   - its saved SRR0 exactly equals the derived re-entry PC.
+ *
+ * At that point returning a handled+blocked native-region query makes DolRecomp
+ * materialize the restored PC and return from the scratch native chain. The
+ * existing v7 bridge_commit_m14_retrace_context_transfer() remains the only
+ * code which actually commits the restored CPU state to the persistent CPU.
+ * This layer never picks a thread, changes RunQueueBits, edits an OSContext or
+ * fabricates a wakeup.
+ *
+ * Bounded reject diagnostics are included so any remaining failed predicate is
+ * explicit in the next player log rather than silently delegating to dev40.
+ *
+ * Historical marker retained for source-contract ancestry:
+ * m14-dev41-llvm-vi-scheduler-transfer-capture
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev41_transfer_capture_base
+#include "legacy_c_adapter_v31.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+#define OPENSPM_M14_V42_LOG_LIMIT UINT32_C(20)
+
+static openspm_native_create_fn g_m14_v42_underlying_create;
+static openspm_native_destroy_fn g_m14_v42_underlying_destroy;
+static PPCHostCall g_m14_v42_underlying_host_call;
+static uint32_t g_m14_v42_capture_count;
+static uint32_t g_m14_v42_candidate_count;
+static uint32_t g_m14_v42_reject_persistent;
+static uint32_t g_m14_v42_reject_memory;
+static uint32_t g_m14_v42_reject_current;
+static uint32_t g_m14_v42_reject_context;
+static uint32_t g_m14_v42_reject_saved_pc;
+static uint32_t g_m14_v42_log_count;
+
+static void bridge_v42_log(openspm_bridge_instance *instance,
+                           const char *message) {
+    const openspm_host_api *host;
+    if (instance == NULL || instance->runtime == NULL || message == NULL) return;
+    host = instance->runtime->host;
+    if (host != NULL && host->log != NULL)
+        host->log(host->context, OPENSPM_LOG_INFO, message);
+}
+
+static void bridge_v42_log_reject(openspm_bridge_instance *instance,
+                                  const char *reason,
+                                  CPUState *cpu,
+                                  uint32_t current_context,
+                                  uint32_t saved_pc) {
+    char message[448];
+    if (instance == NULL || reason == NULL || cpu == NULL ||
+        g_m14_v42_log_count >= OPENSPM_M14_V42_LOG_LIMIT) return;
+    (void)snprintf(
+        message, sizeof(message),
+        "M14 LLVM VI transfer candidate #%u rejected=%s scratch=%s idle_active=%u interrupted=0x%08X current=0x%08X saved_pc=0x%08X range=[0x%08X,0x%08X).",
+        (unsigned)g_m14_v42_candidate_count, reason,
+        cpu != &instance->cpu ? "yes" : "no",
+        (unsigned)g_m14_v41_idle_run_active,
+        (unsigned)g_m14_v41_interrupted_context,
+        (unsigned)current_context, (unsigned)saved_pc,
+        (unsigned)cpu->external_addr, (unsigned)cpu->external_value);
+    bridge_v42_log(instance, message);
+    ++g_m14_v42_log_count;
+}
+
+static bool bridge_host_call_v42(CPUState *cpu, u32 address) {
+    openspm_bridge_instance *instance = g_m14_v41_instance;
+    uint32_t start;
+    uint32_t current_context = 0u;
+    uint32_t saved_pc = 0u;
+
+    if (cpu == NULL || g_m14_v42_underlying_host_call == NULL)
+        return false;
+    if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY)
+        return g_m14_v42_underlying_host_call(cpu, address);
+
+    start = (uint32_t)cpu->external_addr;
+    if (!g_m14_v41_idle_run_active ||
+        start != OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY)
+        return g_m14_v42_underlying_host_call(cpu, address);
+
+    ++g_m14_v42_candidate_count;
+    if (instance == NULL || g_m14_v41_interrupted_context == 0u) {
+        ++g_m14_v42_reject_current;
+        if (instance != NULL)
+            bridge_v42_log_reject(instance, "no-idle-context", cpu, 0u, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+
+    /* The event CPU is a plain stack copy, so never call bridge_from_cpu(cpu)
+     * here. Prove scratch ownership by exclusion plus shared guest memory. */
+    if (cpu == &instance->cpu) {
+        ++g_m14_v42_reject_persistent;
+        bridge_v42_log_reject(instance, "persistent-cpu", cpu, 0u, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+    if (cpu->ram != instance->cpu.ram || cpu->ram_size != instance->cpu.ram_size ||
+        cpu->mem2 != instance->cpu.mem2 ||
+        cpu->mem2_size != instance->cpu.mem2_size) {
+        ++g_m14_v42_reject_memory;
+        bridge_v42_log_reject(instance, "foreign-memory", cpu, 0u, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+
+    if (!bridge_m14_context_address_valid(cpu,
+                                           OPENSPM_M14_OS_CURRENT_CONTEXT, 4u)) {
+        ++g_m14_v42_reject_current;
+        bridge_v42_log_reject(instance, "current-context-unmapped", cpu, 0u, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+    current_context = mem_read32(cpu, OPENSPM_M14_OS_CURRENT_CONTEXT);
+    if (current_context == 0u ||
+        current_context == g_m14_v41_interrupted_context) {
+        ++g_m14_v42_reject_current;
+        bridge_v42_log_reject(instance, "context-not-switched", cpu,
+                              current_context, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+    if (!bridge_m14_context_address_valid(
+            cpu, current_context,
+            OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET + 4u)) {
+        ++g_m14_v42_reject_context;
+        bridge_v42_log_reject(instance, "selected-context-unmapped", cpu,
+                              current_context, 0u);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+
+    saved_pc = mem_read32(
+        cpu, current_context + OPENSPM_M14_OS_CONTEXT_SRR0_OFFSET) &
+        ~UINT32_C(3);
+    if (saved_pc != OPENSPM_LOCAL_SCHEDULER_CONTEXT_REENTRY) {
+        ++g_m14_v42_reject_saved_pc;
+        bridge_v42_log_reject(instance, "saved-pc-mismatch", cpu,
+                              current_context, saved_pc);
+        return g_m14_v42_underlying_host_call(cpu, address);
+    }
+
+    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+    ++g_m14_v42_capture_count;
+    if (g_m14_v42_log_count < OPENSPM_M14_V42_LOG_LIMIT) {
+        char message[448];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM VI scheduler-transfer capture v42 #%u scratch=yes interrupted=0x%08X current=0x%08X saved_pc=0x%08X range=[0x%08X,0x%08X); materializing exact event handoff.",
+            (unsigned)g_m14_v42_capture_count,
+            (unsigned)g_m14_v41_interrupted_context,
+            (unsigned)current_context, (unsigned)saved_pc,
+            (unsigned)cpu->external_addr, (unsigned)cpu->external_value);
+        bridge_v42_log(instance, message);
+        ++g_m14_v42_log_count;
+    }
+    return true;
+}
+
+static int OPENSPM_CALL bridge_create_v42(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+    if (g_m14_v42_underlying_create == NULL) return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_v42_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL) return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_v42_underlying_host_call = instance->cpu.host_call;
+    instance->cpu.host_call = bridge_host_call_v42;
+    g_m14_v42_capture_count = 0u;
+    g_m14_v42_candidate_count = 0u;
+    g_m14_v42_reject_persistent = 0u;
+    g_m14_v42_reject_memory = 0u;
+    g_m14_v42_reject_current = 0u;
+    g_m14_v42_reject_context = 0u;
+    g_m14_v42_reject_saved_pc = 0u;
+    g_m14_v42_log_count = 0u;
+
+    bridge_v42_log(instance,
+        "M14 LLVM VI scheduler-transfer capture v42 active: scratch CPU ownership is proven by exclusion/shared guest memory rather than bridge_from_cpu(); exact Nintendo restored-context semantics remain authoritative.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_v42(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[384];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM VI scheduler-transfer v42 stats candidates=%u captures=%u reject_persistent=%u reject_memory=%u reject_current=%u reject_context=%u reject_saved_pc=%u.",
+            (unsigned)g_m14_v42_candidate_count,
+            (unsigned)g_m14_v42_capture_count,
+            (unsigned)g_m14_v42_reject_persistent,
+            (unsigned)g_m14_v42_reject_memory,
+            (unsigned)g_m14_v42_reject_current,
+            (unsigned)g_m14_v42_reject_context,
+            (unsigned)g_m14_v42_reject_saved_pc);
+        bridge_v42_log(instance, message);
+        instance->cpu.host_call = g_m14_v42_underlying_host_call;
+    }
+    if (g_m14_v42_underlying_destroy != NULL)
+        g_m14_v42_underlying_destroy(opaque);
+    g_m14_v42_underlying_host_call = NULL;
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev41_transfer_capture_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_v42_underlying_create = out_api->create;
+    g_m14_v42_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev42-llvm-vi-scratch-transfer-fix";
+    out_api->create = bridge_create_v42;
+    out_api->destroy = bridge_destroy_v42;
+#endif
+    return OPENSPM_OK;
+}

@@ -1,0 +1,135 @@
+diff --git a/module/generated/chunks/chunk_0014_text1_80051940.c b/module/generated/chunks/chunk_0014_text1_80051940.c
+index 4b824f9..176957d 100644
+--- a/module/generated/chunks/chunk_0014_text1_80051940.c
++++ b/module/generated/chunks/chunk_0014_text1_80051940.c
+@@ -38514,6 +38514,9 @@ label_80055604:
+         ctx->ps1[2] = value;
+     }
+ 
++    /* OpenSPM: convert SPM's stock 4:3/16:9 perspective to the selected output ratio. */
++    openspm_adjust_perspective_projection(ctx, ctx->gpr[29], &ctx->fpr[2]);
++
+ label_80055608:
+     ctx->pc = 0x80055608u;
+     // 80055608: lfs     f3, 400(r29)
+@@ -38600,6 +38603,9 @@ label_80055628:
+         ctx->ps1[4] = value;
+     }
+ 
++    /* OpenSPM: widen eligible orthographic world/UI cameras using SPM's own exclusions. */
++    openspm_adjust_ortho_projection(ctx, ctx->gpr[29], &ctx->fpr[3], &ctx->fpr[4]);
++
+ label_8005562C:
+     ctx->pc = 0x8005562Cu;
+     // 8005562C: lfs     f5, 400(r29)
+diff --git a/module/generated/generated.h b/module/generated/generated.h
+index 2b544ff..882b7c2 100644
+--- a/module/generated/generated.h
++++ b/module/generated/generated.h
+@@ -14,6 +14,10 @@
+ #endif
+ #include DOLRECOMP_CPU_HEADER
+ 
++/* OpenSPM native projection override bridge. Implemented by spm_module.c. */
++void openspm_adjust_perspective_projection(CPUState* ctx, u32 cam_entry, f64* aspect);
++void openspm_adjust_ortho_projection(CPUState* ctx, u32 cam_entry, f64* left, f64* right);
++
+ #ifndef DOLRECOMP_C_LOOP_CYCLE_BUDGET
+ #define DOLRECOMP_C_LOOP_CYCLE_BUDGET 256
+ #endif
+diff --git a/module/src/spm_module.c b/module/src/spm_module.c
+index eec6d08..49f637d 100644
+--- a/module/src/spm_module.c
++++ b/module/src/spm_module.c
+@@ -20,6 +20,91 @@ static void spm_on_state_loaded(CPUState* ctx)
+     (void)ctx;
+ }
+ 
++enum
++{
++    OPENSPM_ASPECT_AUTO = 0,
++    OPENSPM_ASPECT_4_3 = 1,
++    OPENSPM_ASPECT_16_9 = 2,
++    OPENSPM_ASPECT_21_9 = 3,
++    OPENSPM_ASPECT_32_9 = 4,
++};
++
++/* Written on the emulated CPU/runtime thread by the host adapter. */
++static u32 g_openspm_aspect_mode = OPENSPM_ASPECT_AUTO;
++
++SPM_EXPORT void openspm_set_aspect_ratio(u32 mode)
++{
++    if (mode <= OPENSPM_ASPECT_32_9)
++        g_openspm_aspect_mode = mode;
++}
++
++static float openspm_projection_scale(CPUState* ctx, u32 cam_entry)
++{
++    const u32 mode = g_openspm_aspect_mode;
++    if (mode == OPENSPM_ASPECT_AUTO || cam_entry == 0)
++        return 1.0f;
++
++    const u32 flags = mem_read32(ctx, cam_entry + 0x000u);
++    const s32 cam_no = (s32)mem_read32(ctx, cam_entry + 0x004u);
++    const u32 projection_type = mem_read32(ctx, cam_entry + 0x158u);
++
++    /* Reuse the exact camera exclusions used by SPM's stock 16:9 paths. */
++    if (projection_type == 0u)
++    {
++        const u32 callback = mem_read32(ctx, cam_entry + 0x258u);
++        if (callback == 0x80057B38u)
++            return 1.0f;
++    }
++    else if (projection_type == 1u)
++    {
++        if (cam_no == 0 || cam_no == 1 || cam_no == 13)
++            return 1.0f;
++    }
++    else
++    {
++        return 1.0f;
++    }
++
++    const float source_aspect = (flags & 0x10000000u) ? (16.0f / 9.0f) : (4.0f / 3.0f);
++    float target_aspect;
++    switch (mode)
++    {
++    case OPENSPM_ASPECT_4_3:
++        target_aspect = 4.0f / 3.0f;
++        break;
++    case OPENSPM_ASPECT_16_9:
++        target_aspect = 16.0f / 9.0f;
++        break;
++    case OPENSPM_ASPECT_21_9:
++        target_aspect = 21.0f / 9.0f;
++        break;
++    case OPENSPM_ASPECT_32_9:
++        target_aspect = 32.0f / 9.0f;
++        break;
++    default:
++        return 1.0f;
++    }
++
++    return target_aspect / source_aspect;
++}
++
++void openspm_adjust_perspective_projection(CPUState* ctx, u32 cam_entry, f64* aspect)
++{
++    const float scale = openspm_projection_scale(ctx, cam_entry);
++    if (scale != 1.0f)
++        *aspect = (f64)((float)*aspect * scale);
++}
++
++void openspm_adjust_ortho_projection(CPUState* ctx, u32 cam_entry, f64* left, f64* right)
++{
++    const float scale = openspm_projection_scale(ctx, cam_entry);
++    if (scale != 1.0f)
++    {
++        *left = (f64)((float)*left * scale);
++        *right = (f64)((float)*right * scale);
++    }
++}
++
+ static const StaticRecompModuleDesc spm_module = {
+     3u,
+     3u,

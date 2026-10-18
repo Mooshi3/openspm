@@ -1,0 +1,26 @@
+; OpenSPM-authored import list for the freestanding player-local module.
+;   llvm-dlltool -m i386:x86-64 -d m14_freestanding_ucrtbase.def -l ucrtbase.lib
+; ucrtbase.dll is the Universal CRT that ships with Windows 10 and later; the
+; MSVC-built host already loads it, so the module shares the host's heap and
+; stdio. Names only; no Windows SDK content. Must list exactly the
+; OPENSPM_CRT_IMPORT C functions of m14_freestanding_crt.h and .c.
+LIBRARY ucrtbase.dll
+EXPORTS
+__acrt_iob_func
+__stdio_common_vfprintf
+__stdio_common_vsprintf
+_aligned_free
+_aligned_malloc
+calloc
+ceil
+floor
+fma
+fmod
+free
+getenv
+ldexp
+malloc
+sin
+sqrt
+strtoull
+trunc

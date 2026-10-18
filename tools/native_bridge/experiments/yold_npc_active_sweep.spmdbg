@@ -1,0 +1,101 @@
+# OpenSPM M14 dev30 - Yold Town one-NPC active-bit sweep
+#
+# Purpose: identify whether one passive townsfolk entry disproportionately owns
+# the active-NPC performance cliff without rebuilding between actors.
+#
+# Stand in Yold Town / he2_03. This is intentionally invasive but bounded:
+# each selected actor has only NPCEntry::flag8.active suppressed for <2 seconds,
+# then the backend restores only that bit. The command also auto-restores on its
+# own after 120 safe-frame ticks, and cleanup cancels any unfinished pulse.
+
+defer npcs pulseone off
+defer npcs suspend off
+defer npcs isolate off
+defer npcs freeze off
+defer speed 1
+
+# Normalize any prior cockpit experiment before taking the baseline.
+resetdebug
+speed 1
+npcs pulseone off
+npcs suspend off
+npcs isolate off
+npcs freeze off
+
+require_map he2_03
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 1.5 0.15
+
+capture start yold-npc-baseline
+mark YOLD-NPC-SWEEP baseline
+npcs info
+npcs list
+wait 2.0
+capture stop
+
+# Pulse each ACTIVE ORDINAL independently. 120 ticks guarantees the actor stays
+# suppressed for the 1.85 s wall-time window even if the scene jumps to 60 Hz.
+# Explicit off restores before the next actor; the backend restores only bit 0.
+
+capture start yold-npc-0
+mark YOLD-NPC-SWEEP ordinal=0
+npcs pulseone 0 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-1
+mark YOLD-NPC-SWEEP ordinal=1
+npcs pulseone 1 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-2
+mark YOLD-NPC-SWEEP ordinal=2
+npcs pulseone 2 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-3
+mark YOLD-NPC-SWEEP ordinal=3
+npcs pulseone 3 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-4
+mark YOLD-NPC-SWEEP ordinal=4
+npcs pulseone 4 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-5
+mark YOLD-NPC-SWEEP ordinal=5
+npcs pulseone 5 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+capture start yold-npc-6
+mark YOLD-NPC-SWEEP ordinal=6
+npcs pulseone 6 120
+wait 1.85
+npcs pulseone off
+wait 0.20
+capture stop
+
+require_npcs 7
+require_npc_names mise,mura_1,mura_2,mura_3,mura_4,mura_5,son
+stable_npcs 1.0 0.15
+npcs info
+npcs list

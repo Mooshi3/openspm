@@ -1,0 +1,221 @@
+/*
+ * M14 local-module bridge v38 / dev48 PC-native GX display-list construction.
+ *
+ * dev47 fixed the missing PE-finish completion and advanced the player through
+ * the Wii Remote orientation screen into the opening cutscene.  The next live
+ * frontier is deterministic: seq=3/stage=6 spins forever at 0x80291E20 inside
+ * the exact compiler region [0x80291DC8,0x80291E78), i.e. retail
+ * GXBeginDisplayList.  That SDK body redirects the physical Wii CPU FIFO and
+ * resets the Broadway write-gather pipe.  Those are console transport details,
+ * not useful work for a native PC renderer.
+ *
+ * OpenSPM already has the correct native semantic service for the same public
+ * SDK calls.  openspm_gx_platform_begin_display_list() validates the player's
+ * guest buffer and redirects subsequent GX FIFO bytes into it;
+ * openspm_gx_platform_end_display_list() 32-byte-aligns/pads the payload and
+ * returns the recorded size.  The backend hostcall targets at the retail US2
+ * addresses already expose those operations.
+ *
+ * LLVM's older v23 seam deliberately ran the real GXBegin/GXEnd bodies first
+ * and only switched the neutral recorder at durable caller continuations.  v38
+ * supersedes that policy for LLVM only.  Once v23's compiler partition has
+ * materialized the exact function entry, this top-level hostcall wrapper sends
+ * the call directly to the existing OpenSPM GX platform service and returns to
+ * the guest LR.  A one-shot v23 permit for that LR prevents the obsolete
+ * generated-C-style return hook from firing.  The retail Wii FIFO/write-gather
+ * body is therefore never entered.
+ *
+ * No scheduler state, display-list bytes, or game assets are fabricated.  The
+ * same player-owned list buffer and exact GX byte stream are used; only the
+ * console-specific transport mechanism is replaced by the native platform
+ * implementation.
+ *
+ * Historical source-contract ancestry:
+ * m14-dev47-llvm-gx-finish-semantic-completion
+ *
+ * M14 native retrace phase-lock active: fixed 60 Hz deadline grid; elapsed deadlines are skipped, never burst-delivered.
+ * m14-dev48-llvm-pc-display-list
+ */
+
+#pragma push_macro("openspm_native_module_query")
+#undef openspm_native_module_query
+#define openspm_native_module_query openspm_native_module_query_dev47_gx_finish_base
+#include "legacy_c_adapter_v37.c.in"
+#undef openspm_native_module_query
+#pragma pop_macro("openspm_native_module_query")
+
+#ifdef DOLRECOMP_BACKEND_LLVM
+static openspm_native_create_fn g_m14_dev48_underlying_create;
+static openspm_native_destroy_fn g_m14_dev48_underlying_destroy;
+static PPCHostCall g_m14_dev48_underlying_host_call;
+static openspm_bridge_instance *g_m14_dev48_instance;
+static uint64_t g_m14_dev48_begin_calls;
+static uint64_t g_m14_dev48_end_calls;
+static uint64_t g_m14_dev48_failures;
+
+static int bridge_dev48_is_display_list_target(uint32_t address) {
+    return address == OPENSPM_LOCAL_V19_GX_BEGIN ||
+           address == OPENSPM_LOCAL_V19_GX_END;
+}
+
+static bool bridge_dev48_host_display_list(CPUState *cpu, uint32_t address) {
+    openspm_bridge_instance *instance = g_m14_dev48_instance;
+    openspm_m14_hostcall_state state;
+    uint32_t return_pc;
+    int result;
+    char message[512];
+
+    /* Do not use bridge_from_cpu() for ownership here.  Host-driven interrupt
+       events intentionally use stack-local CPUState copies; dev42 proved that
+       container-of ownership tests are invalid for those scratch CPUs.  GX
+       display-list API calls belong to the persistent gameplay CPU only. */
+    if (cpu == NULL || instance == NULL || cpu != &instance->cpu ||
+        !bridge_dev48_is_display_list_target(address)) {
+        return g_m14_dev48_underlying_host_call != NULL
+                   ? g_m14_dev48_underlying_host_call(cpu, address)
+                   : false;
+    }
+
+    if (!g_m14_have_hostcall || g_m14_hostcall.handle == NULL) {
+        ++g_m14_dev48_failures;
+        bridge_request_fallback(instance, address, 48u);
+        cpu->pc = address;
+        return true;
+    }
+
+    /* Finish any partial Broadway gather line before changing the destination
+       of subsequent GX bytes.  This is the same ordering guarantee used by the
+       proven generated-C v19 physical recorder boundary. */
+    if (g_m14_v8_have_gx_fifo) {
+        result = bridge_flush_wg_v8(instance, address);
+        if (result != OPENSPM_OK) {
+            ++g_m14_dev48_failures;
+            bridge_request_fallback(instance, address, 49u);
+            cpu->pc = address;
+            return true;
+        }
+    }
+
+    return_pc = (uint32_t)cpu->lr;
+    bridge_cpu_to_m14_hostcall_state(cpu, &state);
+    state.event_target = 0u;
+    state.event_argc = 0u;
+    memset(state.event_args, 0, sizeof(state.event_args));
+
+    result = g_m14_hostcall.handle(g_m14_hostcall.context, address, &state);
+    if (result != OPENSPM_OK || state.event_target != 0u ||
+        state.event_argc != 0u) {
+        ++g_m14_dev48_failures;
+        bridge_request_fallback(instance, address, 50u);
+        cpu->pc = address;
+        return true;
+    }
+
+    /* The backend implementation of GXBegin/GXEnd already models the public
+       SDK call boundary and returns pc=lr.  Copy that architectural result back
+       verbatim, including GXEndDisplayList's r3 byte count. */
+    bridge_cpu_from_m14_hostcall_state(cpu, &state);
+
+    /* v15 also partitioned every historical caller PC+4 because generated-C
+       v19 performed its neutral-recorder transition there.  The transition has
+       already happened synchronously above, so let that one continuation enter
+       native code without invoking the obsolete return hook. */
+    bridge_v23_arm_permit(return_pc);
+
+    if (address == OPENSPM_LOCAL_V19_GX_BEGIN)
+        ++g_m14_dev48_begin_calls;
+    else
+        ++g_m14_dev48_end_calls;
+
+    if ((address == OPENSPM_LOCAL_V19_GX_BEGIN &&
+         (g_m14_dev48_begin_calls <= 8u ||
+          (g_m14_dev48_begin_calls & (g_m14_dev48_begin_calls - 1u)) == 0u)) ||
+        (address == OPENSPM_LOCAL_V19_GX_END &&
+         (g_m14_dev48_end_calls <= 8u ||
+          (g_m14_dev48_end_calls & (g_m14_dev48_end_calls - 1u)) == 0u))) {
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM PC-native GX display-list %s #%llu target=0x%08X return=0x%08X buffer=0x%08X capacity/result=%u; retail Wii CPU-FIFO body skipped.",
+            address == OPENSPM_LOCAL_V19_GX_BEGIN ? "begin" : "end",
+            (unsigned long long)(address == OPENSPM_LOCAL_V19_GX_BEGIN
+                                     ? g_m14_dev48_begin_calls
+                                     : g_m14_dev48_end_calls),
+            (unsigned)address, (unsigned)return_pc,
+            (unsigned)(address == OPENSPM_LOCAL_V19_GX_BEGIN
+                           ? state.gpr[3]
+                           : 0u),
+            (unsigned)(address == OPENSPM_LOCAL_V19_GX_BEGIN
+                           ? state.gpr[4]
+                           : state.gpr[3]));
+        bridge_v44_log(instance, message);
+    }
+
+    return true;
+}
+
+static int OPENSPM_CALL bridge_create_dev48(
+    const openspm_native_runtime_api *runtime,
+    const openspm_launch_desc *launch,
+    void **out_instance) {
+    openspm_bridge_instance *instance;
+    int result;
+
+    if (g_m14_dev48_underlying_create == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    result = g_m14_dev48_underlying_create(runtime, launch, out_instance);
+    if (result != OPENSPM_OK) return result;
+    if (out_instance == NULL || *out_instance == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+
+    instance = (openspm_bridge_instance *)*out_instance;
+    g_m14_dev48_instance = instance;
+    g_m14_dev48_underlying_host_call = instance->cpu.host_call;
+    g_m14_dev48_begin_calls = 0u;
+    g_m14_dev48_end_calls = 0u;
+    g_m14_dev48_failures = 0u;
+    instance->cpu.host_call = bridge_dev48_host_display_list;
+
+    bridge_v44_log(instance,
+        "M14 LLVM PC-native GX display-list semantic completion active: GXBeginDisplayList/GXEndDisplayList are handled by the existing bounded OpenSPM recorder at the exact compiler seam; retail Wii CPU-FIFO/write-gather bodies are skipped.");
+    return OPENSPM_OK;
+}
+
+static void OPENSPM_CALL bridge_destroy_dev48(void *opaque) {
+    openspm_bridge_instance *instance = (openspm_bridge_instance *)opaque;
+    if (instance != NULL) {
+        char message[384];
+        (void)snprintf(
+            message, sizeof(message),
+            "M14 LLVM PC-native GX display-list stats begins=%llu ends=%llu failures=%llu.",
+            (unsigned long long)g_m14_dev48_begin_calls,
+            (unsigned long long)g_m14_dev48_end_calls,
+            (unsigned long long)g_m14_dev48_failures);
+        bridge_v44_log(instance, message);
+        if (instance->cpu.host_call == bridge_dev48_host_display_list)
+            instance->cpu.host_call = g_m14_dev48_underlying_host_call;
+    }
+
+    g_m14_dev48_instance = NULL;
+    g_m14_dev48_underlying_host_call = NULL;
+    if (g_m14_dev48_underlying_destroy != NULL)
+        g_m14_dev48_underlying_destroy(opaque);
+}
+#endif /* DOLRECOMP_BACKEND_LLVM */
+
+OPENSPM_EXPORT int OPENSPM_CALL openspm_native_module_query(
+    uint32_t requested_abi,
+    openspm_native_module_api *out_api) {
+    int result = openspm_native_module_query_dev47_gx_finish_base(
+        requested_abi, out_api);
+    if (result != OPENSPM_OK) return result;
+#ifdef DOLRECOMP_BACKEND_LLVM
+    if (out_api == NULL || out_api->create == NULL || out_api->destroy == NULL)
+        return OPENSPM_ERROR_RUNTIME;
+    g_m14_dev48_underlying_create = out_api->create;
+    g_m14_dev48_underlying_destroy = out_api->destroy;
+    out_api->module_version = "m14-dev48-llvm-pc-display-list";
+    out_api->create = bridge_create_dev48;
+    out_api->destroy = bridge_destroy_dev48;
+#endif
+    return OPENSPM_OK;
+}
